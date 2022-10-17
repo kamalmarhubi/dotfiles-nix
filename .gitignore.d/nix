@@ -1,3 +1,6 @@
 *
 !/.gitignore.d
 !/.gitignore.d/hm
+!/.config
+!/.config/nix
+!/.config/nix/*
