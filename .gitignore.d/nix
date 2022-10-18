@@ -4,3 +4,5 @@
 !/.config
 !/.config/nix
 !/.config/nix/*
+!/.config/nixpkgs
+!/.config/nixpkgs/*
