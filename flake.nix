@@ -24,12 +24,17 @@
           programs = {
             home-manager.enable = true;
             fish.enable = true;
+            neovim.enable = true;
           };
 
           home = {
             username = "kamal";
             homeDirectory = "/home/kamal";
             stateVersion = "22.11";
+
+            sessionVariables = {
+              EDITOR = "nvim";
+            };
           };
         }];
       };
