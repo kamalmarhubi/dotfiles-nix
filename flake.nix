@@ -1,3 +1,11 @@
+# Remaining:
+# - fix up repo to not be vcsh repo
+#   - move .config/nixpkgs/* to root
+#   - add README with instructions on how to run nix
+# - manage ~/.config/nix/nix.conf
+# - add genericLinux and genericMacos configs?
+#   - assign kamal@kx = genericLinux?
+# - start using it at work
 {
   description = "Kamal pretends to use nix?";
 
