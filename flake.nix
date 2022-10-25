@@ -41,7 +41,7 @@
 
          home = {
            username = "kamal";
-           homeDirectory = "/home/kamal";
+           inherit homeDirectory;
            stateVersion = "22.11";
 
            sessionVariables = {
