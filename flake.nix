@@ -57,6 +57,7 @@
         homeDirectory = "/Users/kamal";
       };
       "kamal@kx7" = genericLinux;
+      "kamal@kmbpwave.local" = genericMacos;
     };
   };
 }
