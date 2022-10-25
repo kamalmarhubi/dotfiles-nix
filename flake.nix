@@ -106,6 +106,9 @@
             #   Use mkOutOfStoreSymlink to link ~/.config/nvim to $BLAH/config/nvim
             #   etc
           };
+        xdg.configFile."nix/nix.conf".text = ''
+          experimental-features = nix-command flakes
+        '';
         }];
       };
     };
