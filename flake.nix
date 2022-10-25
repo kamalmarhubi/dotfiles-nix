@@ -17,43 +17,52 @@
     };
   };
 
-  outputs = { nixpkgs, home-manager, ... }: {
-    homeConfigurations = {
-      "kamal@kx7" = let
+  outputs = { nixpkgs, home-manager, ... }: let
+    maker = { system, homeDirectory, ... }: let
+     pkgs = nixpkgs.legacyPackages.${system};
+    in
+    home-manager.lib.homeManagerConfiguration {
+     inherit pkgs;
+
+     # Specify your home configuration modules here, for example,
+     # the path to your home.nix.
+     modules = [
+       ./dotfiles-nix.nix
+       {
+         programs = {
+           home-manager.enable = true;
+           fish.enable = true;
+           neovim = {
+             enable = true;
+             plugins = with pkgs.vimPlugins; [
+             ];
+           };
+         };
+
+         home = {
+           username = "kamal";
+           homeDirectory = "/home/kamal";
+           stateVersion = "22.11";
+
+           sessionVariables = {
+             EDITOR = "nvim";
+           };
+         };
+       }
+     ];
+    };
+  in
+  {
+    homeConfigurations = rec {
+      genericLinux = maker {
         system = "x86_64-linux";
-        pkgs = nixpkgs.legacyPackages.${system};
-        repoUrl = "https://github.com/kamalmarhubi/dotfiles-nix.git";
-      in
-      home-manager.lib.homeManagerConfiguration {
-        inherit pkgs;
-
-        # Specify your home configuration modules here, for example,
-        # the path to your home.nix.
-        modules = [
-	  ./dotfiles-nix.nix
-	  {
-            programs = {
-              home-manager.enable = true;
-              fish.enable = true;
-              neovim = {
-                enable = true;
-                plugins = with pkgs.vimPlugins; [
-                ];
-              };
-            };
-
-            home = rec {
-              username = "kamal";
-              homeDirectory = "/home/kamal";
-              stateVersion = "22.11";
-
-              sessionVariables = {
-                EDITOR = "nvim";
-              };
-            };
-          }
-        ];
+        homeDirectory = "/home/kamal";
       };
+      genericMacos = maker {
+        system = "aarch64-darwin";
+        homeDirectory = "/Users/kamal";
+      };
+      "kamal@kx7" = genericLinux;
     };
   };
 }
