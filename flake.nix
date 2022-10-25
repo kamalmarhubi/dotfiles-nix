@@ -29,7 +29,7 @@
 
         # Specify your home configuration modules here, for example,
         # the path to your home.nix.
-        modules = [{
+        modules = [({ config, ... }: {
           programs = {
             home-manager.enable = true;
             fish.enable = true;
@@ -109,7 +109,8 @@
         xdg.configFile."nix/nix.conf".text = ''
           experimental-features = nix-command flakes
         '';
-        }];
+	xdg.configFile."nixpkgs".source = config.lib.file.mkOutOfStoreSymlink "${config.home.homeDirectory}/.local/share/dotfiles-nix";
+        })];
       };
     };
   };
