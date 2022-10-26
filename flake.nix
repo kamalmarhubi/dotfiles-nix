@@ -55,6 +55,15 @@
               sessionVariables = {
                 EDITOR = "nvim";
               };
+
+              packages = with pkgs; [
+                atool
+                entr
+                ripgrep
+                pv
+                tree
+                wget
+              ];
             };
             # For whatever reason, the installer didn't put this somewhere that
             # fish would see. Since the nix-daemon.fish file guards against
