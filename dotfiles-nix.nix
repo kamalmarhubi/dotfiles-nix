@@ -1,9 +1,14 @@
-{ config, pkgs, lib, ... }: let
+{
+  config,
+  pkgs,
+  lib,
+  ...
+}: let
   targetDir = "${config.home.homeDirectory}/.local/share/dotfiles-nix";
   repoUrl = "https://github.com/kamalmarhubi/dotfiles-nix.git";
   checkGitRepoOriginIfPresent = pkgs.writeShellApplication {
     name = "check-git-repo-origin-if-present";
-    runtimeInputs = [ pkgs.git ];
+    runtimeInputs = [pkgs.git];
     text = ''
       die() {
         echo "$@" >&2
@@ -33,7 +38,7 @@
   };
   cloneGitRepoIfNeeded = pkgs.writeShellApplication {
     name = "clone-git-repo-if-needed";
-    runtimeInputs = [ pkgs.git ];
+    runtimeInputs = [pkgs.git];
     text = ''
       target_dir="${targetDir}"
       git_origin="${repoUrl}"
