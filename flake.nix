@@ -28,7 +28,6 @@
       ...
     }: let
       pkgs = nixpkgs.legacyPackages.${system};
-      homeDirectory = homeDirectoryFor system username;
     in
       home-manager.lib.homeManagerConfiguration {
         inherit pkgs;
@@ -50,7 +49,7 @@
 
             home = {
               username = "kamal";
-              inherit homeDirectory;
+              homeDirectory = homeDirectoryFor system username;
               stateVersion = "22.11";
 
               sessionVariables = {
