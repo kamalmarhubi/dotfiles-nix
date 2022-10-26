@@ -12,8 +12,12 @@
   };
 
   outputs = { nixpkgs, home-manager, ... }: let
-    maker = { system, homeDirectory, ... }: let
-     pkgs = nixpkgs.legacyPackages.${system};
+    homeDirectoryFor = system: username: if builtins.match ".*darwin" system != null
+      then "/Users/${username}"
+      else "/home/${username}";
+    mkConfig = { username ? "kamal", system, ... }: let
+      pkgs = nixpkgs.legacyPackages.${system};
+      homeDirectory = homeDirectoryFor system username;
     in
     home-manager.lib.homeManagerConfiguration {
      inherit pkgs;
@@ -58,13 +62,11 @@
   in
   {
     homeConfigurations = rec {
-      genericLinux = maker {
+      genericLinux = mkConfig {
         system = "x86_64-linux";
-        homeDirectory = "/home/kamal";
       };
-      genericMacos = maker {
+      genericMacos = mkConfig {
         system = "aarch64-darwin";
-        homeDirectory = "/Users/kamal";
       };
       "kamal@kx7" = genericLinux;
       "kamal@kmbpwave.local" = genericMacos;
