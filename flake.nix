@@ -48,7 +48,7 @@
             };
 
             home = {
-              username = "kamal";
+              inherit username;
               homeDirectory = homeDirectoryFor system username;
               stateVersion = "22.11";
 
