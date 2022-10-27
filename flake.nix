@@ -71,6 +71,7 @@
               packages = with pkgs; [
                 atool
                 entr
+                fd
                 ripgrep
                 pv
                 tree
