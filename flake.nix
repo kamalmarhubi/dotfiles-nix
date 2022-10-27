@@ -37,7 +37,7 @@
         # the path to your home.nix.
         modules = [
           ./dotfiles-nix.nix
-          {
+          ({config, ...}: {
             programs = {
               home-manager.enable = true;
               fish.enable = true;
@@ -75,7 +75,8 @@
               end
               # End Nix
             '';
-          }
+            xdg.configFile."nvim".source = config.lib.file.mkOutOfStoreSymlink "${homeDirectory}/.local/share/dotfiles-nix/files/nvim";
+          })
         ];
       };
   in
