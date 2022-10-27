@@ -1,5 +1,8 @@
-# Remaining:
-# - start using it at work
+# TODOs
+# - neovim
+#   - factor out vim plugins to another flake
+#   - add in plugins I know I like
+#   - try out that import.nvim thing
 {
   description = "Kamal pretends to use nix?";
 
