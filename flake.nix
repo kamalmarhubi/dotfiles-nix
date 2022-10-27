@@ -10,12 +10,19 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     flake-utils.url = "github:numtide/flake-utils";
+
+    # Neovim plugins
+    leap-nvim = {
+      url = "github:ggandor/leap.nvim";
+      flake = false;
+    };
   };
 
   outputs = {
     nixpkgs,
     home-manager,
     flake-utils,
+    leap-nvim,
     ...
   }: let
     homeDirectoryFor = system: username:
@@ -29,6 +36,10 @@
     }: let
       homeDirectory = homeDirectoryFor system username;
       pkgs = nixpkgs.legacyPackages.${system};
+      leap = pkgs.vimUtils.buildVimPlugin {
+        name = "leap.nvim";
+        src = leap-nvim;
+      };
     in
       home-manager.lib.homeManagerConfiguration {
         inherit pkgs;
@@ -44,6 +55,7 @@
               neovim = {
                 enable = true;
                 plugins = with pkgs.vimPlugins; [
+                  leap
                 ];
               };
             };
