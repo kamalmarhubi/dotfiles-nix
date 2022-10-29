@@ -52,6 +52,27 @@
         "type": "github"
       }
     },
+    "neovim-plugins": {
+      "inputs": {
+        "flake-utils": [
+          "flake-utils"
+        ],
+        "leap-nvim": "leap-nvim",
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1,
+        "narHash": "sha256-MajEtY9aXVXBaqLi60uXSK21qJeJ/7bw3wlkDuQPoKs=",
+        "path": "./flakes/neovim",
+        "type": "path"
+      },
+      "original": {
+        "path": "./flakes/neovim",
+        "type": "path"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1665940183,
@@ -72,7 +93,7 @@
       "inputs": {
         "flake-utils": "flake-utils",
         "home-manager": "home-manager",
-        "leap-nvim": "leap-nvim",
+        "neovim-plugins": "neovim-plugins",
         "nixpkgs": "nixpkgs"
       }
     },

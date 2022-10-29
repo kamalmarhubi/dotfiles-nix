@@ -1,6 +1,5 @@
 # TODOs
 # - neovim
-#   - factor out vim plugins to another flake
 #   - add in plugins I know I like
 #   - try out that import.nvim thing
 {
@@ -13,11 +12,10 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     flake-utils.url = "github:numtide/flake-utils";
-
-    # Neovim plugins
-    leap-nvim = {
-      url = "github:ggandor/leap.nvim";
-      flake = false;
+    neovim-plugins = {
+      url = "path:./flakes/neovim";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.flake-utils.follows = "flake-utils";
     };
   };
 
@@ -25,7 +23,7 @@
     nixpkgs,
     home-manager,
     flake-utils,
-    leap-nvim,
+    neovim-plugins,
     ...
   }: let
     homeDirectoryFor = system: username:
@@ -39,10 +37,6 @@
     }: let
       homeDirectory = homeDirectoryFor system username;
       pkgs = nixpkgs.legacyPackages.${system};
-      leap = pkgs.vimUtils.buildVimPlugin {
-        name = "leap.nvim";
-        src = leap-nvim;
-      };
     in
       home-manager.lib.homeManagerConfiguration {
         inherit pkgs;
@@ -57,9 +51,10 @@
               fish.enable = true;
               neovim = {
                 enable = true;
-                plugins = with pkgs.vimPlugins; [
-                  leap
-                ];
+                plugins = with pkgs.vimPlugins;
+                  [
+                  ]
+                  ++ builtins.attrValues neovim-plugins.packages.${system};
               };
             };
 
