@@ -2,8 +2,7 @@
 # - neovim
 #   - add in plugins I know I like
 #   - try out that import.nvim thing?
-#   - don't bother with lazy loading or packadd
-#   - do try to dry
+#   - figure out keymapping plugin
 {
   description = "Kamal pretends to use nix?";
 
