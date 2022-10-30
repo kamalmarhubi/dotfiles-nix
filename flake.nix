@@ -43,17 +43,17 @@
         # the path to your home.nix.
         modules = [
           ./dotfiles-nix.nix
-	  neovim-unpackaged-plugins.module
+          neovim-unpackaged-plugins.module
           ({config, ...}: {
             programs = {
               home-manager.enable = true;
               fish.enable = true;
-	      neovim = {
-	        enable = true;
-		plugins = with pkgs.vimPlugins; [
-		  leap-nvim
-		];
-	      };
+              neovim = {
+                enable = true;
+                plugins = with pkgs.vimPlugins; [
+                  leap-nvim
+                ];
+              };
             };
 
             home = {
@@ -84,7 +84,7 @@
               end
               # End Nix
             '';
-	    xdg.configFile."nvim".source = config.lib.file.mkOutOfStoreSymlink "${homeDirectory}/.local/share/dotfiles-nix/files/nvim";
+            xdg.configFile."nvim".source = config.lib.file.mkOutOfStoreSymlink "${homeDirectory}/.local/share/dotfiles-nix/files/nvim";
           })
         ];
       };
