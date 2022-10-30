@@ -1,9 +1,9 @@
 {
   inputs = {
-    #"leap.nvim" = {
-    #  url = "github:ggandor/leap.nvim";
-    #  flake = false;
-    #};
+    "import.nvim" = {
+      url = "github:miversen33/import.nvim";
+      flake = false;
+    };
   };
 
   outputs = inputs: {
