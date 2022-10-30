@@ -1,7 +1,9 @@
 # TODOs
 # - neovim
 #   - add in plugins I know I like
-#   - try out that import.nvim thing
+#   - try out that import.nvim thing?
+#   - don't bother with lazy loading or packadd
+#   - do try to dry
 {
   description = "Kamal pretends to use nix?";
 
@@ -30,12 +32,12 @@
       if builtins.match ".*darwin" system != null
       then "/Users/${username}"
       else "/home/${username}";
-    mkConfig = {
+    homeFor = {
       username ? "kamal",
       system,
+      homeDirectory ? homeDirectoryFor system username,
       ...
     }: let
-      homeDirectory = homeDirectoryFor system username;
       pkgs = nixpkgs.legacyPackages.${system};
     in
       home-manager.lib.homeManagerConfiguration {
@@ -92,15 +94,15 @@
       };
   in
     {
-      homeConfigurations = rec {
-        genericLinux = mkConfig {
+      # For bootstrapping systems that aren't aleady in the homeConfigurations output.
+      inherit homeFor;
+      homeConfigurations = {
+        "kamal@kx7" = homeFor {
           system = "x86_64-linux";
         };
-        genericMacos = mkConfig {
+        "kamal@kmbpwave.local" = homeFor {
           system = "aarch64-darwin";
         };
-        "kamal@kx7" = genericLinux;
-        "kamal@kmbpwave.local" = genericMacos;
       };
     }
     // flake-utils.lib.eachDefaultSystem (system: {
