@@ -52,6 +52,9 @@
                 enable = true;
                 plugins = with pkgs.vimPlugins; [
                   leap-nvim
+                  telescope-nvim
+                  (nvim-treesitter.withPlugins (_: pkgs.tree-sitter.allGrammars))
+                  vim-unimpaired
                 ];
               };
             };
