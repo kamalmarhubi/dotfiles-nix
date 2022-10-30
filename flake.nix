@@ -14,14 +14,14 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     flake-utils.url = "github:numtide/flake-utils";
-    neovim-config.url = "path:./flakes/neovim";
+    neovim-unpackaged-plugins.url = "path:./flakes/neovim-unpackaged-plugins";
   };
 
   outputs = {
     nixpkgs,
     home-manager,
     flake-utils,
-    neovim-config,
+    neovim-unpackaged-plugins,
     ...
   }: let
     homeDirectoryFor = system: username:
@@ -43,11 +43,17 @@
         # the path to your home.nix.
         modules = [
           ./dotfiles-nix.nix
-	  neovim-config.module
+	  neovim-unpackaged-plugins.module
           ({config, ...}: {
             programs = {
               home-manager.enable = true;
               fish.enable = true;
+	      neovim = {
+	        enable = true;
+		plugins = with pkgs.vimPlugins; [
+		  leap-nvim
+		];
+	      };
             };
 
             home = {
@@ -78,6 +84,7 @@
               end
               # End Nix
             '';
+	    xdg.configFile."nvim".source = config.lib.file.mkOutOfStoreSymlink "${homeDirectory}/.local/share/dotfiles-nix/files/nvim";
           })
         ];
       };
