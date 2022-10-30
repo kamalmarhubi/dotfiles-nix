@@ -36,10 +36,29 @@
         "type": "github"
       }
     },
+    "import.nvim": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1666730474,
+        "narHash": "sha256-mpRBvDp+NaekeB1RyYRdwy/BQORUZDymI9l1xaVXCTo=",
+        "owner": "miversen33",
+        "repo": "import.nvim",
+        "rev": "ae0204208ecd1eb2239f3597df6a9b2dc5686b37",
+        "type": "github"
+      },
+      "original": {
+        "owner": "miversen33",
+        "repo": "import.nvim",
+        "type": "github"
+      }
+    },
     "neovim-unpackaged-plugins": {
+      "inputs": {
+        "import.nvim": "import.nvim"
+      },
       "locked": {
         "lastModified": 1,
-        "narHash": "sha256-3wFSioXsapI4kOa+tp1dmIYElPxS/P+tNUXLNtrz3Do=",
+        "narHash": "sha256-S8OJ1Ky9ZBWfPA3GeJzRHtFgmzcfb5V3ilnkRUJmHTE=",
         "path": "./flakes/neovim-unpackaged-plugins",
         "type": "path"
       },
