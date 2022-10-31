@@ -1,8 +1,9 @@
 # TODOs
 # - neovim
 #   - add in plugins I know I like
-#   - try out that import.nvim thing?
 #   - figure out keymapping plugin
+#   - really: color scheme?
+#   - print out new thing to put in packpath after activation? the way to do that would be via neovim not nix
 {
   description = "Kamal pretends to use nix?";
 
