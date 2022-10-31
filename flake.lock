@@ -1,5 +1,21 @@
 {
   "nodes": {
+    "acme-colors": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1651497924,
+        "narHash": "sha256-T8GLNeJLWp8rJqgO9fsDnmE4NG7bcFa3zF5CkjrcrV0=",
+        "owner": "plan9-for-vimspace",
+        "repo": "acme-colors",
+        "rev": "c2ae949144fc9d38cf16d9369b567c8918cf2a82",
+        "type": "github"
+      },
+      "original": {
+        "owner": "plan9-for-vimspace",
+        "repo": "acme-colors",
+        "type": "github"
+      }
+    },
     "flake-utils": {
       "locked": {
         "lastModified": 1659877975,
@@ -52,13 +68,32 @@
         "type": "github"
       }
     },
+    "monotone.nvim": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1639945295,
+        "narHash": "sha256-fEcEYkrXfL19iE4Svwn5de6mOwJ2D8kKogv4axYLF1o=",
+        "owner": "Lokaltog",
+        "repo": "monotone.nvim",
+        "rev": "32b906d8c0ee248d086a7f2a808a4d89fb997d9d",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Lokaltog",
+        "repo": "monotone.nvim",
+        "type": "github"
+      }
+    },
     "neovim-unpackaged-plugins": {
       "inputs": {
-        "import.nvim": "import.nvim"
+        "acme-colors": "acme-colors",
+        "import.nvim": "import.nvim",
+        "monotone.nvim": "monotone.nvim",
+        "vim-bw": "vim-bw"
       },
       "locked": {
         "lastModified": 1,
-        "narHash": "sha256-S8OJ1Ky9ZBWfPA3GeJzRHtFgmzcfb5V3ilnkRUJmHTE=",
+        "narHash": "sha256-cfAtD0o25M+cK0QNBpY/9QOJSkVY5ja71jJ2Vvx/nzg=",
         "path": "./flakes/neovim-unpackaged-plugins",
         "type": "path"
       },
@@ -104,6 +139,22 @@
         "owner": "numtide",
         "repo": "flake-utils",
         "type": "github"
+      }
+    },
+    "vim-bw": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1666940645,
+        "narHash": "sha256-bhsa7ClcQA5llvrdZQb3PBmYc8qPrHmJkdKgmwjv21o=",
+        "ref": "refs/heads/master",
+        "rev": "fce17f2b8d9d26b49d88f2f78dba3245d1a885e6",
+        "revCount": 54,
+        "type": "git",
+        "url": "https://git.goral.net.pl/mgoral/vim-bw.git"
+      },
+      "original": {
+        "type": "git",
+        "url": "https://git.goral.net.pl/mgoral/vim-bw.git"
       }
     }
   },
