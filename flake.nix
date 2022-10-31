@@ -47,7 +47,12 @@
           ({config, ...}: {
             programs = {
               home-manager.enable = true;
-              fish.enable = true;
+              fish = {
+                enable = true;
+                shellInit = ''
+                  source $HOME/.nix-profile/share/asdf-vm/asdf.fish
+                '';
+              };
               neovim = {
                 enable = true;
                 plugins = with pkgs.vimPlugins; [
@@ -76,6 +81,7 @@
               };
 
               packages = with pkgs; [
+                asdf-vm
                 atool
                 entr
                 fd
