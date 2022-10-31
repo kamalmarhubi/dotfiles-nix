@@ -52,6 +52,7 @@
                 plugins = with pkgs.vimPlugins; [
                   comment-nvim
                   guess-indent-nvim
+                  lazy-lsp-nvim
                   leap-nvim
                   nvim-surround
                   telescope-nvim
