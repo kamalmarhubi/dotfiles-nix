@@ -51,14 +51,17 @@
                 enable = true;
                 plugins = with pkgs.vimPlugins; [
                   comment-nvim
+                  dressing-nvim
                   guess-indent-nvim
                   lazy-lsp-nvim
                   leap-nvim
+                  legendary-nvim
                   lush-nvim
                   nvim-surround
                   telescope-nvim
                   (nvim-treesitter.withPlugins (_: pkgs.tree-sitter.allGrammars))
                   vim-unimpaired
+                  which-key-nvim
                 ];
               };
             };
