@@ -54,6 +54,7 @@
                   guess-indent-nvim
                   lazy-lsp-nvim
                   leap-nvim
+                  lush-nvim
                   nvim-surround
                   telescope-nvim
                   (nvim-treesitter.withPlugins (_: pkgs.tree-sitter.allGrammars))

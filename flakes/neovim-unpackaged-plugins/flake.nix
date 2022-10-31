@@ -1,7 +1,19 @@
 {
   inputs = {
+    acme-colors = {
+      url = "github:plan9-for-vimspace/acme-colors";
+      flake = false;
+    };
     "import.nvim" = {
       url = "github:miversen33/import.nvim";
+      flake = false;
+    };
+    "monotone.nvim" = {
+      url = "github:Lokaltog/monotone.nvim";
+      flake = false;
+    };
+    vim-bw = {
+      url = "git+https://git.goral.net.pl/mgoral/vim-bw.git";
       flake = false;
     };
   };
