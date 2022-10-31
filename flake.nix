@@ -50,6 +50,8 @@
               neovim = {
                 enable = true;
                 plugins = with pkgs.vimPlugins; [
+                  comment-nvim
+                  guess-indent-nvim
                   leap-nvim
                   telescope-nvim
                   (nvim-treesitter.withPlugins (_: pkgs.tree-sitter.allGrammars))
