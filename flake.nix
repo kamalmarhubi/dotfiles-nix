@@ -53,6 +53,7 @@
                   comment-nvim
                   guess-indent-nvim
                   leap-nvim
+                  nvim-surround
                   telescope-nvim
                   (nvim-treesitter.withPlugins (_: pkgs.tree-sitter.allGrammars))
                   vim-unimpaired
