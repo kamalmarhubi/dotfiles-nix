@@ -77,6 +77,7 @@
                   nvim-surround
                   telescope-nvim
                   (nvim-treesitter.withPlugins (_: pkgs.tree-sitter.allGrammars))
+                  nvim-treesitter-textobjects
                   vim-unimpaired
                   which-key-nvim
                 ];
