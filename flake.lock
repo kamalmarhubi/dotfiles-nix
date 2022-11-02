@@ -68,6 +68,23 @@
         "type": "github"
       }
     },
+    "lazy-lsp.nvim": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1667415266,
+        "narHash": "sha256-6vXBE3UdS9MmOxMpYqzEkwB0Y3kom2qav1dI59aZOLU=",
+        "owner": "kamalmarhubi",
+        "repo": "lazy-lsp.nvim",
+        "rev": "ef76c2d0a0406b3717b8935f0f11206aa01d8302",
+        "type": "github"
+      },
+      "original": {
+        "owner": "kamalmarhubi",
+        "ref": "empty-config",
+        "repo": "lazy-lsp.nvim",
+        "type": "github"
+      }
+    },
     "monotone.nvim": {
       "flake": false,
       "locked": {
@@ -88,12 +105,13 @@
       "inputs": {
         "acme-colors": "acme-colors",
         "import.nvim": "import.nvim",
+        "lazy-lsp.nvim": "lazy-lsp.nvim",
         "monotone.nvim": "monotone.nvim",
         "vim-bw": "vim-bw"
       },
       "locked": {
         "lastModified": 1,
-        "narHash": "sha256-cfAtD0o25M+cK0QNBpY/9QOJSkVY5ja71jJ2Vvx/nzg=",
+        "narHash": "sha256-cVJyRgb+miQmR0oXi5dFLYdwdkggxu9Jq9Ir7qzkoOs=",
         "path": "./flakes/neovim-unpackaged-plugins",
         "type": "path"
       },

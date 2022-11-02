@@ -16,6 +16,10 @@
       url = "git+https://git.goral.net.pl/mgoral/vim-bw.git";
       flake = false;
     };
+    "lazy-lsp.nvim" = {
+      url = "github:kamalmarhubi/lazy-lsp.nvim/empty-config";
+      flake = false;
+    };
   };
 
   outputs = inputs: {

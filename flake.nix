@@ -68,10 +68,12 @@
                   comment-nvim
                   dressing-nvim
                   guess-indent-nvim
-                  lazy-lsp-nvim
+                  # Go back to upstream when this PR is merged: https://github.com/dundalek/lazy-lsp.nvim/pull/3
+                  # lazy-lsp-nvim
                   leap-nvim
                   legendary-nvim
                   lush-nvim
+                  nvim-lspconfig
                   nvim-surround
                   telescope-nvim
                   (nvim-treesitter.withPlugins (_: pkgs.tree-sitter.allGrammars))
