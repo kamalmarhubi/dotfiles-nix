@@ -1,6 +1,7 @@
 # TODOs
 # - neovim
 #   - add in plugins I know I like
+#     - indent-line?rt:wq
 #   - figure out keymapping plugin
 #     - put in a minimal mapping??
 #   - really: color scheme?
@@ -10,6 +11,8 @@
 #     - OR: add way to switch to current generation's packdir and reload everything
 #       - `nvim --headless '+lua print(vim.opt.packpath:get()[1])' +q` will print packdir from new neovim
 #       - v:argv contains arguments of this running nvim: can be used to reset packpath
+#   - lazy-lsp
+#     - figure out a way to have it use the same nixpkgs as my home-manager config
 # - misc:
 #   - add a thing that checks /etc/pam.d/sudo for auth sufficient pam_tid.so and suggests adding it if absent
 #   - similar check for yubikey?
