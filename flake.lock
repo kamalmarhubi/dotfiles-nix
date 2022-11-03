@@ -85,6 +85,22 @@
         "type": "github"
       }
     },
+    "lush.nvim": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1666431065,
+        "narHash": "sha256-M26Qb9woh714YcNxlzIqhQGUjpVtEHf4ZsXlCsX8vm4=",
+        "owner": "rktjmp",
+        "repo": "lush.nvim",
+        "rev": "57e0b8574d1edf00f16e7ee82ea39bbe19825cb1",
+        "type": "github"
+      },
+      "original": {
+        "owner": "rktjmp",
+        "repo": "lush.nvim",
+        "type": "github"
+      }
+    },
     "monotone.nvim": {
       "flake": false,
       "locked": {
@@ -106,12 +122,13 @@
         "acme-colors": "acme-colors",
         "import.nvim": "import.nvim",
         "lazy-lsp.nvim": "lazy-lsp.nvim",
+        "lush.nvim": "lush.nvim",
         "monotone.nvim": "monotone.nvim",
         "vim-bw": "vim-bw"
       },
       "locked": {
         "lastModified": 1,
-        "narHash": "sha256-cVJyRgb+miQmR0oXi5dFLYdwdkggxu9Jq9Ir7qzkoOs=",
+        "narHash": "sha256-2vdvnf3oBKQTZSwGgsKO5awuCRd99AFrdx+oBSiXcCM=",
         "path": "./flakes/neovim-unpackaged-plugins",
         "type": "path"
       },

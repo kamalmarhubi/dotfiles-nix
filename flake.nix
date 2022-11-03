@@ -75,7 +75,8 @@
                   # lazy-lsp-nvim
                   leap-nvim
                   legendary-nvim
-                  lush-nvim
+                  # For some reason the one from nixpkgs does't include the plugin directory so it's a bit broken
+                  # lush-nvim
                   nvim-lspconfig
                   nvim-surround
                   telescope-nvim
