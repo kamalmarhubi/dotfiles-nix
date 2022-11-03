@@ -20,6 +20,10 @@
       url = "github:kamalmarhubi/lazy-lsp.nvim/flake";
       flake = false;
     };
+    "lush.nvim" = {
+      url = "github:rktjmp/lush.nvim";
+      flake = false;
+    };
   };
 
   outputs = inputs: {
