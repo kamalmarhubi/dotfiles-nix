@@ -17,7 +17,7 @@
       flake = false;
     };
     "lazy-lsp.nvim" = {
-      url = "github:kamalmarhubi/lazy-lsp.nvim/empty-config";
+      url = "github:kamalmarhubi/lazy-lsp.nvim/flake";
       flake = false;
     };
   };

@@ -71,16 +71,16 @@
     "lazy-lsp.nvim": {
       "flake": false,
       "locked": {
-        "lastModified": 1667415266,
+        "lastModified": 1667422391,
         "narHash": "sha256-6vXBE3UdS9MmOxMpYqzEkwB0Y3kom2qav1dI59aZOLU=",
         "owner": "kamalmarhubi",
         "repo": "lazy-lsp.nvim",
-        "rev": "ef76c2d0a0406b3717b8935f0f11206aa01d8302",
+        "rev": "7866efc6e5bef78e7f14ab2c0118c1fed15947c9",
         "type": "github"
       },
       "original": {
         "owner": "kamalmarhubi",
-        "ref": "empty-config",
+        "ref": "flake",
         "repo": "lazy-lsp.nvim",
         "type": "github"
       }
