@@ -13,6 +13,9 @@ require('leap').add_default_mappings()
 require('Comment').setup()
 require('guess-indent').setup()
 require('nvim-surround').setup()
+-- This is required before lspconfig is set up, which is done by lazy-lsp just below. See
+--   https://github.com/folke/neodev.nvim#-setup
+require('neodev').setup()
 require('lazy-lsp').setup {
   excluded_servers = {
     "efm",
