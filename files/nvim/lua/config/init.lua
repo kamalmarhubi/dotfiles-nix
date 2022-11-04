@@ -14,6 +14,14 @@ import('lazy-lsp', function(m) m.setup {
     "efm",
     "diagnosticls"
   },
+  default_config = {
+    on_attach = function(client, buffnr)
+      local wk = require('which-key')
+      wk.register({["<leader>l"] = { name = "lsp" } }, { buffer = buffnr })
+      vim.keymap.set("n", "<leader>lr", "<cmd>Telescope lsp_references<cr>", { desc = "references", buffer = buffnr })
+      vim.keymap.set("n", "<leader>ld", "<cmd>lua vim.lsp.buf.definition()<cr>", { desc = "definition", buffer = buffnr })
+    end,
+  },
 }
 end)
 import('nvim-treesitter.configs', function(m) m.setup {
