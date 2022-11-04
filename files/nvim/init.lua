@@ -1,2 +1,1 @@
-require('import')
-import('config')
+require('config')

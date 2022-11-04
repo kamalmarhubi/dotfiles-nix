@@ -52,22 +52,6 @@
         "type": "github"
       }
     },
-    "import.nvim": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1666730474,
-        "narHash": "sha256-mpRBvDp+NaekeB1RyYRdwy/BQORUZDymI9l1xaVXCTo=",
-        "owner": "miversen33",
-        "repo": "import.nvim",
-        "rev": "ae0204208ecd1eb2239f3597df6a9b2dc5686b37",
-        "type": "github"
-      },
-      "original": {
-        "owner": "miversen33",
-        "repo": "import.nvim",
-        "type": "github"
-      }
-    },
     "lazy-lsp.nvim": {
       "flake": false,
       "locked": {
@@ -120,7 +104,6 @@
     "neovim-unpackaged-plugins": {
       "inputs": {
         "acme-colors": "acme-colors",
-        "import.nvim": "import.nvim",
         "lazy-lsp.nvim": "lazy-lsp.nvim",
         "lush.nvim": "lush.nvim",
         "monotone.nvim": "monotone.nvim",
@@ -128,7 +111,7 @@
       },
       "locked": {
         "lastModified": 1,
-        "narHash": "sha256-2vdvnf3oBKQTZSwGgsKO5awuCRd99AFrdx+oBSiXcCM=",
+        "narHash": "sha256-wIBurhsXMngM8ZWC6DiWho2HJkEZUgu+a1UJmgIydv8=",
         "path": "./flakes/neovim-unpackaged-plugins",
         "type": "path"
       },
