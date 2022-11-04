@@ -79,6 +79,7 @@
                   nvim-surround
                   plenary-nvim
                   telescope-nvim
+                  telescope-fzf-native-nvim
                   (nvim-treesitter.withPlugins (_: pkgs.tree-sitter.allGrammars))
                   nvim-treesitter-textobjects
                   vim-unimpaired

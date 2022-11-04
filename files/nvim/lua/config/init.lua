@@ -40,6 +40,8 @@ import('nvim-treesitter.configs', function(m) m.setup {
 }
 end)
 
+import('telescope', function(m) m.load_extension('fzf'); return nil end)
+
 import('config.map')
 
 vim.opt.termguicolors = true
