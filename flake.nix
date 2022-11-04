@@ -1,7 +1,7 @@
 # TODOs
 # - neovim
 #   - add in plugins I know I like
-#     - indent-line?rt:wq
+#     - indent-line?
 #   - figure out keymapping plugin
 #     - put in a minimal mapping??
 #   - really: color scheme?
