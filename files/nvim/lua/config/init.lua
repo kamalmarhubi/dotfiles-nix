@@ -1,6 +1,8 @@
 -- Super handy command mode abbreviation for the directory of the current file.
 -- From
 --   http://vim.wikia.com/wiki/Easy_edit_of_files_in_the_same_directory#Using_a_command_line_abbreviation
+vim.g.mapleader = ' '
+vim.o.timeoutlen = 500
 vim.cmd[[cabbr <expr> %% expand('%:p:h')]]
 
 import('leap', function(m) m.add_default_mappings() end)
@@ -23,6 +25,8 @@ import('nvim-treesitter.configs', function(m) m.setup {
   },
 }
 end)
+
+import('config.map')
 
 vim.opt.termguicolors = true
 vim.cmd.colorscheme('acme')
