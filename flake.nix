@@ -2,8 +2,6 @@
 # - neovim
 #   - add in plugins I know I like
 #     - indent-line?
-#   - figure out keymapping plugin
-#     - put in a minimal mapping??
 #   - really: color scheme?
 #     - acme is ok; need to fix cursor highlight though
 #     - also link various builtins' hl groups to the non-built-in version
@@ -79,6 +77,7 @@
                   # lush-nvim
                   nvim-lspconfig
                   nvim-surround
+                  plenary-nvim
                   telescope-nvim
                   (nvim-treesitter.withPlugins (_: pkgs.tree-sitter.allGrammars))
                   nvim-treesitter-textobjects
