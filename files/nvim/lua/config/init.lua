@@ -9,7 +9,13 @@ import('leap', function(m) m.add_default_mappings() end)
 import('Comment', function(m) m.setup() end)
 import('guess-indent', function(m) m.setup() end)
 import('nvim-surround', function(m) m.setup() end)
-import('lazy-lsp', function(m) m.setup() end)
+import('lazy-lsp', function(m) m.setup {
+  excluded_servers = {
+    "efm",
+    "diagnosticls"
+  },
+}
+end)
 import('nvim-treesitter.configs', function(m) m.setup {
   highlight = { enable = true },
   textobjects = {
