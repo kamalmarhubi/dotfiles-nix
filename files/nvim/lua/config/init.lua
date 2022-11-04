@@ -1,15 +1,19 @@
+vim.g.mapleader = ' '
+vim.o.timeoutlen = 500
+
+vim.opt.termguicolors = true
+vim.cmd.colorscheme('acme')
+
 -- Super handy command mode abbreviation for the directory of the current file.
 -- From
 --   http://vim.wikia.com/wiki/Easy_edit_of_files_in_the_same_directory#Using_a_command_line_abbreviation
-vim.g.mapleader = ' '
-vim.o.timeoutlen = 500
 vim.cmd[[cabbr <expr> %% expand('%:p:h')]]
 
-import('leap', function(m) m.add_default_mappings() end)
-import('Comment', function(m) m.setup() end)
-import('guess-indent', function(m) m.setup() end)
-import('nvim-surround', function(m) m.setup() end)
-import('lazy-lsp', function(m) m.setup {
+require('leap').add_default_mappings()
+require('Comment').setup()
+require('guess-indent').setup()
+require('nvim-surround').setup()
+require('lazy-lsp').setup {
   excluded_servers = {
     "efm",
     "diagnosticls"
@@ -23,8 +27,7 @@ import('lazy-lsp', function(m) m.setup {
     end,
   },
 }
-end)
-import('nvim-treesitter.configs', function(m) m.setup {
+require('nvim-treesitter.configs').setup {
   highlight = { enable = true },
   textobjects = {
     select = {
@@ -38,11 +41,7 @@ import('nvim-treesitter.configs', function(m) m.setup {
     },
   },
 }
-end)
 
-import('telescope', function(m) m.load_extension('fzf'); return nil end)
+require('telescope').load_extension('fzf');
 
-import('config.map')
-
-vim.opt.termguicolors = true
-vim.cmd.colorscheme('acme')
+require('config.map')
