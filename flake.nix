@@ -1,13 +1,38 @@
 # TODOs
 # - neovim
-#   - add in plugins I know I like
-#     - indent-line?
 #   - really: color scheme?
 #     - acme is ok; need to fix cursor highlight though
 #     - also link various builtins' hl groups to the non-built-in version
+#     - import to lush.nvim to make editing easier
+#     - fix DevIconMd
+#   - completion!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#   - make git happen somehow
+#     - neogit?
+#   - add in plugins I know I like
+#   - try new plugins
+#     - editorconfig
+#     - portal.nvim
+#     - luasnip
+#     - bqf
+#     - hydra.nvim?
+#     - indent-line?
+#       - not until sorting out color scheme
+#     - lsp niceties
+#       - noice?
+#       - trouble?
+#       - lspsaga?
+#       - one of the where-am-i things?
+#       - improve diagnostics
+#   - misc config
+#     - laststatus=3?
+#     - cmdheight=0?
+#     - winbar?
+#     - formatoptions: check `:h fo-table` for other useful stuff
+#   - telescope
+#     - figure out why <c-space> doesn't work to go from live_grep to fuzzy search (macos)
 #   - print out new thing to put in packpath after activation? the way to do that would be via neovim not nix
 #     - OR: add way to switch to current generation's packdir and reload everything
-#       - `nvim --headless '+lua print(vim.opt.packpath:get()[1])' +q` will print packdir from new neovim
+#       - `nvim -u NONE --headless '+lua print(vim.opt.packpath:get()[1])' +q` will print packdir from new neovim
 #       - v:argv contains arguments of this running nvim: can be used to reset packpath
 #   - lazy-lsp
 #     - figure out a way to have it use the same nixpkgs as my home-manager config
