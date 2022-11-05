@@ -1,15 +1,20 @@
 # TODOs
 # - neovim
 #   - really: color scheme?
-#     - acme is ok; need to fix cursor highlight though
-#     - also link various builtins' hl groups to the non-built-in version
 #     - import to lush.nvim to make editing easier
-#     - fix DevIconMd
+#     - acme is ok
+#       - need to fix cursor highlight though
+#       - also need to fix leap highlight
+#     - also link various builtins' hl groups to the non-built-in version
+#     - fix DevIconMd or whatever the Markdown one is called
 #   - completion!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 #   - make git happen somehow
-#     - neogit?
+#     - neogit? lazygit? fugitive? git-messenger?
 #   - add in plugins I know I like
 #   - try new plugins
+#     - configure dressing.nvim?
+#     - nvim-treesitter-textsubjects
+#     - some kind of swap-with-register thing
 #     - editorconfig
 #     - portal.nvim
 #     - luasnip
@@ -17,6 +22,8 @@
 #     - hydra.nvim?
 #     - indent-line?
 #       - not until sorting out color scheme
+#     - treesitter things
+#       - incremental_selection
 #     - lsp niceties
 #       - noice?
 #       - trouble?
