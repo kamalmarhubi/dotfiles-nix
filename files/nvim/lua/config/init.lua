@@ -46,6 +46,13 @@ require('nvim-treesitter.configs').setup {
     },
   },
 }
+require('nvim-cursorline').setup{
+  cursorline = {
+    enable = true,
+    number = true,
+  },
+  cursorword = { enable = false },
+}
 
 require('telescope').load_extension('fzf');
 
