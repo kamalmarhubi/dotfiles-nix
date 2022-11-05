@@ -102,6 +102,8 @@
                 atool
                 entr
                 fd
+                (nerdfonts.override { fonts = [ "NerdFontsSymbolsOnly" ]; })
+                (iosevka-bin.override {variant = "sgr-iosevka-fixed";})
                 ripgrep
                 pv
                 tree
@@ -119,6 +121,7 @@
               # End Nix
             '';
             xdg.configFile."nvim".source = config.lib.file.mkOutOfStoreSymlink "${homeDirectory}/.local/share/dotfiles-nix/files/nvim";
+            xdg.configFile."kitty".source = config.lib.file.mkOutOfStoreSymlink "${homeDirectory}/.local/share/dotfiles-nix/files/kitty";
           })
         ];
       };
