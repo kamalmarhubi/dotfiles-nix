@@ -111,6 +111,7 @@
                   nvim-cursorline
                   nvim-lspconfig
                   nvim-surround
+                  playground  # nvim-tresitter/playground
                   plenary-nvim
                   telescope-nvim
                   telescope-fzf-native-nvim
