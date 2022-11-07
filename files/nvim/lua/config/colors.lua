@@ -1,0 +1,441 @@
+local lush = require("lush")
+local hsl = lush.hsl
+local hsluv = lush.hsluv
+
+local theme = lush(function()
+  -- Starting values are from acme-colors
+  -- https://github.com/plan9-for-vimspace/acme-colors/blob/master/colors/acme.vim
+  return {
+    Normal                                 { bg="#ffffea", fg="#000000", }, -- Normal         xxx ctermfg=232 ctermbg=230 guifg=#000000 guibg=#ffffea
+    NonText                                { bg="bg", fg="fg", gui="bold", }, -- NonText        xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    StatusLine                             { bg="#aeeeee", fg="#000000", }, -- StatusLine     xxx ctermfg=232 ctermbg=159 guifg=#000000 guibg=#aeeeee
+    StatusLineNC                           { bg="#eaffff", fg="#000000", }, -- StatusLineNC   xxx ctermfg=232 ctermbg=194 guifg=#000000 guibg=#eaffff
+    WildMenu                               { bg="#000000", fg="#eaffff", }, -- WildMenu       xxx ctermfg=159 ctermbg=0 guifg=#eaffff guibg=#000000
+    VertSplit                              { bg="#ffffea", fg="#000000", }, -- VertSplit      xxx ctermfg=232 ctermbg=159 guifg=#000000 guibg=#ffffea
+    Folded                                 { bg="#cccc7c", fg="fg", gui="italic", }, -- Folded         xxx cterm=italic ctermfg=232 ctermbg=187 gui=italic guifg=fg guibg=#cccc7c
+    FoldColumn                             { bg="#fcfcce", fg="fg", }, -- FoldColumn     xxx ctermfg=232 ctermbg=229 guifg=fg guibg=#fcfcce
+    Conceal                                { bg="bg", fg="fg", }, -- Conceal        xxx ctermfg=232 ctermbg=230 guifg=fg guibg=bg
+    LineNr                                 { bg="bg", fg="#505050", gui="italic", }, -- LineNr         xxx cterm=italic ctermfg=239 ctermbg=230 gui=italic guifg=#505050 guibg=bg
+    Visual                                 { bg="fg", fg="bg", }, -- Visual         xxx ctermfg=230 ctermbg=232 guifg=bg guibg=fg
+    CursorLine                             { bg="#ffffca", fg="fg", }, -- CursorLine     xxx cterm=underline ctermfg=232 ctermbg=230 guifg=fg guibg=#ffffca
+    Pmenu                                  { bg="bg", fg="fg", }, -- Pmenu          xxx ctermfg=232 ctermbg=230 guifg=fg guibg=bg
+    PmenuSel                               { bg="fg", fg="bg", }, -- PmenuSel       xxx ctermfg=230 ctermbg=232 guifg=bg guibg=fg
+
+    Statement                              { bg="bg", fg="fg", gui="italic", }, -- Statement      xxx cterm=italic ctermfg=232 ctermbg=230 gui=italic guifg=fg guibg=bg
+    Identifier                             { bg="bg", fg="fg", gui="bold", }, -- Identifier     xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    Type                                   { bg="bg", fg="fg", gui="bold", }, -- Type           xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    PreProc                                { bg="bg", fg="fg", gui="bold", }, -- PreProc        xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    Constant                               { bg="bg", fg="#101010", gui="bold", }, -- Constant       xxx cterm=italic ctermfg=233 ctermbg=230 gui=bold guifg=#101010 guibg=bg
+    Comment                                { italic = true, }, -- Comment        xxx cterm=italic ctermfg=236 ctermbg=230 gui=italic guifg=#303030 guibg=bg
+    Special                                { bg="bg", fg="fg", gui="bold", }, -- Special        xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    SpecialKey                             { bg="bg", fg="fg", gui="bold", }, -- SpecialKey     xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+
+    Directory                              { bg="bg", fg="fg", gui="bold", }, -- Directory      xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    Title                                  { Directory }, -- Title          xxx ctermfg=5 gui=bold guifg=Magenta
+    MoreMsg                                { Comment }, -- MoreMsg        xxx ctermfg=2 gui=bold guifg=SeaGreen
+    Question                               { Comment }, -- Question       xxx ctermfg=2 gui=bold guifg=SeaGreen
+
+    -- Noise from running :LushImport
+
+    -- SpecialKey                             { bg="bg", gui="bold", fg="fg", }, -- SpecialKey     xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    -- TermCursor                             { gui="reverse", }, -- TermCursor     xxx cterm=reverse gui=reverse
+    -- NonText                                { bg="bg", gui="bold", fg="fg", }, -- NonText        xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    -- EndOfBuffer                            { NonText }, -- EndOfBuffer    xxx links to NonText
+    -- Whitespace                             { NonText }, -- Whitespace     xxx links to NonText
+    -- TelescopePromptCounter                 { NonText }, -- TelescopePromptCounter xxx links to NonText
+    -- TelescopeResultsDiffUntracked          { NonText }, -- TelescopeResultsDiffUntracked xxx links to NonText
+    -- TelescopePreviewHyphen                 { NonText }, -- TelescopePreviewHyphen xxx links to NonText
+    -- Directory                              { bg="bg", gui="bold", fg="fg", }, -- Directory      xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    -- TelescopePreviewDirectory              { Directory }, -- TelescopePreviewDirectory xxx links to Directory
+    -- TelescopePreviewDate                   { Directory }, -- TelescopePreviewDate xxx links to Directory
+    -- ErrorMsg                               { bg="red", fg="white", }, -- ErrorMsg       xxx ctermfg=15 ctermbg=1 guifg=White guibg=Red
+    -- NvimInvalidSpacing                     { ErrorMsg }, -- NvimInvalidSpacing xxx links to ErrorMsg
+    -- IncSearch                              { gui="reverse", }, -- IncSearch      xxx cterm=reverse gui=reverse
+    -- Search                                 { bg="yellow", }, -- Search         xxx ctermbg=11 guibg=Yellow
+    -- QuickFixLine                           { Search }, -- QuickFixLine   xxx links to Search
+    -- Substitute                             { Search }, -- Substitute     xxx links to Search
+    -- TelescopePreviewMatch                  { Search }, -- TelescopePreviewMatch xxx links to Search
+    -- MoreMsg                                { gui="bold", fg="seagreen", }, -- MoreMsg        xxx ctermfg=2 gui=bold guifg=SeaGreen
+    -- ModeMsg                                { gui="bold", }, -- ModeMsg        xxx cterm=bold gui=bold
+    -- LineNr                                 { bg="bg", gui="italic", fg="#505050", }, -- LineNr         xxx cterm=italic ctermfg=239 ctermbg=230 gui=italic guifg=#505050 guibg=bg
+    -- LineNrAbove                            { LineNr }, -- LineNrAbove    xxx links to LineNr
+    -- LineNrBelow                            { LineNr }, -- LineNrBelow    xxx links to LineNr
+    -- TelescopeResultsLineNr                 { LineNr }, -- TelescopeResultsLineNr xxx links to LineNr
+    -- CursorLineNr                           { gui="bold", fg="brown", }, -- CursorLineNr   xxx cterm=underline ctermfg=130 gui=bold guifg=Brown
+    -- Question                               { gui="bold", fg="seagreen", }, -- Question       xxx ctermfg=2 gui=bold guifg=SeaGreen
+    -- StatusLine                             { bg="#aeeeee", fg="#000000", }, -- StatusLine     xxx ctermfg=232 ctermbg=159 guifg=#000000 guibg=#aeeeee
+    -- MsgSeparator                           { StatusLine }, -- MsgSeparator   xxx links to StatusLine
+    -- StatusLineNC                           { bg="#eaffff", fg="#000000", }, -- StatusLineNC   xxx ctermfg=232 ctermbg=194 guifg=#000000 guibg=#eaffff
+    -- VertSplit                              { bg="#ffffea", fg="#000000", }, -- VertSplit      xxx ctermfg=232 ctermbg=159 guifg=#000000 guibg=#ffffea
+    -- WinSeparator                           { VertSplit }, -- WinSeparator   xxx links to VertSplit
+    -- Title                                  { gui="bold", fg="magenta", }, -- Title          xxx ctermfg=5 gui=bold guifg=Magenta
+    -- LspInfoTitle                           { Title }, -- LspInfoTitle   xxx links to Title
+    -- Visual                                 { bg="fg", fg="bg", }, -- Visual         xxx ctermfg=230 ctermbg=232 guifg=bg guibg=fg
+    -- NvimSurroundHighlight                  { Visual }, -- NvimSurroundHighlight xxx links to Visual
+    -- TSPlaygroundFocus                      { Visual }, -- TSPlaygroundFocus xxx links to Visual
+    -- TelescopeSelection                     { Visual }, -- TelescopeSelection xxx links to Visual
+    -- TelescopePreviewLine                   { Visual }, -- TelescopePreviewLine xxx links to Visual
+    -- WarningMsg                             { fg="red", }, -- WarningMsg     xxx ctermfg=1 guifg=Red
+    -- WildMenu                               { bg="#000000", fg="#eaffff", }, -- WildMenu       xxx ctermfg=159 ctermbg=0 guifg=#eaffff guibg=#000000
+    -- Folded                                 { bg="#cccc7c", gui="italic", fg="fg", }, -- Folded         xxx cterm=italic ctermfg=232 ctermbg=187 gui=italic guifg=fg guibg=#cccc7c
+    -- FoldColumn                             { bg="#fcfcce", fg="fg", }, -- FoldColumn     xxx ctermfg=232 ctermbg=229 guifg=fg guibg=#fcfcce
+    -- CursorLineFold                         { FoldColumn }, -- CursorLineFold xxx links to FoldColumn
+    -- DiffAdd                                { bg="lightblue", }, -- DiffAdd        xxx ctermbg=81 guibg=LightBlue
+    -- TelescopeResultsDiffAdd                { DiffAdd }, -- TelescopeResultsDiffAdd xxx links to DiffAdd
+    -- DiffChange                             { bg="lightmagenta", }, -- DiffChange     xxx ctermbg=225 guibg=LightMagenta
+    -- TelescopeResultsDiffChange             { DiffChange }, -- TelescopeResultsDiffChange xxx links to DiffChange
+    -- DiffDelete                             { bg="lightcyan", gui="bold", fg="blue", }, -- DiffDelete     xxx ctermfg=12 ctermbg=159 gui=bold guifg=Blue guibg=LightCyan
+    -- TelescopeResultsDiffDelete             { DiffDelete }, -- TelescopeResultsDiffDelete xxx links to DiffDelete
+    -- DiffText                               { bg="red", gui="bold", }, -- DiffText       xxx cterm=bold ctermbg=9 gui=bold guibg=Red
+    -- SignColumn                             { bg="grey", fg="darkblue", }, -- SignColumn     xxx ctermfg=4 ctermbg=248 guifg=DarkBlue guibg=Grey
+    -- CursorLineSign                         { SignColumn }, -- CursorLineSign xxx links to SignColumn
+    -- Conceal                                { bg="bg", fg="fg", }, -- Conceal        xxx ctermfg=232 ctermbg=230 guifg=fg guibg=bg
+    -- SpellBad                               { gui="undercurl", sp="red", }, -- SpellBad       xxx ctermbg=224 gui=undercurl guisp=Red
+    -- SpellCap                               { gui="undercurl", sp="blue", }, -- SpellCap       xxx ctermbg=81 gui=undercurl guisp=Blue
+    -- SpellRare                              { gui="undercurl", sp="magenta", }, -- SpellRare      xxx ctermbg=225 gui=undercurl guisp=Magenta
+    -- SpellLocal                             { gui="undercurl", sp="darkcyan", }, -- SpellLocal     xxx ctermbg=14 gui=undercurl guisp=DarkCyan
+    -- Pmenu                                  { bg="bg", fg="fg", }, -- Pmenu          xxx ctermfg=232 ctermbg=230 guifg=fg guibg=bg
+    -- NormalFloat                            { Pmenu }, -- NormalFloat    xxx links to Pmenu
+    -- PmenuSel                               { bg="fg", fg="bg", }, -- PmenuSel       xxx ctermfg=230 ctermbg=232 guifg=bg guibg=fg
+    -- PmenuSbar                              { bg="grey", }, -- PmenuSbar      xxx ctermbg=248 guibg=Grey
+    -- PmenuThumb                             { bg="black", }, -- PmenuThumb     xxx ctermbg=0 guibg=Black
+    -- TabLine                                { bg="lightgrey", gui="underline", }, -- TabLine        xxx cterm=underline ctermfg=0 ctermbg=7 gui=underline guibg=LightGrey
+    -- TabLineSel                             { gui="bold", }, -- TabLineSel     xxx cterm=bold gui=bold
+    -- TabLineFill                            { gui="reverse", }, -- TabLineFill    xxx cterm=reverse gui=reverse
+    -- CursorColumn                           { bg="grey90", }, -- CursorColumn   xxx ctermbg=7 guibg=Grey90
+    -- CursorLine                             { bg="#ffffca", fg="fg", }, -- CursorLine     xxx cterm=underline ctermfg=232 ctermbg=230 guifg=fg guibg=#ffffca
+    -- ColorColumn                            { bg="lightred", }, -- ColorColumn    xxx ctermbg=224 guibg=LightRed
+    -- WinBar                                 { gui="bold", }, -- WinBar         xxx cterm=bold gui=bold
+    -- WinBarNC                               { WinBar }, -- WinBarNC       xxx links to WinBar
+    -- Cursor                                 { bg="fg", fg="bg", }, -- Cursor         xxx guifg=bg guibg=fg
+    -- lCursor                                { bg="fg", fg="bg", }, -- lCursor        xxx guifg=bg guibg=fg
+    -- Normal                                 { bg="#ffffea", fg="#000000", }, -- Normal         xxx ctermfg=232 ctermbg=230 guifg=#000000 guibg=#ffffea
+    -- NvimSpacing                            { Normal }, -- NvimSpacing    xxx links to Normal
+    -- TelescopeNormal                        { Normal }, -- TelescopeNormal xxx links to Normal
+    -- FloatShadow                            { bg="black", blend=80, }, -- FloatShadow    xxx guibg=Black blend=80
+    -- FloatShadowThrough                     { bg="black", blend=100, }, -- FloatShadowThrough xxx guibg=Black blend=100
+    -- RedrawDebugNormal                      { gui="reverse", }, -- RedrawDebugNormal xxx cterm=reverse gui=reverse
+    -- RedrawDebugClear                       { bg="yellow", }, -- RedrawDebugClear xxx ctermbg=11 guibg=Yellow
+    -- RedrawDebugComposed                    { bg="green", }, -- RedrawDebugComposed xxx ctermbg=10 guibg=Green
+    -- RedrawDebugRecompose                   { bg="red", }, -- RedrawDebugRecompose xxx ctermbg=9 guibg=Red
+    -- Error                                  { bg="red", fg="white", }, -- Error          xxx ctermfg=15 ctermbg=9 guifg=White guibg=Red
+    -- NvimInvalid                            { Error }, -- NvimInvalid    xxx links to Error
+    -- TSQueryLinterError                     { Error }, -- TSQueryLinterError xxx links to Error
+    -- luaParenError                          { Error }, -- luaParenError  xxx links to Error
+    -- luaError                               { Error }, -- luaError       xxx links to Error
+    -- Todo                                   { bg="yellow", fg="blue", }, -- Todo           xxx ctermfg=0 ctermbg=11 guifg=Blue guibg=Yellow
+    -- todo                                   { Todo }, -- @todo          xxx links to Todo
+    -- confTodo                               { Todo }, -- confTodo       xxx links to Todo
+    -- luaTodo                                { Todo }, -- luaTodo        xxx links to Todo
+    -- Constant                               { bg="bg", gui="bold", fg="#101010", }, -- Constant       xxx cterm=italic ctermfg=233 ctermbg=230 gui=bold guifg=#101010 guibg=bg
+    -- String                                 { Constant }, -- String         xxx links to Constant
+    -- Character                              { Constant }, -- Character      xxx links to Constant
+    -- Number                                 { Constant }, -- Number         xxx links to Constant
+    -- Boolean                                { Constant }, -- Boolean        xxx links to Constant
+    -- constant                               { Constant }, -- @constant      xxx links to Constant
+    -- TelescopeResultsConstant               { Constant }, -- TelescopeResultsConstant xxx links to Constant
+    -- TelescopePreviewPipe                   { Constant }, -- TelescopePreviewPipe xxx links to Constant
+    -- TelescopePreviewCharDev                { Constant }, -- TelescopePreviewCharDev xxx links to Constant
+    -- TelescopePreviewBlock                  { Constant }, -- TelescopePreviewBlock xxx links to Constant
+    -- TelescopePreviewRead                   { Constant }, -- TelescopePreviewRead xxx links to Constant
+    -- TelescopePreviewUser                   { Constant }, -- TelescopePreviewUser xxx links to Constant
+    -- TelescopePreviewGroup                  { Constant }, -- TelescopePreviewGroup xxx links to Constant
+    -- luaConstant                            { Constant }, -- luaConstant    xxx links to Constant
+    -- Identifier                             { bg="bg", gui="bold", fg="fg", }, -- Identifier     xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    -- Function                               { Identifier }, -- Function       xxx links to Identifier
+    -- parameter                              { Identifier }, -- @parameter     xxx links to Identifier
+    -- field                                  { Identifier }, -- @field         xxx links to Identifier
+    -- property                               { Identifier }, -- @property      xxx links to Identifier
+    -- NvimIdentifier                         { Identifier }, -- NvimIdentifier xxx links to Identifier
+    -- vimFunction                            { Identifier }, -- vimFunction    xxx links to Identifier
+    -- TelescopeResultsIdentifier             { Identifier }, -- TelescopeResultsIdentifier xxx links to Identifier
+    -- TelescopeMultiIcon                     { Identifier }, -- TelescopeMultiIcon xxx links to Identifier
+    -- TelescopePromptPrefix                  { Identifier }, -- TelescopePromptPrefix xxx links to Identifier
+    -- WhichKeyDesc                           { Identifier }, -- WhichKeyDesc   xxx links to Identifier
+    -- luaFunc                                { Identifier }, -- luaFunc        xxx links to Identifier
+    -- Statement                              { bg="bg", gui="italic", fg="fg", }, -- Statement      xxx cterm=italic ctermfg=232 ctermbg=230 gui=italic guifg=fg guibg=bg
+    -- Conditional                            { Statement }, -- Conditional    xxx links to Statement
+    -- Repeat                                 { Statement }, -- Repeat         xxx links to Statement
+    -- Label                                  { Statement }, -- Label          xxx links to Statement
+    -- Operator                               { Statement }, -- Operator       xxx links to Statement
+    -- Keyword                                { Statement }, -- Keyword        xxx links to Statement
+    -- Exception                              { Statement }, -- Exception      xxx links to Statement
+    -- TelescopePreviewSocket                 { Statement }, -- TelescopePreviewSocket xxx links to Statement
+    -- TelescopePreviewWrite                  { Statement }, -- TelescopePreviewWrite xxx links to Statement
+    -- luaStatement                           { Statement }, -- luaStatement   xxx links to Statement
+    -- PreProc                                { bg="bg", gui="bold", fg="fg", }, -- PreProc        xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    -- Include                                { PreProc }, -- Include        xxx links to PreProc
+    -- Define                                 { PreProc }, -- Define         xxx links to PreProc
+    -- Macro                                  { PreProc }, -- Macro          xxx links to PreProc
+    -- PreCondit                              { PreProc }, -- PreCondit      xxx links to PreProc
+    -- preproc                                { PreProc }, -- @preproc       xxx links to PreProc
+    -- Type                                   { bg="bg", gui="bold", fg="fg", }, -- Type           xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    -- StorageClass                           { Type }, -- StorageClass   xxx links to Type
+    -- Structure                              { Type }, -- Structure      xxx links to Type
+    -- Typedef                                { Type }, -- Typedef        xxx links to Type
+    -- type                                   { Type }, -- @type          xxx links to Type
+    -- NvimNumberPrefix                       { Type }, -- NvimNumberPrefix xxx links to Type
+    -- NvimOptionSigil                        { Type }, -- NvimOptionSigil xxx links to Type
+    -- LspInfoFiletype                        { Type }, -- LspInfoFiletype xxx links to Type
+    -- TelescopeMultiSelection                { Type }, -- TelescopeMultiSelection xxx links to Type
+    -- Special                                { bg="bg", gui="bold", fg="fg", }, -- Special        xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    -- Tag                                    { Special }, -- Tag            xxx links to Special
+    -- SpecialChar                            { Special }, -- SpecialChar    xxx links to Special
+    -- Delimiter                              { Special }, -- Delimiter      xxx links to Special
+    -- SpecialComment                         { Special }, -- SpecialComment xxx links to Special
+    -- Debug                                  { Special }, -- Debug          xxx links to Special
+    -- builtin                                { Special }, -- @constant.builtin xxx links to Special
+    -- builtin                                { Special }, -- @function.builtin xxx links to Special
+    -- constructor                            { Special }, -- @constructor   xxx links to Special
+    -- TelescopeMatching                      { Special }, -- TelescopeMatching xxx links to Special
+    -- TelescopePreviewLink                   { Special }, -- TelescopePreviewLink xxx links to Special
+    -- DiagnosticError                        { fg="red", }, -- DiagnosticError xxx ctermfg=1 guifg=Red
+    -- DiagnosticVirtualTextError             { DiagnosticError }, -- DiagnosticVirtualTextError xxx links to DiagnosticError
+    -- DiagnosticFloatingError                { DiagnosticError }, -- DiagnosticFloatingError xxx links to DiagnosticError
+    -- DiagnosticSignError                    { DiagnosticError }, -- DiagnosticSignError xxx links to DiagnosticError
+    -- DiagnosticWarn                         { fg="orange", }, -- DiagnosticWarn xxx ctermfg=3 guifg=Orange
+    -- DiagnosticVirtualTextWarn              { DiagnosticWarn }, -- DiagnosticVirtualTextWarn xxx links to DiagnosticWarn
+    -- DiagnosticFloatingWarn                 { DiagnosticWarn }, -- DiagnosticFloatingWarn xxx links to DiagnosticWarn
+    -- DiagnosticSignWarn                     { DiagnosticWarn }, -- DiagnosticSignWarn xxx links to DiagnosticWarn
+    -- DiagnosticInfo                         { fg="lightblue", }, -- DiagnosticInfo xxx ctermfg=4 guifg=LightBlue
+    -- DiagnosticVirtualTextInfo              { DiagnosticInfo }, -- DiagnosticVirtualTextInfo xxx links to DiagnosticInfo
+    -- DiagnosticFloatingInfo                 { DiagnosticInfo }, -- DiagnosticFloatingInfo xxx links to DiagnosticInfo
+    -- DiagnosticSignInfo                     { DiagnosticInfo }, -- DiagnosticSignInfo xxx links to DiagnosticInfo
+    -- DiagnosticHint                         { fg="lightgrey", }, -- DiagnosticHint xxx ctermfg=7 guifg=LightGrey
+    -- DiagnosticVirtualTextHint              { DiagnosticHint }, -- DiagnosticVirtualTextHint xxx links to DiagnosticHint
+    -- DiagnosticFloatingHint                 { DiagnosticHint }, -- DiagnosticFloatingHint xxx links to DiagnosticHint
+    -- DiagnosticSignHint                     { DiagnosticHint }, -- DiagnosticSignHint xxx links to DiagnosticHint
+    -- DiagnosticUnderlineError               { gui="underline", sp="red", }, -- DiagnosticUnderlineError xxx cterm=underline gui=underline guisp=Red
+    -- DiagnosticUnderlineWarn                { gui="underline", sp="orange", }, -- DiagnosticUnderlineWarn xxx cterm=underline gui=underline guisp=Orange
+    -- DiagnosticUnderlineInfo                { gui="underline", sp="lightblue", }, -- DiagnosticUnderlineInfo xxx cterm=underline gui=underline guisp=LightBlue
+    -- DiagnosticUnderlineHint                { gui="underline", sp="lightgrey", }, -- DiagnosticUnderlineHint xxx cterm=underline gui=underline guisp=LightGrey
+    -- Underlined                             { gui="underline", fg="slateblue", }, -- Underlined     xxx cterm=underline ctermfg=5 gui=underline guifg=SlateBlue
+    -- underline                              { Underlined }, -- @text.underline xxx links to Underlined
+    -- Comment                                { bg="bg", gui="italic", fg="#303030", }, -- Comment        xxx cterm=italic ctermfg=236 ctermbg=230 gui=italic guifg=#303030 guibg=bg
+    -- comment                                { Comment }, -- @comment       xxx links to Comment
+    -- LspInfoTip                             { Comment }, -- LspInfoTip     xxx links to Comment
+    -- TelescopeResultsComment                { Comment }, -- TelescopeResultsComment xxx links to Comment
+    -- WhichKeyValue                          { Comment }, -- WhichKeyValue  xxx links to Comment
+    -- WhichKeySeparator                      { Comment }, -- WhichKeySeparator xxx links to Comment
+    -- confComment                            { Comment }, -- confComment    xxx links to Comment
+    -- luaComment                             { Comment }, -- luaComment     xxx links to Comment
+    -- MatchParen                             { bg="cyan", }, -- MatchParen     xxx ctermbg=14 guibg=Cyan
+    -- Ignore                                 { fg="bg", }, -- Ignore         xxx ctermfg=15 guifg=bg
+    -- NvimInternalError                      { bg="red", fg="red", }, -- NvimInternalError xxx ctermfg=9 ctermbg=9 guifg=Red guibg=Red
+    -- NvimFigureBrace                        { NvimInternalError }, -- NvimFigureBrace xxx links to NvimInternalError
+    -- NvimSingleQuotedUnknownEscape          { NvimInternalError }, -- NvimSingleQuotedUnknownEscape xxx links to NvimInternalError
+    -- NvimInvalidSingleQuotedUnknownEscape   { NvimInternalError }, -- NvimInvalidSingleQuotedUnknownEscape xxx links to NvimInternalError
+    -- DevIconCs                              { fg="#596706", }, -- DevIconCs      xxx ctermfg=58 guifg=#596706
+    -- DevIconCss                             { fg="#42a5f5", }, -- DevIconCss     xxx ctermfg=39 guifg=#42a5f5
+    -- DevIconEnv                             { fg="#faf743", }, -- DevIconEnv     xxx ctermfg=226 guifg=#faf743
+    -- DevIconDart                            { fg="#03589c", }, -- DevIconDart    xxx ctermfg=25 guifg=#03589c
+    -- DevIconPng                             { fg="#a074c4", }, -- DevIconPng     xxx ctermfg=140 guifg=#a074c4
+    -- DevIconRmd                             { fg="#519aba", }, -- DevIconRmd     xxx ctermfg=67 guifg=#519aba
+    -- DevIconPpt                             { fg="#cb4a32", }, -- DevIconPpt     xxx ctermfg=167 guifg=#cb4a32
+    -- DevIconElm                             { fg="#519aba", }, -- DevIconElm     xxx ctermfg=67 guifg=#519aba
+    -- DevIconNPMIgnore                       { fg="#e8274b", }, -- DevIconNPMIgnore xxx ctermfg=161 guifg=#e8274b
+    -- DevIconDefault                         { fg="#6d8086", }, -- DevIconDefault xxx ctermfg=66 guifg=#6d8086
+    -- DevIconProcfile                        { fg="#a074c4", }, -- DevIconProcfile xxx ctermfg=140 guifg=#a074c4
+    -- DevIconLicense                         { fg="#cbcb41", }, -- DevIconLicense xxx ctermfg=185 guifg=#cbcb41
+    -- DevIconMint                            { fg="#87c095", }, -- DevIconMint    xxx ctermfg=108 guifg=#87c095
+    -- DevIconPsb                             { fg="#519aba", }, -- DevIconPsb     xxx ctermfg=67 guifg=#519aba
+    -- DevIconGvimrc                          { fg="#019833", }, -- DevIconGvimrc  xxx ctermfg=29 guifg=#019833
+    -- DevIconCsv                             { fg="#89e051", }, -- DevIconCsv     xxx ctermfg=113 guifg=#89e051
+    -- DevIconCxx                             { fg="#519aba", }, -- DevIconCxx     xxx ctermfg=67 guifg=#519aba
+    -- DevIconGraphQL                         { fg="#e535ab", }, -- DevIconGraphQL xxx ctermfg=199 guifg=#e535ab
+    -- DevIconHrl                             { fg="#b83998", }, -- DevIconHrl     xxx ctermfg=132 guifg=#b83998
+    -- DevIconDb                              { fg="#dad8d8", }, -- DevIconDb      xxx ctermfg=188 guifg=#dad8d8
+    -- DevIconIni                             { fg="#6d8086", }, -- DevIconIni     xxx ctermfg=66 guifg=#6d8086
+    -- DevIconJava                            { fg="#cc3e44", }, -- DevIconJava    xxx ctermfg=167 guifg=#cc3e44
+    -- DevIconGitConfig                       { fg="#41535b", }, -- DevIconGitConfig xxx ctermfg=59 guifg=#41535b
+    -- DevIconGo                              { fg="#519aba", }, -- DevIconGo      xxx ctermfg=67 guifg=#519aba
+    -- DevIconRproj                           { fg="#358a5b", }, -- DevIconRproj   xxx ctermfg=65 guifg=#358a5b
+    -- DevIconLuau                            { fg="#51a0cf", }, -- DevIconLuau    xxx ctermfg=74 guifg=#51a0cf
+    -- DevIconDrools                          { fg="#ffafaf", }, -- DevIconDrools  xxx ctermfg=217 guifg=#ffafaf
+    -- DevIconYml                             { fg="#6d8086", }, -- DevIconYml     xxx ctermfg=66 guifg=#6d8086
+    -- DevIconNim                             { fg="#f3d400", }, -- DevIconNim     xxx ctermfg=220 guifg=#f3d400
+    -- DevIconDropbox                         { fg="#0061fe", }, -- DevIconDropbox xxx ctermfg=27 guifg=#0061fe
+    -- DevIconJsx                             { fg="#519aba", }, -- DevIconJsx     xxx ctermfg=67 guifg=#519aba
+    -- DevIconZsh                             { fg="#89e051", }, -- DevIconZsh     xxx ctermfg=113 guifg=#89e051
+    -- DevIconSml                             { fg="#e37933", }, -- DevIconSml     xxx ctermfg=173 guifg=#e37933
+    -- DevIconMjs                             { fg="#f1e05a", }, -- DevIconMjs     xxx ctermfg=221 guifg=#f1e05a
+    -- DevIconPhp                             { fg="#a074c4", }, -- DevIconPhp     xxx ctermfg=140 guifg=#a074c4
+    -- DevIconPrisma                          { fg="#ffffff", }, -- DevIconPrisma  xxx ctermfg=15 guifg=#ffffff
+    -- DevIconSln                             { fg="#854cc7", }, -- DevIconSln     xxx ctermfg=98 guifg=#854cc7
+    -- DevIconEpp                             { fg="#ffa61a", }, -- DevIconEpp     xxx guifg=#ffa61a
+    -- DevIconH                               { fg="#a074c4", }, -- DevIconH       xxx ctermfg=140 guifg=#a074c4
+    -- DevIconR                               { fg="#358a5b", }, -- DevIconR       xxx ctermfg=65 guifg=#358a5b
+    -- DevIconSql                             { fg="#dad8d8", }, -- DevIconSql     xxx ctermfg=188 guifg=#dad8d8
+    -- DevIconStyl                            { fg="#8dc149", }, -- DevIconStyl    xxx ctermfg=107 guifg=#8dc149
+    -- DevIconScala                           { fg="#cc3e44", }, -- DevIconScala   xxx ctermfg=167 guifg=#cc3e44
+    -- DevIconSuo                             { fg="#e37933", }, -- DevIconSuo     xxx ctermfg=98 guifg=#e37933
+    -- DevIconSvelte                          { fg="#ff3e00", }, -- DevIconSvelte  xxx ctermfg=202 guifg=#ff3e00
+    -- DevIconSwift                           { fg="#e37933", }, -- DevIconSwift   xxx ctermfg=173 guifg=#e37933
+    -- DevIconFsharp                          { fg="#519aba", }, -- DevIconFsharp  xxx ctermfg=67 guifg=#519aba
+    -- DevIconQuery                           { fg="#90a850", }, -- DevIconQuery   xxx ctermfg=154 guifg=#90a850
+    -- DevIconCMake                           { fg="#6d8086", }, -- DevIconCMake   xxx ctermfg=66 guifg=#6d8086
+    -- DevIconFavicon                         { fg="#cbcb41", }, -- DevIconFavicon xxx ctermfg=185 guifg=#cbcb41
+    -- DevIconRakefile                        { fg="#701516", }, -- DevIconRakefile xxx ctermfg=52 guifg=#701516
+    -- DevIconToml                            { fg="#6d8086", }, -- DevIconToml    xxx ctermfg=66 guifg=#6d8086
+    -- DevIconPyo                             { fg="#ffe291", }, -- DevIconPyo     xxx ctermfg=67 guifg=#ffe291
+    -- DevIconBinaryGLTF                      { fg="#ffb13b", }, -- DevIconBinaryGLTF xxx ctermfg=215 guifg=#ffb13b
+    -- DevIconGitLogo                         { fg="#f14c28", }, -- DevIconGitLogo xxx ctermfg=202 guifg=#f14c28
+    -- DevIconDockerfile                      { fg="#384d54", }, -- DevIconDockerfile xxx ctermfg=59 guifg=#384d54
+    -- DevIconGemspec                         { fg="#701516", }, -- DevIconGemspec xxx ctermfg=52 guifg=#701516
+    -- DevIconFsi                             { fg="#519aba", }, -- DevIconFsi     xxx ctermfg=67 guifg=#519aba
+    -- DevIconTsx                             { fg="#519aba", }, -- DevIconTsx     xxx ctermfg=67 guifg=#519aba
+    -- DevIconYaml                            { fg="#6d8086", }, -- DevIconYaml    xxx ctermfg=66 guifg=#6d8086
+    -- DevIconZig                             { fg="#f69a1b", }, -- DevIconZig     xxx ctermfg=208 guifg=#f69a1b
+    -- DevIconFsx                             { fg="#519aba", }, -- DevIconFsx     xxx ctermfg=67 guifg=#519aba
+    -- DevIconLhs                             { fg="#a074c4", }, -- DevIconLhs     xxx ctermfg=140 guifg=#a074c4
+    -- DevIconVHDL                            { fg="#019833", }, -- DevIconVHDL    xxx ctermfg=29 guifg=#019833
+    -- DevIconZshprofile                      { fg="#89e051", }, -- DevIconZshprofile xxx ctermfg=113 guifg=#89e051
+    -- DevIconEdn                             { fg="#519aba", }, -- DevIconEdn     xxx ctermfg=67 guifg=#519aba
+    -- DevIconBashrc                          { fg="#89e051", }, -- DevIconBashrc  xxx ctermfg=113 guifg=#89e051
+    -- DevIconTerminal                        { fg="#31b53e", }, -- DevIconTerminal xxx ctermfg=71 guifg=#31b53e
+    -- DevIconTcl                             { fg="#1e5cb3", }, -- DevIconTcl     xxx ctermfg=67 guifg=#1e5cb3
+    -- DevIconEex                             { fg="#a074c4", }, -- DevIconEex     xxx ctermfg=140 guifg=#a074c4
+    -- DevIconDiff                            { fg="#41535b", }, -- DevIconDiff    xxx ctermfg=59 guifg=#41535b
+    -- DevIconVue                             { fg="#8dc149", }, -- DevIconVue     xxx ctermfg=107 guifg=#8dc149
+    -- DevIconBashProfile                     { fg="#89e051", }, -- DevIconBashProfile xxx ctermfg=113 guifg=#89e051
+    -- DevIconCobol                           { fg="#005ca5", }, -- DevIconCobol   xxx ctermfg=25 guifg=#005ca5
+    -- DevIconTs                              { fg="#519aba", }, -- DevIconTs      xxx ctermfg=67 guifg=#519aba
+    -- DevIconFish                            { fg="#4d5a5e", }, -- DevIconFish    xxx ctermfg=59 guifg=#4d5a5e
+    -- DevIconVimrc                           { fg="#019833", }, -- DevIconVimrc   xxx ctermfg=29 guifg=#019833
+    -- DevIconDesktopEntry                    { fg="#563d7c", }, -- DevIconDesktopEntry xxx ctermfg=60 guifg=#563d7c
+    -- DevIconZshenv                          { fg="#89e051", }, -- DevIconZshenv  xxx ctermfg=113 guifg=#89e051
+    -- DevIconTor                             { fg="#519aba", }, -- DevIconTor     xxx ctermfg=67 guifg=#519aba
+    -- DevIconRake                            { fg="#701516", }, -- DevIconRake    xxx ctermfg=52 guifg=#701516
+    -- DevIconZshrc                           { fg="#89e051", }, -- DevIconZshrc   xxx ctermfg=113 guifg=#89e051
+    -- DevIconC                               { fg="#599eff", }, -- DevIconC       xxx ctermfg=75 guifg=#599eff
+    -- DevIconWebp                            { fg="#a074c4", }, -- DevIconWebp    xxx ctermfg=140 guifg=#a074c4
+    -- DevIconImportConfiguration             { fg="#ececec", }, -- DevIconImportConfiguration xxx ctermfg=231 guifg=#ececec
+    -- DevIconWebpack                         { fg="#519aba", }, -- DevIconWebpack xxx ctermfg=67 guifg=#519aba
+    -- DevIconTex                             { fg="#3d6117", }, -- DevIconTex     xxx ctermfg=58 guifg=#3d6117
+    -- DevIconJson                            { fg="#cbcb41", }, -- DevIconJson    xxx ctermfg=185 guifg=#cbcb41
+    -- DevIconVim                             { fg="#019833", }, -- DevIconVim     xxx ctermfg=29 guifg=#019833
+    -- DevIconXls                             { fg="#207245", }, -- DevIconXls     xxx ctermfg=23 guifg=#207245
+    -- DevIconKsh                             { fg="#4d5a5e", }, -- DevIconKsh     xxx ctermfg=59 guifg=#4d5a5e
+    -- DevIconRs                              { fg="#dea584", }, -- DevIconRs      xxx ctermfg=180 guifg=#dea584
+    -- DevIconHtm                             { fg="#e34c26", }, -- DevIconHtm     xxx ctermfg=166 guifg=#e34c26
+    -- DevIconXcPlayground                    { fg="#e37933", }, -- DevIconXcPlayground xxx ctermfg=173 guifg=#e37933
+    -- DevIconGitIgnore                       { fg="#41535b", }, -- DevIconGitIgnore xxx ctermfg=59 guifg=#41535b
+    -- DevIconDump                            { fg="#dad8d8", }, -- DevIconDump    xxx ctermfg=188 guifg=#dad8d8
+    -- DevIconAwk                             { fg="#4d5a5e", }, -- DevIconAwk     xxx ctermfg=59 guifg=#4d5a5e
+    -- DevIconCoffee                          { fg="#cbcb41", }, -- DevIconCoffee  xxx ctermfg=185 guifg=#cbcb41
+    -- DevIconClojureDart                     { fg="#519aba", }, -- DevIconClojureDart xxx ctermfg=67 guifg=#519aba
+    -- DevIconProlog                          { fg="#e4b854", }, -- DevIconProlog  xxx ctermfg=179 guifg=#e4b854
+    -- DevIconSystemVerilog                   { fg="#019833", }, -- DevIconSystemVerilog xxx ctermfg=29 guifg=#019833
+    -- DevIconCPlusPlus                       { fg="#f34b7d", }, -- DevIconCPlusPlus xxx ctermfg=204 guifg=#f34b7d
+    -- DevIconLua                             { fg="#51a0cf", }, -- DevIconLua     xxx ctermfg=74 guifg=#51a0cf
+    -- DevIconErb                             { fg="#701516", }, -- DevIconErb     xxx ctermfg=52 guifg=#701516
+    -- DevIconCsh                             { fg="#4d5a5e", }, -- DevIconCsh     xxx ctermfg=59 guifg=#4d5a5e
+    -- DevIconGif                             { fg="#a074c4", }, -- DevIconGif     xxx ctermfg=140 guifg=#a074c4
+    -- DevIconHbs                             { fg="#f0772b", }, -- DevIconHbs     xxx ctermfg=208 guifg=#f0772b
+    -- DevIconHaml                            { fg="#eaeae1", }, -- DevIconHaml    xxx ctermfg=188 guifg=#eaeae1
+    -- DevIconConfiguration                   { fg="#ececec", }, -- DevIconConfiguration xxx ctermfg=231 guifg=#ececec
+    -- DevIconHs                              { fg="#a074c4", }, -- DevIconHs      xxx ctermfg=140 guifg=#a074c4
+    -- DevIconClojureJS                       { fg="#519aba", }, -- DevIconClojureJS xxx ctermfg=67 guifg=#519aba
+    -- DevIconClojureC                        { fg="#8dc149", }, -- DevIconClojureC xxx ctermfg=107 guifg=#8dc149
+    -- DevIconJl                              { fg="#a270ba", }, -- DevIconJl      xxx ctermfg=133 guifg=#a270ba
+    -- DevIconDsStore                         { fg="#41535b", }, -- DevIconDsStore xxx ctermfg=59 guifg=#41535b
+    -- DevIconGitAttributes                   { fg="#41535b", }, -- DevIconGitAttributes xxx ctermfg=59 guifg=#41535b
+    -- DevIconSlim                            { fg="#e34c26", }, -- DevIconSlim    xxx ctermfg=166 guifg=#e34c26
+    -- DevIconPackedResource                  { fg="#6d8086", }, -- DevIconPackedResource xxx ctermfg=66 guifg=#6d8086
+    -- DevIconGodotProject                    { fg="#6d8086", }, -- DevIconGodotProject xxx ctermfg=66 guifg=#6d8086
+    -- DevIconGitModules                      { fg="#41535b", }, -- DevIconGitModules xxx ctermfg=59 guifg=#41535b
+    -- DevIconLog                             { fg="#ffffff", }, -- DevIconLog     xxx ctermfg=15 guifg=#ffffff
+    -- DevIconPy                              { fg="#ffbc03", }, -- DevIconPy      xxx ctermfg=61 guifg=#ffbc03
+    -- DevIconPm                              { fg="#519aba", }, -- DevIconPm      xxx ctermfg=67 guifg=#519aba
+    -- DevIconGitlabCI                        { fg="#e24329", }, -- DevIconGitlabCI xxx ctermfg=166 guifg=#e24329
+    -- DevIconGruntfile                       { fg="#e37933", }, -- DevIconGruntfile xxx ctermfg=173 guifg=#e37933
+    -- DevIconLess                            { fg="#563d7c", }, -- DevIconLess    xxx ctermfg=60 guifg=#563d7c
+    -- DevIconErl                             { fg="#b83998", }, -- DevIconErl     xxx ctermfg=132 guifg=#b83998
+    -- DevIconFennel                          { fg="#fff3d7", }, -- DevIconFennel  xxx ctermfg=230 guifg=#fff3d7
+    -- DevIconGDScript                        { fg="#6d8086", }, -- DevIconGDScript xxx ctermfg=66 guifg=#6d8086
+    -- DevIconGulpfile                        { fg="#cc3e44", }, -- DevIconGulpfile xxx ctermfg=167 guifg=#cc3e44
+    -- DevIconTxt                             { fg="#89e051", }, -- DevIconTxt     xxx ctermfg=113 guifg=#89e051
+    -- DevIconExs                             { fg="#a074c4", }, -- DevIconExs     xxx ctermfg=140 guifg=#a074c4
+    -- DevIconVerilog                         { fg="#019833", }, -- DevIconVerilog xxx ctermfg=29 guifg=#019833
+    -- DevIconPsd                             { fg="#519aba", }, -- DevIconPsd     xxx ctermfg=67 guifg=#519aba
+    -- DevIconBat                             { fg="#c1f12e", }, -- DevIconBat     xxx ctermfg=154 guifg=#c1f12e
+    -- DevIconNPMrc                           { fg="#e8274b", }, -- DevIconNPMrc   xxx ctermfg=161 guifg=#e8274b
+    -- DevIconCson                            { fg="#cbcb41", }, -- DevIconCson    xxx ctermfg=185 guifg=#cbcb41
+    -- DevIconSettingsJson                    { fg="#854cc7", }, -- DevIconSettingsJson xxx ctermfg=98 guifg=#854cc7
+    -- DevIconSvg                             { fg="#ffb13b", }, -- DevIconSvg     xxx ctermfg=215 guifg=#ffb13b
+    -- DevIconPyd                             { fg="#ffe291", }, -- DevIconPyd     xxx ctermfg=67 guifg=#ffe291
+    -- DevIconHeex                            { fg="#a074c4", }, -- DevIconHeex    xxx ctermfg=140 guifg=#a074c4
+    -- DevIconCMakeLists                      { fg="#6d8086", }, -- DevIconCMakeLists xxx ctermfg=66 guifg=#6d8086
+    -- DevIconSig                             { fg="#e37933", }, -- DevIconSig     xxx ctermfg=173 guifg=#e37933
+    -- DevIconHh                              { fg="#a074c4", }, -- DevIconHh      xxx ctermfg=140 guifg=#a074c4
+    -- DevIconBrewfile                        { fg="#701516", }, -- DevIconBrewfile xxx ctermfg=52 guifg=#701516
+    -- DevIconKotlinScript                    { fg="#f88a02", }, -- DevIconKotlinScript xxx ctermfg=208 guifg=#f88a02
+    -- DevIconEjs                             { fg="#cbcb41", }, -- DevIconEjs     xxx ctermfg=185 guifg=#cbcb41
+    -- DevIconMakefile                        { fg="#6d8086", }, -- DevIconMakefile xxx ctermfg=66 guifg=#6d8086
+    -- DevIconsbt                             { fg="#cc3e44", }, -- DevIconsbt     xxx ctermfg=167 guifg=#cc3e44
+    -- DevIconHpp                             { fg="#a074c4", }, -- DevIconHpp     xxx ctermfg=140 guifg=#a074c4
+    -- DevIconIco                             { fg="#cbcb41", }, -- DevIconIco     xxx ctermfg=185 guifg=#cbcb41
+    -- DevIconMd                              { fg="#ffffff", }, -- DevIconMd      xxx ctermfg=15 guifg=#ffffff
+    -- DevIconGitCommit                       { fg="#41535b", }, -- DevIconGitCommit xxx ctermfg=59 guifg=#41535b
+    -- DevIconPl                              { fg="#519aba", }, -- DevIconPl      xxx ctermfg=67 guifg=#519aba
+    -- DevIconCp                              { fg="#519aba", }, -- DevIconCp      xxx ctermfg=67 guifg=#519aba
+    -- DevIconLeex                            { fg="#a074c4", }, -- DevIconLeex    xxx ctermfg=140 guifg=#a074c4
+    -- DevIconMli                             { fg="#e37933", }, -- DevIconMli     xxx ctermfg=173 guifg=#e37933
+    -- DevIconGemfile                         { fg="#701516", }, -- DevIconGemfile xxx ctermfg=52 guifg=#701516
+    -- DevIconJpg                             { fg="#a074c4", }, -- DevIconJpg     xxx ctermfg=140 guifg=#a074c4
+    -- DevIconPromptPs1                       { fg="#4d5a5e", }, -- DevIconPromptPs1 xxx ctermfg=59 guifg=#4d5a5e
+    -- DevIconMarkdown                        { fg="#519aba", }, -- DevIconMarkdown xxx ctermfg=67 guifg=#519aba
+    -- DevIconMaterial                        { fg="#b83998", }, -- DevIconMaterial xxx ctermfg=132 guifg=#b83998
+    -- DevIconMdx                             { fg="#519aba", }, -- DevIconMdx     xxx ctermfg=67 guifg=#519aba
+    -- DevIconConfigRu                        { fg="#701516", }, -- DevIconConfigRu xxx ctermfg=52 guifg=#701516
+    -- DevIconSh                              { fg="#4d5a5e", }, -- DevIconSh      xxx ctermfg=59 guifg=#4d5a5e
+    -- DevIconClojure                         { fg="#8dc149", }, -- DevIconClojure xxx ctermfg=107 guifg=#8dc149
+    -- DevIconVagrantfile                     { fg="#1563ff", }, -- DevIconVagrantfile xxx ctermfg=27 guifg=#1563ff
+    -- DevIconD                               { fg="#427819", }, -- DevIconD       xxx ctermfg=64 guifg=#427819
+    -- DevIconJpeg                            { fg="#a074c4", }, -- DevIconJpeg    xxx ctermfg=140 guifg=#a074c4
+    -- DevIconAi                              { fg="#cbcb41", }, -- DevIconAi      xxx ctermfg=185 guifg=#cbcb41
+    -- DevIconCrystal                         { fg="#000000", }, -- DevIconCrystal xxx ctermfg=16 guifg=#000000
+    -- DevIconFs                              { fg="#519aba", }, -- DevIconFs      xxx ctermfg=67 guifg=#519aba
+    -- DevIconMixLock                         { fg="#a074c4", }, -- DevIconMixLock xxx ctermfg=140 guifg=#a074c4
+    -- DevIconFsscript                        { fg="#519aba", }, -- DevIconFsscript xxx ctermfg=67 guifg=#519aba
+    -- DevIconNix                             { fg="#7ebae4", }, -- DevIconNix     xxx ctermfg=110 guifg=#7ebae4
+    -- DevIconXul                             { fg="#e37933", }, -- DevIconXul     xxx ctermfg=173 guifg=#e37933
+    -- DevIconEx                              { fg="#a074c4", }, -- DevIconEx      xxx ctermfg=140 guifg=#a074c4
+    -- DevIconSass                            { fg="#f55385", }, -- DevIconSass    xxx ctermfg=204 guifg=#f55385
+    -- DevIconScss                            { fg="#f55385", }, -- DevIconScss    xxx ctermfg=204 guifg=#f55385
+    -- DevIconHxx                             { fg="#a074c4", }, -- DevIconHxx     xxx ctermfg=140 guifg=#a074c4
+    -- DevIconMotoko                          { fg="#9772fb", }, -- DevIconMotoko  xxx ctermfg=99 guifg=#9772fb
+    -- DevIconNodeModules                     { fg="#e8274b", }, -- DevIconNodeModules xxx ctermfg=161 guifg=#e8274b
+    -- DevIconPyc                             { fg="#ffe291", }, -- DevIconPyc     xxx ctermfg=67 guifg=#ffe291
+    -- DevIconPackageJson                     { fg="#e8274b", }, -- DevIconPackageJson xxx guifg=#e8274b
+    -- DevIconKotlin                          { fg="#f88a02", }, -- DevIconKotlin  xxx ctermfg=208 guifg=#f88a02
+    -- DevIconRlib                            { fg="#dea584", }, -- DevIconRlib    xxx ctermfg=180 guifg=#dea584
+    -- DevIconRss                             { fg="#fb9d3b", }, -- DevIconRss     xxx ctermfg=215 guifg=#fb9d3b
+    -- DevIconBmp                             { fg="#a074c4", }, -- DevIconBmp     xxx ctermfg=140 guifg=#a074c4
+    -- DevIconXml                             { fg="#e37933", }, -- DevIconXml     xxx ctermfg=173 guifg=#e37933
+    -- DevIconTextResource                    { fg="#cbcb41", }, -- DevIconTextResource xxx ctermfg=185 guifg=#cbcb41
+    -- DevIconTextScene                       { fg="#a074c4", }, -- DevIconTextScene xxx ctermfg=140 guifg=#a074c4
+    -- DevIconSolidity                        { fg="#519aba", }, -- DevIconSolidity xxx ctermfg=67 guifg=#519aba
+    -- DevIconWebmanifest                     { fg="#f1e05a", }, -- DevIconWebmanifest xxx ctermfg=221 guifg=#f1e05a
+    -- DevIconBabelrc                         { fg="#cbcb41", }, -- DevIconBabelrc xxx ctermfg=185 guifg=#cbcb41
+    -- DevIconRb                              { fg="#701516", }, -- DevIconRb      xxx ctermfg=52 guifg=#701516
+    -- DevIconHtml                            { fg="#e44d26", }, -- DevIconHtml    xxx ctermfg=202 guifg=#e44d26
+    -- DevIconOPUS                            { fg="#f88a02", }, -- DevIconOPUS    xxx ctermfg=208 guifg=#f88a02
+    -- DevIconMustache                        { fg="#e37933", }, -- DevIconMustache xxx ctermfg=173 guifg=#e37933
+    -- DevIconOpenTypeFont                    { fg="#ececec", }, -- DevIconOpenTypeFont xxx ctermfg=231 guifg=#ececec
+    -- DevIconPp                              { fg="#ffa61a", }, -- DevIconPp      xxx guifg=#ffa61a
+    -- DevIconTwig                            { fg="#8dc149", }, -- DevIconTwig    xxx ctermfg=107 guifg=#8dc149
+    -- DevIconPackageLockJson                 { fg="#7a0d21", }, -- DevIconPackageLockJson xxx guifg=#7a0d21
+    -- DevIconJson5                           { fg="#cbcb41", }, -- DevIconJson5   xxx ctermfg=185 guifg=#cbcb41
+    -- DevIconLock                            { fg="#bbbbbb", }, -- DevIconLock    xxx ctermfg=250 guifg=#bbbbbb
+    -- DevIconDoc                             { fg="#185abd", }, -- DevIconDoc     xxx ctermfg=25 guifg=#185abd
+    -- DevIconBash                            { fg="#89e051", }, -- DevIconBash    xxx ctermfg=113 guifg=#89e051
+    -- DevIconPdf                             { fg="#b30b00", }, -- DevIconPdf     xxx ctermfg=124 guifg=#b30b00
+    -- DevIconScheme                          { fg="#000000", }, -- DevIconScheme  xxx ctermfg=16 guifg=#000000
+    -- DevIconMl                              { fg="#e37933", }, -- DevIconMl      xxx ctermfg=173 guifg=#e37933
+    -- DevIconConf                            { fg="#6d8086", }, -- DevIconConf    xxx ctermfg=66 guifg=#6d8086
+    -- DevIconJs                              { fg="#cbcb41", }, -- DevIconJs      xxx ctermfg=185 guifg=#cbcb41
+    -- DevIconCpp                             { fg="#519aba", }, -- DevIconCpp     xxx ctermfg=67 guifg=#519aba
+  }
+end)
+return theme
