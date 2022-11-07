@@ -4,7 +4,7 @@ vim.o.timeoutlen = 500
 vim.opt.termguicolors = true
 vim.opt.formatoptions:append("r")  -- respect comment on newline in insert
 vim.opt.formatoptions:append("o")  -- respect comment on o in normal
-vim.cmd.colorscheme('acme')
+vim.cmd.colorscheme('mine')
 
 -- Super handy command mode abbreviation for the directory of the current file.
 -- From
