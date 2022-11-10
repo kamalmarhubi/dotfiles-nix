@@ -141,6 +141,7 @@
                 (iosevka-bin.override {variant = "sgr-iosevka-fixed";})
                 (iosevka-bin.override {variant = "sgr-iosevka-fixed-slab";})
                 ripgrep
+                pgformatter
                 pv
                 tree
                 wget
