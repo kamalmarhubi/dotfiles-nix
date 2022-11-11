@@ -7,7 +7,7 @@ local theme = lush(function()
   -- https://github.com/plan9-for-vimspace/acme-colors/blob/master/colors/acme.vim
   return {
     Normal                                 { bg="#ffffea", fg="#000000", }, -- Normal         xxx ctermfg=232 ctermbg=230 guifg=#000000 guibg=#ffffea
-    NonText                                { bg="bg", fg="fg", gui="bold", }, -- NonText        xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    NonText                                { bg="bg", fg="fg", }, -- NonText        xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
     StatusLine                             { bg="#aeeeee", fg="#000000", }, -- StatusLine     xxx ctermfg=232 ctermbg=159 guifg=#000000 guibg=#aeeeee
     StatusLineNC                           { bg="#eaffff", fg="#000000", }, -- StatusLineNC   xxx ctermfg=232 ctermbg=194 guifg=#000000 guibg=#eaffff
     WildMenu                               { bg="#000000", fg="#eaffff", }, -- WildMenu       xxx ctermfg=159 ctermbg=0 guifg=#eaffff guibg=#000000
@@ -21,16 +21,17 @@ local theme = lush(function()
     Pmenu                                  { bg="bg", fg="fg", }, -- Pmenu          xxx ctermfg=232 ctermbg=230 guifg=fg guibg=bg
     PmenuSel                               { bg="fg", fg="bg", }, -- PmenuSel       xxx ctermfg=230 ctermbg=232 guifg=bg guibg=fg
 
-    Statement                              { bg="bg", fg="fg", gui="italic", }, -- Statement      xxx cterm=italic ctermfg=232 ctermbg=230 gui=italic guifg=fg guibg=bg
-    Identifier                             { bg="bg", fg="fg", gui="bold", }, -- Identifier     xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
-    Type                                   { bg="bg", fg="fg", gui="bold", }, -- Type           xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
-    PreProc                                { bg="bg", fg="fg", gui="bold", }, -- PreProc        xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
-    Constant                               { bg="bg", fg="#101010", gui="bold", }, -- Constant       xxx cterm=italic ctermfg=233 ctermbg=230 gui=bold guifg=#101010 guibg=bg
-    Comment                                { italic = true, }, -- Comment        xxx cterm=italic ctermfg=236 ctermbg=230 gui=italic guifg=#303030 guibg=bg
-    Special                                { bg="bg", fg="fg", gui="bold", }, -- Special        xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
-    SpecialKey                             { bg="bg", fg="fg", gui="bold", }, -- SpecialKey     xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    Statement                              { bg="bg", fg="fg", }, -- Statement      xxx cterm=italic ctermfg=232 ctermbg=230 gui=italic guifg=fg guibg=bg
+    Identifier                             { bg="bg", fg="fg", }, -- Identifier     xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    Type                                   { bg="bg", fg="fg", }, -- Type           xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    PreProc                                { bg="bg", fg="fg", }, -- PreProc        xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    Constant                               { bg="bg", fg="fg", }, -- Constant       xxx cterm=italic ctermfg=233 ctermbg=230 gui=bold guifg=#101010 guibg=bg
+    Comment                                { italic = true, bold = true, }, -- Comment        xxx cterm=italic ctermfg=236 ctermbg=230 gui=italic guifg=#303030 guibg=bg
+    String                                 { italic = true, },
+    Special                                { bg="bg", fg="fg", }, -- Special        xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    SpecialKey                             { bg="bg", fg="fg", }, -- SpecialKey     xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
 
-    Directory                              { bg="bg", fg="fg", gui="bold", }, -- Directory      xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
+    Directory                              { bg="bg", fg="fg", }, -- Directory      xxx cterm=bold ctermfg=232 ctermbg=230 gui=bold guifg=fg guibg=bg
     Title                                  { Directory }, -- Title          xxx ctermfg=5 gui=bold guifg=Magenta
     MoreMsg                                { Comment }, -- MoreMsg        xxx ctermfg=2 gui=bold guifg=SeaGreen
     Question                               { Comment }, -- Question       xxx ctermfg=2 gui=bold guifg=SeaGreen
