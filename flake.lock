@@ -107,7 +107,8 @@
         "lazy-lsp.nvim": "lazy-lsp.nvim",
         "lush.nvim": "lush.nvim",
         "monotone.nvim": "monotone.nvim",
-        "vim-bw": "vim-bw"
+        "vim-bw": "vim-bw",
+        "zenbones.nvim": "zenbones.nvim"
       },
       "locked": {
         "lastModified": 1,
@@ -173,6 +174,22 @@
       "original": {
         "type": "git",
         "url": "https://git.goral.net.pl/mgoral/vim-bw.git"
+      }
+    },
+    "zenbones.nvim": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1666403433,
+        "narHash": "sha256-KpFkXeXMk/C8Wwu7VtOc51/x/DMxPmZxNUhc8gVLgww=",
+        "owner": "mcchrish",
+        "repo": "zenbones.nvim",
+        "rev": "0f7e9eb1ef309098e69e5e317508e9a7af299d94",
+        "type": "github"
+      },
+      "original": {
+        "owner": "mcchrish",
+        "repo": "zenbones.nvim",
+        "type": "github"
       }
     }
   },
