@@ -20,6 +20,10 @@
       url = "github:rktjmp/lush.nvim";
       flake = false;
     };
+    "zenbones.nvim" = {
+      url = "github:mcchrish/zenbones.nvim";
+      flake = false;
+    };
   };
 
   outputs = inputs: {
