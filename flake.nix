@@ -1,12 +1,8 @@
 # TODOs
 # - neovim
-#   - really: color scheme?
-#     - import to lush.nvim to make editing easier
-#     - acme is ok
-#       - need to fix cursor highlight though
-#       - also need to fix leap highlight
-#     - also link various builtins' hl groups to the non-built-in version
+#   - colors
 #     - fix DevIconMd or whatever the Markdown one is called
+#     - darken the comments
 #   - completion!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 #   - make git happen somehow
 #     - neogit? lazygit? fugitive? git-messenger?

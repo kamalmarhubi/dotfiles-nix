@@ -2,6 +2,12 @@ local lush = require("lush")
 local hsl = lush.hsl
 local hsluv = lush.hsluv
 
+-- TODOs if continuing to use my own theme.
+-- - acme is ok
+--   - need to fix cursor highlight though
+--   - also need to fix leap highlight
+-- - also link various builtins' hl groups to the non-built-in version
+
 local theme = lush(function()
   -- Starting values are from acme-colors
   -- https://github.com/plan9-for-vimspace/acme-colors/blob/master/colors/acme.vim
