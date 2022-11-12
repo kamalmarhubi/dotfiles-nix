@@ -18,6 +18,9 @@ require('nvim-surround').setup()
 -- This is required before lspconfig is set up, which is done by lazy-lsp just below. See
 --   https://github.com/folke/neodev.nvim#-setup
 require('neodev').setup()
+require('which-key').setup {
+  window = { padding = { 1, 2, 1, 8 } }
+}
 require('lazy-lsp').setup {
   excluded_servers = {
     "efm",
