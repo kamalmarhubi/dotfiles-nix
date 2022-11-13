@@ -16,8 +16,6 @@
 #     - luasnip
 #     - bqf
 #     - hydra.nvim?
-#     - indent-line?
-#       - not until sorting out color scheme
 #     - treesitter things
 #       - incremental_selection
 #     - lsp niceties
@@ -97,6 +95,7 @@
                   comment-nvim
                   dressing-nvim
                   guess-indent-nvim
+                  indent-blankline-nvim
                   # Go back to upstream when this PR is merged: https://github.com/dundalek/lazy-lsp.nvim/pull/3
                   # lazy-lsp-nvim
                   leap-nvim

@@ -24,6 +24,13 @@ require('neodev').setup()
 require('which-key').setup {
   window = { padding = { 1, 2, 1, 8 } }
 }
+require("indent_blankline").setup {
+  char = "▏",
+  -- char = "▎",
+  space_char_blankline = " ",
+  show_current_context = true,
+  -- show_current_context_start = true,
+}
 require('lazy-lsp').setup {
   excluded_servers = {
     "efm",
