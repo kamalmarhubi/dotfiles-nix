@@ -1,8 +1,12 @@
 # TODOs
 # - neovim
-#   - colors
-#     - fix DevIconMd or whatever the Markdown one is called
-#     - darken the comments
+#   - cosmetics & aesthetics
+#     - nonicons
+#     - other tweaks:
+#       - CursorLineNr, CursorLineSign, (CursorLineFold?)
+#         - set these so that cursorline extends into gutter??
+#       - Add toggle for `number signcolumn=number` <-> `nonumber signcolumn=yes:3`
+#       - maybe something like: if LSP is attached or in gitrepo: set signcolumn=yes:3
 #   - completion!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 #   - make git happen somehow
 #     - neogit? lazygit? fugitive? git-messenger?

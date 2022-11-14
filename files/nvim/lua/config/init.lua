@@ -1,6 +1,7 @@
 vim.opt.shortmess:append("I")
 vim.opt.termguicolors = true
 vim.opt.background = "light"
+vim.g.neobones = { solid_line_nr = true, darken_comments = 58 }
 vim.cmd.colorscheme('neobones')
 
 vim.g.mapleader = ' '
