@@ -8,16 +8,36 @@
 #       - Add toggle for `number signcolumn=number` <-> `nonumber signcolumn=yes:3`
 #       - maybe something like: if LSP is attached or in gitrepo: set signcolumn=yes:3
 #   - completion!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#     - coq vs cmp?
+#     - snippets
+#       - luasnip (https://github.com/L3MON4D3/LuaSnip)
+#         - collections? https://github.com/L3MON4D3/LuaSnip#add-snippets
 #   - make git happen somehow
 #     - neogit? lazygit? fugitive? git-messenger?
+#     - gitlinker.nvim
+#     - gitsigns.nvim
+#     - git-messenger.vim
+#
 #   - add in plugins I know I like
+#     - Plugins from my old setup:
+#       - vim-abolish
+#       - vim-doge
+#       - vim-floaterm
+#       - vimwiki et al
+#         - taskwiki
+#         - vim-taskwarrior
+#         - vimwiki
+#
 #   - try new plugins
+#     - dap
+#       - https://github.com/mfussenegger/nvim-dap
+#     - bqn
+#       - https://sr.ht/~detegr/nvim-bqn/
 #     - configure dressing.nvim?
 #     - nvim-treesitter-textsubjects
 #     - some kind of swap-with-register thing
 #     - editorconfig
 #     - portal.nvim
-#     - luasnip
 #     - bqf
 #     - hydra.nvim?
 #     - treesitter things
@@ -25,9 +45,12 @@
 #     - lsp niceties
 #       - noice?
 #       - trouble?
+#       - lsp_lines
 #       - lspsaga?
 #       - one of the where-am-i things?
 #       - improve diagnostics
+#     - image display?
+#       - https://github.com/edluffy/hologram.nvim
 #   - misc config
 #     - laststatus=3?
 #     - cmdheight=0?
