@@ -14,7 +14,6 @@
 #         - collections? https://github.com/L3MON4D3/LuaSnip#add-snippets
 #   - make git happen somehow
 #     - neogit? lazygit? fugitive? git-messenger?
-#     - gitlinker.nvim
 #     - gitsigns.nvim
 #     - git-messenger.vim
 #
@@ -121,6 +120,7 @@
                 plugins = with pkgs.vimPlugins; [
                   comment-nvim
                   dressing-nvim
+                  gitlinker-nvim
                   guess-indent-nvim
                   indent-blankline-nvim
                   # Go back to upstream when this PR is merged: https://github.com/dundalek/lazy-lsp.nvim/pull/3
