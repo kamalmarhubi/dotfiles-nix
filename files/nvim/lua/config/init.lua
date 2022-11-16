@@ -1,6 +1,7 @@
 vim.opt.shortmess:append("I")
 vim.opt.termguicolors = true
 vim.opt.background = "light"
+vim.opt.showmode = false  -- turn this off so gitlinker messages show in visual mode
 vim.g.neobones = { solid_line_nr = true, darken_comments = 58 }
 vim.cmd.colorscheme('neobones')
 
@@ -69,6 +70,7 @@ require('nvim-cursorline').setup{
   },
   cursorword = { enable = false },
 }
+require('gitlinker').setup()
 
 require('telescope').load_extension('fzf');
 
