@@ -171,6 +171,7 @@
                 (nerdfonts.override { fonts = [ "NerdFontsSymbolsOnly" ]; })
                 (iosevka-bin.override {variant = "sgr-iosevka-fixed";})
                 (iosevka-bin.override {variant = "sgr-iosevka-fixed-slab";})
+                poetry
                 ripgrep
                 pgformatter
                 pv
