@@ -66,6 +66,15 @@
 # - misc:
 #   - add a thing that checks /etc/pam.d/sudo for auth sufficient pam_tid.so and suggests adding it if absent
 #   - similar check for yubikey?
+# - firefox
+#   - add userChrome.css:
+#     #main-window[titlepreface*="‌"] #sidebar-header {
+#       display: none;
+#     }
+#
+#     #main-window[titlepreface*="‌"] #TabsToolbar {
+#       display: none;
+#     }
 {
   description = "Kamal pretends to use nix?";
 
