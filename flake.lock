@@ -52,23 +52,6 @@
         "type": "github"
       }
     },
-    "lazy-lsp.nvim": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1667422391,
-        "narHash": "sha256-6vXBE3UdS9MmOxMpYqzEkwB0Y3kom2qav1dI59aZOLU=",
-        "owner": "kamalmarhubi",
-        "repo": "lazy-lsp.nvim",
-        "rev": "7866efc6e5bef78e7f14ab2c0118c1fed15947c9",
-        "type": "github"
-      },
-      "original": {
-        "owner": "kamalmarhubi",
-        "ref": "flake",
-        "repo": "lazy-lsp.nvim",
-        "type": "github"
-      }
-    },
     "lush.nvim": {
       "flake": false,
       "locked": {
@@ -104,7 +87,6 @@
     "neovim-unpackaged-plugins": {
       "inputs": {
         "acme-colors": "acme-colors",
-        "lazy-lsp.nvim": "lazy-lsp.nvim",
         "lush.nvim": "lush.nvim",
         "monotone.nvim": "monotone.nvim",
         "vim-bw": "vim-bw",
@@ -112,7 +94,7 @@
       },
       "locked": {
         "lastModified": 1,
-        "narHash": "sha256-idQjDGU8tr1QwZ50MPmWW32sIO4sovMvV6UoFDKYbBM=",
+        "narHash": "sha256-U+rfmUcUNMt5PND6BNgw996ryZys8WCXrUXMn/ix+Vo=",
         "path": "./flakes/neovim-unpackaged-plugins",
         "type": "path"
       },
@@ -123,11 +105,11 @@
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1667231093,
-        "narHash": "sha256-RERXruzBEBuf0c7OfZeX1hxEKB+PTCUNxWeB6C1jd8Y=",
+        "lastModified": 1668765800,
+        "narHash": "sha256-rC40+/W6Hio7b/RsY8SvQPKNx4WqNcTgfYv8cUMAvJk=",
         "owner": "nixos",
         "repo": "nixpkgs",
-        "rev": "d40fea9aeb8840fea0d377baa4b38e39b9582458",
+        "rev": "52b2ac8ae18bbad4374ff0dd5aeee0fdf1aea739",
         "type": "github"
       },
       "original": {

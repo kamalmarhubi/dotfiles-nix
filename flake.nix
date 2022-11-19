@@ -132,8 +132,7 @@
                   gitlinker-nvim
                   guess-indent-nvim
                   indent-blankline-nvim
-                  # Go back to upstream when this PR is merged: https://github.com/dundalek/lazy-lsp.nvim/pull/3
-                  # lazy-lsp-nvim
+                  lazy-lsp-nvim
                   leap-nvim
                   legendary-nvim
                   # For some reason the one from nixpkgs does't include the plugin directory so it's a bit broken
