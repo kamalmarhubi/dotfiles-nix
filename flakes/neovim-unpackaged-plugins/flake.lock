@@ -16,23 +16,6 @@
         "type": "github"
       }
     },
-    "lazy-lsp.nvim": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1667422391,
-        "narHash": "sha256-6vXBE3UdS9MmOxMpYqzEkwB0Y3kom2qav1dI59aZOLU=",
-        "owner": "kamalmarhubi",
-        "repo": "lazy-lsp.nvim",
-        "rev": "7866efc6e5bef78e7f14ab2c0118c1fed15947c9",
-        "type": "github"
-      },
-      "original": {
-        "owner": "kamalmarhubi",
-        "ref": "flake",
-        "repo": "lazy-lsp.nvim",
-        "type": "github"
-      }
-    },
     "lush.nvim": {
       "flake": false,
       "locked": {
@@ -68,7 +51,6 @@
     "root": {
       "inputs": {
         "acme-colors": "acme-colors",
-        "lazy-lsp.nvim": "lazy-lsp.nvim",
         "lush.nvim": "lush.nvim",
         "monotone.nvim": "monotone.nvim",
         "vim-bw": "vim-bw",
