@@ -4,7 +4,7 @@
   lib,
   ...
 }: let
-  targetDir = "${config.home.homeDirectory}/.local/share/dotfiles-nix";
+  targetDir = "${config.xdg.dataHome}/dotfiles-nix";
   repoUrl = "https://github.com/kamalmarhubi/dotfiles-nix.git";
   checkGitRepoOriginIfPresent = pkgs.writeShellApplication {
     name = "check-git-repo-origin-if-present";
@@ -61,5 +61,5 @@ in {
   xdg.configFile."nix/nix.conf".text = ''
     experimental-features = nix-command flakes
   '';
-  xdg.configFile."nixpkgs".source = config.lib.file.mkOutOfStoreSymlink "${config.home.homeDirectory}/.local/share/dotfiles-nix";
+  xdg.configFile."nixpkgs".source = config.lib.file.mkOutOfStoreSymlink targetDir;
 }
