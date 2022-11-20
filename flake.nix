@@ -190,6 +190,9 @@
             '';
             xdg.configFile."nvim".source = config.lib.file.mkOutOfStoreSymlink "${homeDirectory}/.local/share/dotfiles-nix/files/nvim";
             xdg.configFile."kitty".source = config.lib.file.mkOutOfStoreSymlink "${homeDirectory}/.local/share/dotfiles-nix/files/kitty";
+            xdg.configFile."kitty.shell.conf".text = ''
+              shell ${homeDirectory}/.nix-profile/bin/fish --login --interactive
+            '';
           })
         ];
       };
