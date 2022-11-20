@@ -116,6 +116,7 @@
           ./dotfiles-nix.nix
           neovim-unpackaged-plugins.module
           ({config, ...}: {
+            fonts.fontconfig.enable = true;
             programs = {
               home-manager.enable = true;
               fish = {
