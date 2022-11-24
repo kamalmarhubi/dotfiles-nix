@@ -84,25 +84,6 @@
         "type": "github"
       }
     },
-    "neovim-unpackaged-plugins": {
-      "inputs": {
-        "acme-colors": "acme-colors",
-        "lush.nvim": "lush.nvim",
-        "monotone.nvim": "monotone.nvim",
-        "vim-bw": "vim-bw",
-        "zenbones.nvim": "zenbones.nvim"
-      },
-      "locked": {
-        "lastModified": 1,
-        "narHash": "sha256-U+rfmUcUNMt5PND6BNgw996ryZys8WCXrUXMn/ix+Vo=",
-        "path": "./flakes/neovim-unpackaged-plugins",
-        "type": "path"
-      },
-      "original": {
-        "path": "./flakes/neovim-unpackaged-plugins",
-        "type": "path"
-      }
-    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1668994630,
@@ -121,10 +102,14 @@
     },
     "root": {
       "inputs": {
+        "acme-colors": "acme-colors",
         "flake-utils": "flake-utils",
         "home-manager": "home-manager",
-        "neovim-unpackaged-plugins": "neovim-unpackaged-plugins",
-        "nixpkgs": "nixpkgs"
+        "lush.nvim": "lush.nvim",
+        "monotone.nvim": "monotone.nvim",
+        "nixpkgs": "nixpkgs",
+        "vim-bw": "vim-bw",
+        "zenbones.nvim": "zenbones.nvim"
       }
     },
     "utils": {
