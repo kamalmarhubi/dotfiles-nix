@@ -85,16 +85,40 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     flake-utils.url = "github:numtide/flake-utils";
-    neovim-unpackaged-plugins.url = "path:./flakes/neovim-unpackaged-plugins";
+
+    # This is unfortunate: I'd prefer to keep this noise out of the main flake.
+    # But subflakes are super broken, possibly eventually to be fixed in
+    #   https://github.com/NixOS/nix/pull/6530 maybe?
+    # Anyway for now, here's the unpackaged neovim plugins. Maybe motivation to get them added to nixpkgs.
+    acme-colors = {
+      url = "github:plan9-for-vimspace/acme-colors";
+      flake = false;
+    };
+    "monotone.nvim" = {
+      url = "github:Lokaltog/monotone.nvim";
+      flake = false;
+    };
+    vim-bw = {
+      url = "git+https://git.goral.net.pl/mgoral/vim-bw.git";
+      flake = false;
+    };
+    "lush.nvim" = {
+      url = "github:rktjmp/lush.nvim";
+      flake = false;
+    };
+    "zenbones.nvim" = {
+      url = "github:mcchrish/zenbones.nvim";
+      flake = false;
+    };
   };
 
-  outputs = {
+  outputs = inputs @ {
     nixpkgs,
     home-manager,
     flake-utils,
-    neovim-unpackaged-plugins,
     ...
   }: let
+    vimPluginInputs = builtins.removeAttrs inputs ["self" "nixpkgs" "home-manager" "flake-utils"];
     homeDirectoryFor = system: username:
       if builtins.match ".*darwin" system != null
       then "/Users/${username}"
@@ -114,7 +138,24 @@
         # the path to your home.nix.
         modules = [
           ./dotfiles-nix.nix
-          neovim-unpackaged-plugins.module
+          (
+            {
+              lib,
+              pkgs,
+              inputs,
+              ...
+            }: let
+              buildNamedPlugin = name: input:
+                pkgs.vimUtils.buildVimPlugin {
+                  inherit name;
+                  namePrefix = "";
+                  src = input;
+                };
+            in {
+              programs.neovim.plugins = lib.mapAttrsToList buildNamedPlugin vimPluginInputs;
+            }
+          )
+
           ({config, ...}: {
             fonts.fontconfig.enable = true;
             programs = {
