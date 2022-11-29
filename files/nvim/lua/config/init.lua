@@ -34,9 +34,13 @@ require("indent_blankline").setup {
   -- show_current_context_start = true,
 }
 require('lazy-lsp').setup {
+  -- Should probably switch to explicitly listing ones I want?
   excluded_servers = {
     "efm",
-    "diagnosticls"
+    "diagnosticls",
+    "jedi_language_server",
+    "pylsp",
+    "ltex",
   },
   default_config = {
     on_attach = function(client, buffnr)
