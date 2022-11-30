@@ -115,6 +115,7 @@
                   telescope-fzf-native-nvim
                   (nvim-treesitter.withPlugins (_: pkgs.tree-sitter.allGrammars))
                   nvim-treesitter-textobjects
+                  toggleterm-nvim
                   nvim-web-devicons
                   vim-unimpaired
                   which-key-nvim
