@@ -6,6 +6,7 @@ vim.g.neobones = { solid_line_nr = true, darken_comments = 58 }
 vim.opt.smartcase = true
 vim.opt.ignorecase = true
 vim.cmd.colorscheme('neobones')
+vim.opt.cursorline = true
 
 vim.g.mapleader = ' '
 vim.o.timeoutlen = 500
@@ -67,14 +68,6 @@ require('nvim-treesitter.configs').setup {
       },
     },
   },
-}
-require('nvim-cursorline').setup{
-  cursorline = {
-    enable = true,
-    number = true,
-    timeout = 4000,
-  },
-  cursorword = { enable = false },
 }
 require('gitlinker').setup()
 
