@@ -100,6 +100,22 @@
         "type": "github"
       }
     },
+    "possession.nvim": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1665310726,
+        "narHash": "sha256-WkTHyAJwzqbZ5Ab/9b2k90L6JmsrTjLDkbMGI5t6D5E=",
+        "owner": "jedrzejboczar",
+        "repo": "possession.nvim",
+        "rev": "0afa28734c6fadf625117a03759cc605b07b43ba",
+        "type": "github"
+      },
+      "original": {
+        "owner": "jedrzejboczar",
+        "repo": "possession.nvim",
+        "type": "github"
+      }
+    },
     "root": {
       "inputs": {
         "acme-colors": "acme-colors",
@@ -108,6 +124,7 @@
         "lush.nvim": "lush.nvim",
         "monotone.nvim": "monotone.nvim",
         "nixpkgs": "nixpkgs",
+        "possession.nvim": "possession.nvim",
         "vim-bw": "vim-bw",
         "zenbones.nvim": "zenbones.nvim"
       }
