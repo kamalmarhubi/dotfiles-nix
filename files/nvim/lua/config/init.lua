@@ -71,6 +71,22 @@ require('nvim-treesitter.configs').setup {
 }
 require('gitlinker').setup()
 
-require('telescope').load_extension('fzf');
+require('telescope').load_extension('fzf')
+
+require('possession').setup {
+  autosave = {
+    current = true,
+    tmp = false,
+    on_load = true,
+    on_quit = true,
+  },
+  plugins = {
+    -- Keep hidden buffers...
+    delete_hidden_buffers = false,
+    -- ... but then we need to close all buffers before session load.
+    delete_buffers = true,
+  },
+}
+require('telescope').load_extension('possession')
 
 require('config.map')

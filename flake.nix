@@ -33,6 +33,10 @@
       url = "github:mcchrish/zenbones.nvim";
       flake = false;
     };
+    "possession.nvim" = {
+      url = "github:jedrzejboczar/possession.nvim";
+      flake = false;
+    };
   };
 
   outputs = inputs @ {
