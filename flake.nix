@@ -246,7 +246,7 @@
         "kamal@kx7" = homeFor {
           system = "x86_64-linux";
         };
-        "kamal@kmbpwave.local" = homeFor {
+        "kamal@kmbpwave" = homeFor {
           system = "aarch64-darwin";
         };
       };
