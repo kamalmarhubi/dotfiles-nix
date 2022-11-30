@@ -19,23 +19,11 @@ vim.opt.formatoptions:append("o")  -- respect comment on o in normal
 --   http://vim.wikia.com/wiki/Easy_edit_of_files_in_the_same_directory#Using_a_command_line_abbreviation
 vim.cmd[[cabbr <expr> %% expand('%:p:h')]]
 
-require('leap').add_default_mappings()
-require('Comment').setup()
-require('guess-indent').setup()
-require('nvim-surround').setup()
--- This is required before lspconfig is set up, which is done by lazy-lsp just below. See
+-- Both of these need to happen before lspconfig is set up, which is done by lazy-lsp just below. See
+--   https://github.com/folke/neoconf.nvim#-setup
 --   https://github.com/folke/neodev.nvim#-setup
+require('neoconf').setup()
 require('neodev').setup()
-require('which-key').setup {
-  window = { padding = { 1, 2, 1, 8 } }
-}
-require("indent_blankline").setup {
-  char = "▏",
-  -- char = "▎",
-  space_char_blankline = " ",
-  show_current_context = true,
-  -- show_current_context_start = true,
-}
 require('lazy-lsp').setup {
   -- Should probably switch to explicitly listing ones I want?
   excluded_servers = {
@@ -53,6 +41,21 @@ require('lazy-lsp').setup {
       vim.keymap.set("n", "<leader>ld", "<cmd>lua vim.lsp.buf.definition()<cr>", { desc = "definition", buffer = buffnr })
     end,
   },
+}
+
+require('leap').add_default_mappings()
+require('Comment').setup()
+require('guess-indent').setup()
+require('nvim-surround').setup()
+require('which-key').setup {
+  window = { padding = { 1, 2, 1, 8 } }
+}
+require("indent_blankline").setup {
+  char = "▏",
+  -- char = "▎",
+  space_char_blankline = " ",
+  show_current_context = true,
+  -- show_current_context_start = true,
 }
 require('nvim-treesitter.configs').setup {
   highlight = { enable = true },

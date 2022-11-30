@@ -106,6 +106,7 @@
                   legendary-nvim
                   # For some reason the one from nixpkgs does't include the plugin directory so it's a bit broken
                   # lush-nvim
+                  neoconf-nvim
                   neodev-nvim
                   nvim-lspconfig
                   nvim-surround
