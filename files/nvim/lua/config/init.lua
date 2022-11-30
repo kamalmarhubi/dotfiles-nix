@@ -88,5 +88,21 @@ require('possession').setup {
   },
 }
 require('telescope').load_extension('possession')
+require('toggleterm').setup {
+  open_mapping = [[<c-\>]],
+  direction = "float",
+  shade_terminals = true,
+  shading_factor = 0.75,
+  shell = "fish",
+}
+local termgroup = vim.api.nvim_create_augroup("kterm", { clear = true })
+vim.api.nvim_create_autocmd("TermOpen", {
+  group = termgroup,
+  callback = function()
+    vim.opt_local.cursorline = false
+    vim.keymap.set('t', '<esc>', [[<C-\><C-n>]], { buffer = 0 })
+  end,
+})
+
 
 require('config.map')
