@@ -100,7 +100,6 @@ vim.api.nvim_create_autocmd("TermOpen", {
   group = termgroup,
   callback = function()
     vim.opt_local.cursorline = false
-    vim.keymap.set('t', '<esc>', [[<C-\><C-n>]], { buffer = 0 })
   end,
 })
 

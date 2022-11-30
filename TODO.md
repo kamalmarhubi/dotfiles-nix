@@ -62,6 +62,11 @@ on home-manager switch invocation:
 - treesitter things
   - incremental_selection
 
+### terminal
+- make there be a way to escape insert mode in toggleterm
+- add dedicated toggleterms for k9s htop some other stuff
+- maybe a way to have non-floating terms / multiple terms?
+
 ### git
 - figure out what plugins
   - neogit? lazygit? fugitive? git-messenger?
