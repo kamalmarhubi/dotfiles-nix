@@ -109,7 +109,7 @@
                   neodev-nvim
                   nvim-lspconfig
                   nvim-surround
-                  playground  # nvim-tresitter/playground
+                  playground # nvim-tresitter/playground
                   plenary-nvim
                   telescope-nvim
                   telescope-fzf-native-nvim
@@ -136,7 +136,7 @@
                 atool
                 entr
                 fd
-                (nerdfonts.override { fonts = [ "NerdFontsSymbolsOnly" ]; })
+                (nerdfonts.override {fonts = ["NerdFontsSymbolsOnly"];})
                 (iosevka-bin.override {variant = "sgr-iosevka-fixed";})
                 (iosevka-bin.override {variant = "sgr-iosevka-fixed-slab";})
                 poetry
