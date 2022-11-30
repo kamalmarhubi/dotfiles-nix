@@ -9,7 +9,7 @@ vim.cmd.colorscheme('neobones')
 vim.opt.cursorline = true
 
 vim.g.mapleader = ' '
-vim.o.timeoutlen = 500
+vim.opt.timeoutlen = 500
 
 vim.opt.formatoptions:append("r")  -- respect comment on newline in insert
 vim.opt.formatoptions:append("o")  -- respect comment on o in normal
