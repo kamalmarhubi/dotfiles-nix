@@ -1,5 +1,15 @@
 # Things one could do
 
+## Learning from actually doing any work
+- ideally save session periodically; lost some stuff because of nvim crash
+  - timer?
+  - BufEnter?
+- completion, even if manually triggered
+  - maybe use omnifunc for now?
+- jumping around differeng files... <leader>fb is slightly annoying
+  - figure out portal and/or grapple?
+- juggling multiple open projects... session-per-tab? terminal tabs?
+
 ## neovim
 
 ### nix bs
@@ -30,6 +40,8 @@ on home-manager switch invocation:
     - lua state
       - possibly easy: there's not much in _G on startup. could clear out everything from `package.loaded` that isn't in `package.preload`?
     - autocommands so we can clear ones added by config & plugins before re-init
+      - uh but need to rerun autocmds for buffers, eg TermOpen?
+        - not so bad: https://vimdoc.sourceforge.net/htmldoc/autocmd.html#:doautoall
   - save:
     - `:let` output
     - `:set` output
