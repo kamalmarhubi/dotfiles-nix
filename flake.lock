@@ -39,15 +39,16 @@
         "utils": "utils"
       },
       "locked": {
-        "lastModified": 1667410913,
-        "narHash": "sha256-5+S65dpXaIyMDeoPy823BzNH5HYY1wvZ6G+rzTnO8kY=",
-        "owner": "nix-community",
+        "lastModified": 1669757160,
+        "narHash": "sha256-Rg+pjtpjhmJHDs8/qpDSWI6FCRzDELTn8UFaYfRRJws=",
+        "owner": "kamalmarhubi",
         "repo": "home-manager",
-        "rev": "f520832a47dbc24d1e2c4e4b9a3dbe910777d1a2",
+        "rev": "b6622857ae8e97ba18944e9eb77e71efb32b988a",
         "type": "github"
       },
       "original": {
-        "owner": "nix-community",
+        "owner": "kamalmarhubi",
+        "ref": "flake-short-hostname",
         "repo": "home-manager",
         "type": "github"
       }
