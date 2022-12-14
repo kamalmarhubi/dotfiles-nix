@@ -178,6 +178,9 @@
         "kamal@kmbpwave" = homeFor {
           system = "aarch64-darwin";
         };
+        "kamal@kamal-FL932PQ21V" = homeFor {
+          system = "aarch64-darwin";
+        };
       };
     }
     // flake-utils.lib.eachDefaultSystem (system: {
