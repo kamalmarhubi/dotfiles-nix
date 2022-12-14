@@ -84,6 +84,7 @@
           )
 
           ({config, ...}: {
+            nix.registry.nixpkgs.flake = nixpkgs;
             fonts.fontconfig.enable = true;
             programs = {
               home-manager.enable = true;
