@@ -19,12 +19,8 @@
 
 #### config editability
 
-- print out new thing to put in packpath after activation? the way to do that would be via neovim not nix
-  - OR: add way to switch to current generation's packdir and reload everything
-    - `nvim -u NONE --headless '+lua print(vim.opt.packpath:get()[1])' +q` will print packdir from new neovim
-    - v:argv contains arguments of this running nvim: can be used to reset packpath
-
-OR OR OR
+TODO: figure out which parts of this might still be needed after dumping the
+home-manager module.
 
 something kind of complicated but maybe doable?
 

@@ -8,7 +8,6 @@ vim.opt.ignorecase = true
 vim.cmd.colorscheme('neobones')
 vim.opt.cursorline = true
 
-vim.g.mapleader = ' '
 vim.opt.timeoutlen = 500
 
 vim.opt.formatoptions:append("r")  -- respect comment on newline in insert

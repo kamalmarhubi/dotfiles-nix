@@ -8,44 +8,14 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     flake-utils.url = "github:numtide/flake-utils";
-
-    # This is unfortunate: I'd prefer to keep this noise out of the main flake.
-    # But subflakes are super broken, possibly eventually to be fixed in
-    #   https://github.com/NixOS/nix/pull/6530 maybe?
-    # Anyway for now, here's the unpackaged neovim plugins. Maybe motivation to get them added to nixpkgs.
-    acme-colors = {
-      url = "github:plan9-for-vimspace/acme-colors";
-      flake = false;
-    };
-    "monotone.nvim" = {
-      url = "github:Lokaltog/monotone.nvim";
-      flake = false;
-    };
-    vim-bw = {
-      url = "git+https://git.goral.net.pl/mgoral/vim-bw.git";
-      flake = false;
-    };
-    "lush.nvim" = {
-      url = "github:rktjmp/lush.nvim";
-      flake = false;
-    };
-    "zenbones.nvim" = {
-      url = "github:mcchrish/zenbones.nvim";
-      flake = false;
-    };
-    "possession.nvim" = {
-      url = "github:jedrzejboczar/possession.nvim";
-      flake = false;
-    };
   };
 
-  outputs = inputs @ {
+  outputs = {
     nixpkgs,
     home-manager,
     flake-utils,
     ...
   }: let
-    vimPluginInputs = builtins.removeAttrs inputs ["self" "nixpkgs" "home-manager" "flake-utils"];
     homeDirectoryFor = system: username:
       if builtins.match ".*darwin" system != null
       then "/Users/${username}"
@@ -66,24 +36,6 @@
         # the path to your home.nix.
         modules = [
           ./dotfiles-nix.nix
-          (
-            {
-              lib,
-              pkgs,
-              inputs,
-              ...
-            }: let
-              buildNamedPlugin = name: input:
-                pkgs.vimUtils.buildVimPlugin {
-                  inherit name;
-                  namePrefix = "";
-                  src = input;
-                };
-            in {
-              programs.neovim.plugins = lib.mapAttrsToList buildNamedPlugin vimPluginInputs;
-            }
-          )
-
           ({config, ...}: {
             nix.registry.nixpkgs.flake = nixpkgs;
             fonts.fontconfig.enable = true;
@@ -94,35 +46,6 @@
                 shellInit = ''
                   source $HOME/.nix-profile/share/asdf-vm/asdf.fish
                 '';
-              };
-              neovim = {
-                enable = true;
-                plugins = with pkgs.vimPlugins; [
-                  comment-nvim
-                  dressing-nvim
-                  gitlinker-nvim
-                  guess-indent-nvim
-                  indent-blankline-nvim
-                  lazy-lsp-nvim
-                  leap-nvim
-                  legendary-nvim
-                  # For some reason the one from nixpkgs does't include the plugin directory so it's a bit broken
-                  # lush-nvim
-                  neoconf-nvim
-                  neodev-nvim
-                  nvim-lspconfig
-                  nvim-surround
-                  playground # nvim-tresitter/playground
-                  plenary-nvim
-                  telescope-nvim
-                  telescope-fzf-native-nvim
-                  (nvim-treesitter.withPlugins (_: pkgs.tree-sitter.allGrammars))
-                  nvim-treesitter-textobjects
-                  toggleterm-nvim
-                  nvim-web-devicons
-                  vim-unimpaired
-                  which-key-nvim
-                ];
               };
             };
 
@@ -144,6 +67,7 @@
                 (nerdfonts.override {fonts = ["NerdFontsSymbolsOnly"];})
                 (iosevka-bin.override {variant = "sgr-iosevka-fixed";})
                 (iosevka-bin.override {variant = "sgr-iosevka-fixed-slab";})
+                neovim-unwrapped
                 poetry
                 ripgrep
                 pgformatter
