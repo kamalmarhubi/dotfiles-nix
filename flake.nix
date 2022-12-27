@@ -54,6 +54,7 @@
       username ? "kamal",
       system,
       homeDirectory ? homeDirectoryFor system username,
+      extraModules ? [],
       ...
     }: let
       pkgs = nixpkgs.legacyPackages.${system};
@@ -165,7 +166,7 @@
               shell ${homeDirectory}/.nix-profile/bin/fish --login --interactive
             '';
           })
-        ];
+        ] ++ extraModules;
       };
   in
     {
