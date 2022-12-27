@@ -139,6 +139,8 @@
                 atool
                 entr
                 fd
+                git
+                git-lfs
                 (nerdfonts.override {fonts = ["NerdFontsSymbolsOnly"];})
                 (iosevka-bin.override {variant = "sgr-iosevka-fixed";})
                 (iosevka-bin.override {variant = "sgr-iosevka-fixed-slab";})
@@ -161,6 +163,8 @@
               # End Nix
             '';
             xdg.configFile."nvim".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.dataHome}/dotfiles-nix/files/nvim";
+            xdg.configFile."git/config".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.dataHome}/dotfiles-nix/files/git/config";
+            xdg.configFile."git/config.dotfiles".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.dataHome}/dotfiles-nix/files/git/config.dotfiles";
             xdg.configFile."kitty".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.dataHome}/dotfiles-nix/files/kitty";
             xdg.configFile."kitty.shell.conf".text = ''
               shell ${homeDirectory}/.nix-profile/bin/fish --login --interactive
@@ -181,6 +185,9 @@
         };
         "kamal@kamal-FL932PQ21V" = homeFor {
           system = "aarch64-darwin";
+          extraModules = [({config, ...}: {
+            xdg.configFile."git/config.local".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.dataHome}/dotfiles-nix/files/git/config.wave";
+          })];
         };
       };
     }

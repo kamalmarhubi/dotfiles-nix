@@ -1,0 +1,80 @@
+[user]
+	email = kamal@marhubi.com
+	name = Kamal Al Marhubi
+[pull]
+	ff = only
+[push]
+	default = current
+
+[rebase]
+	autosquash = true
+	autostash = true
+	abbreviateCommands = true
+	rescheduleFailedExec = true
+
+[diff]
+	mnemonicPrefix = true
+	renames = copies
+	algorithm = histogram
+	indentHeuristic = true
+	colorMoved = dimmed-zebra
+	colorMovedWS = allow-indentation-change
+
+[log]
+	showRoot = true
+	follow = true
+
+[alias]
+	# Print absolute path of repo root directory
+	root = rev-parse --show-toplevel
+	# Print short oid for a commit; usage: `git sha1 [REF]`
+	oid = !sh -c 'git rev-parse --short "${1:-HEAD}^{commit}"' --
+	# Get children of specified commit-ish.
+	children = "!f() { git rev-list --all --not $1^@ --children | grep $(git rev-parse $1); }; f"
+	# These two come from https://stackoverflow.com/a/30998048.
+	find-merge = "!sh -c 'commit=$0 && branch=${1:-HEAD} && (git rev-list $commit..$branch --ancestry-path | cat -n; git rev-list $commit..$branch --first-parent | cat -n) | sort -k2 -s | uniq -f1 -d | sort -n | tail -1 | cut -f2'"
+	show-merge = "!sh -c 'merge=$(git find-merge $0 $1) && [ -n \"$merge\" ] && git show $merge'"
+	# Get the GitHub URL for a GitHub repository. Usage: `git gh-url [REMOTE]`
+	gh-url = "!f() { \
+		if ! remote=${1:-$(git config --get \
+			branch.$(git symbolic-ref --short HEAD).remote)}; \
+		then \
+			echo no remote specified and could not get remote for HEAD; \
+			exit; \
+		fi; \
+		if ! remote_url=$(git config --get remote.$remote.url); \
+		then \
+			echo "could not get URL for remote \\`$remote\\`"; \
+			exit; \
+		fi; \
+		case $remote_url in \
+			git@github.com:*.git) \
+				repo=$(echo $remote_url \
+					| sed 's/git@github.com:\\(.*\\).git/\\1/');; \
+			https://github.com/*) \
+				repo=$(echo $remote_url \
+					| sed 's+https://github.com/\\(.*\\).git+\\1+');; \
+			*) \
+				echo "\\`$remote\\` does not appear to have " \
+					"a GitHub remote url: $remote_url"; \
+				exit 1;; \
+		esac; \
+		echo https://github.com/$repo; \
+	}; \
+	f"
+
+# Include local file; if not present git helpfully ignores it.
+# Do this at the end to allow overriding defaults above.
+[include]
+	path = config.local
+
+# Override email address as kamal@marhubi.com for dotfiles repo.
+[includeIf "gitdir:~/.local/share/dotfiles-nix"]
+	path = config.dotfiles
+[init]
+	defaultBranch = main
+[filter "lfs"]
+	process = git-lfs filter-process
+	required = true
+	clean = git-lfs clean -- %f
+	smudge = git-lfs smudge -- %f
