@@ -2,7 +2,7 @@
   description = "Kamal pretends to use nix?";
 
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
     home-manager = {
       url = "github:kamalmarhubi/home-manager/flake-short-hostname";
       inputs.nixpkgs.follows = "nixpkgs";
