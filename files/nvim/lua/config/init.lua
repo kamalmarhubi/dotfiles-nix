@@ -56,21 +56,6 @@ require("indent_blankline").setup {
   show_current_context = true,
   -- show_current_context_start = true,
 }
-require('nvim-treesitter.configs').setup {
-  highlight = { enable = true },
-  playground = { enable = true },
-  textobjects = {
-    select = {
-      enable = true,
-      keymaps = {
-        ["af"] = "@function.outer",
-        ["if"] = "@function.inner",
-        ["ac"] = "@class.outer",
-        ["ic"] = "@class.inner",
-      },
-    },
-  },
-}
 require('gitlinker').setup()
 
 require('telescope').load_extension('fzf')
