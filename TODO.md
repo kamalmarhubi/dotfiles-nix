@@ -1,5 +1,13 @@
 # Things one could do
 
+Look at: https://trello.com/b/lobyPOvA/dev-tools
+
+## general nix/home-manager
+
+- move work specific stuff out of main config so I can commit it
+
+## neovim
+
 ## Learning from actually doing any work
 - ideally save session periodically; lost some stuff because of nvim crash
   - timer?
@@ -9,8 +17,14 @@
 - jumping around differeng files... <leader>fb is slightly annoying
   - figure out portal and/or grapple?
 - juggling multiple open projects... session-per-tab? terminal tabs?
+  - realistically, it's still one purpose
+    - looking at graphql source while working on our graphql stuff
+    - or same for otel
+    - so maybe just open those repos up in tabs in the same session?
 
-## neovim
+### sessions
+
+- switch to resession for $reasons?
 
 ### nix bs
 
