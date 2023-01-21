@@ -71,6 +71,7 @@
                 poetry
                 ripgrep
                 pgformatter
+                pstree
                 pv
                 tree
                 wget
