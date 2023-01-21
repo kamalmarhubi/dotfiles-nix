@@ -68,12 +68,14 @@
                 (iosevka-bin.override {variant = "sgr-iosevka-fixed";})
                 (iosevka-bin.override {variant = "sgr-iosevka-fixed-slab";})
                 neovim-unwrapped
+                nodejs
                 poetry
                 ripgrep
                 pgformatter
                 pstree
                 pv
                 tree
+                tree-sitter
                 wget
               ];
             };
