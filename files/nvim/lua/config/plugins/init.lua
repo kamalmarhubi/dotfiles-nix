@@ -1,9 +1,4 @@
 return {
-  "plan9-for-vimspace/acme-colors",
-  "Lokaltog/monotone.nvim",
-  { url = "https://git.goral.net.pl/mgoral/vim-bw.git" },
-  "rktjmp/lush.nvim",
-  "mcchrish/zenbones.nvim",
   "jedrzejboczar/possession.nvim",
   "cbochs/portal.nvim",  -- don't commit
   "cbochs/grapple.nvim",  -- don't commit
@@ -16,6 +11,7 @@ return {
   "ggandor/leap.nvim",
   "mrjones2014/legendary.nvim",
   "folke/neoconf.nvim",
+  "folke/tokyonight.nvim",
   "folke/neodev.nvim",
   "neovim/nvim-lspconfig",
   "kylechui/nvim-surround",
