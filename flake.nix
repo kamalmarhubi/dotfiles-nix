@@ -54,6 +54,7 @@
           ./git.nix
           ./nvim.nix
           ./kitty.nix
+          ./wezterm.nix
         ] ++ extraModules;
       };
   in
