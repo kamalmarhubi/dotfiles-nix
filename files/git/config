@@ -70,6 +70,6 @@
 [include]
 	path = config.local
 
-# Override email address as kamal@marhubi.com for dotfiles repo.
-[includeIf "gitdir:~/.local/share/dotfiles-nix"]
-	path = config.dotfiles
+# Override email address as kamal@marhubi.com for my github repos.
+[includeIf "hasconfig:remote.*.url:https://github.com/kamalmarhubi/**"]
+	path = config.mine
