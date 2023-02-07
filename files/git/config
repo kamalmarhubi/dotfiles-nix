@@ -1,6 +1,8 @@
 [user]
 	email = kamal@marhubi.com
 	name = Kamal Al Marhubi
+[init]
+	defaultBranch = main
 [pull]
 	ff = only
 [push]
@@ -71,5 +73,3 @@
 # Override email address as kamal@marhubi.com for dotfiles repo.
 [includeIf "gitdir:~/.local/share/dotfiles-nix"]
 	path = config.dotfiles
-[init]
-	defaultBranch = main
