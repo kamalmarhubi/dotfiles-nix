@@ -65,7 +65,7 @@
         "kamal@kx7" = homeFor {
           system = "x86_64-linux";
         };
-        "kamal@kmbpwave" = homeFor {
+        "kamal@mimolette" = homeFor {
           system = "aarch64-darwin";
         };
         "kamal@kamal-FL932PQ21V" = homeFor {
