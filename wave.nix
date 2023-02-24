@@ -12,6 +12,7 @@
     asdf-vm
     git-lfs
     k9s
+    (wrapHelm kubernetes-helm {plugins = [kubernetes-helmPlugins.helm-diff];})
     pgcli
     pgformatter
   ];
