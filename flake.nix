@@ -34,28 +34,29 @@
 
         # Specify your home configuration modules here, for example,
         # the path to your home.nix.
-        modules = [
-          {
-            nix.registry.nixpkgs.flake = nixpkgs;
-            programs = {
-              home-manager.enable = true;
-            };
+        modules =
+          [
+            {
+              nix.registry.nixpkgs.flake = nixpkgs;
+              programs = {
+                home-manager.enable = true;
+              };
 
-            home = {
-              inherit username homeDirectory;
-              stateVersion = "22.11";
-            };
-
-          }
-          ./dotfiles-nix.nix
-          ./base.nix
-          ./fish.nix
-          ./fonts.nix
-          ./git.nix
-          ./nvim.nix
-          ./kitty.nix
-          ./wezterm.nix
-        ] ++ extraModules;
+              home = {
+                inherit username homeDirectory;
+                stateVersion = "22.11";
+              };
+            }
+            ./dotfiles-nix.nix
+            ./base.nix
+            ./fish.nix
+            ./fonts.nix
+            ./git.nix
+            ./nvim.nix
+            ./kitty.nix
+            ./wezterm.nix
+          ]
+          ++ extraModules;
       };
   in
     {
@@ -70,7 +71,7 @@
         };
         "kamal@kamal-FL932PQ21V" = homeFor {
           system = "aarch64-darwin";
-          extraModules = [ ./wave.nix ];
+          extraModules = [./wave.nix];
         };
       };
     }
