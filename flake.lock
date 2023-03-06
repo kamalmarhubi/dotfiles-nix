@@ -36,6 +36,26 @@
         "type": "github"
       }
     },
+    "mkalias": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1677814234,
+        "narHash": "sha256-Uzi8GIzo+ATX9dPOJduBjvSDtQc6+7EpJZasD8+/uoo=",
+        "owner": "reckenrode",
+        "repo": "mkalias",
+        "rev": "592596818a3175cdc1f1c7349d44387ed18aa975",
+        "type": "github"
+      },
+      "original": {
+        "owner": "reckenrode",
+        "repo": "mkalias",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1676928847,
@@ -56,6 +76,7 @@
       "inputs": {
         "flake-utils": "flake-utils",
         "home-manager": "home-manager",
+        "mkalias": "mkalias",
         "nixpkgs": "nixpkgs"
       }
     },

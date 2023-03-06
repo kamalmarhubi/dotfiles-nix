@@ -8,6 +8,10 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     flake-utils.url = "github:numtide/flake-utils";
+    mkalias = {
+      url = "github:reckenrode/mkalias";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = {
@@ -15,7 +19,7 @@
     home-manager,
     flake-utils,
     ...
-  }: let
+  } @ inputs: let
     homeDirectoryFor = system: username:
       if builtins.match ".*darwin" system != null
       then "/Users/${username}"
@@ -32,8 +36,8 @@
       home-manager.lib.homeManagerConfiguration {
         inherit pkgs;
 
-        # Specify your home configuration modules here, for example,
-        # the path to your home.nix.
+        # Make inputs and system available to all modules.
+        extraSpecialArgs = {inherit inputs system;};
         modules =
           [
             {
@@ -47,8 +51,9 @@
                 stateVersion = "22.11";
               };
             }
-            ./dotfiles-nix.nix
             ./base.nix
+            ./darwin.nix
+            ./dotfiles-nix.nix
             ./fish.nix
             ./fonts.nix
             ./git.nix
