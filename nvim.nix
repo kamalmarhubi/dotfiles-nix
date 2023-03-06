@@ -1,6 +1,8 @@
 {
   config,
   pkgs,
+  inputs,
+  system,
   ...
 }: {
   home = {
@@ -9,7 +11,7 @@
     };
 
     packages = with pkgs; [
-      neovim-unwrapped
+      inputs.neovim.packages.${system}.default
       nodejs
       tree-sitter
     ];

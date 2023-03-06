@@ -12,6 +12,12 @@
       url = "github:reckenrode/mkalias";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    neovim = {
+      # Switch this to use upstream neovim flake after 0.9.0 is released?
+      # url = "github:neovim/neovim?dir=contrib";
+      url = "github:nix-community/neovim-nightly-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = {
