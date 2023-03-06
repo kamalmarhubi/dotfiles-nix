@@ -57,8 +57,8 @@
             ./fish.nix
             ./fonts.nix
             ./git.nix
-            ./nvim.nix
             ./kitty.nix
+            ./nvim.nix
             ./wezterm.nix
           ]
           ++ extraModules;
