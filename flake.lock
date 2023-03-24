@@ -74,11 +74,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1677814234,
-        "narHash": "sha256-Uzi8GIzo+ATX9dPOJduBjvSDtQc6+7EpJZasD8+/uoo=",
+        "lastModified": 1678761502,
+        "narHash": "sha256-tL3C/b2BPOGQpV287wECDCDWmKwwPvezAAN3qz7N07M=",
         "owner": "reckenrode",
         "repo": "mkalias",
-        "rev": "592596818a3175cdc1f1c7349d44387ed18aa975",
+        "rev": "8a5478cdb646f137ebc53cb9d235f8e5892ea00a",
         "type": "github"
       },
       "original": {
