@@ -61,5 +61,5 @@ in {
   xdg.configFile."nix/nix.conf".text = ''
     experimental-features = nix-command flakes
   '';
-  xdg.configFile."nixpkgs".source = config.lib.file.mkOutOfStoreSymlink targetDir;
+  xdg.configFile."home-manager".source = config.lib.file.mkOutOfStoreSymlink targetDir;
 }
