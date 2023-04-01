@@ -1,19 +1,14 @@
 # nix flake + home-manager based dotfiles
 
-To bootstrap, install nix and run:
+To bootstrap, [install nix] and run:
 
-    nix --extra-experimental-features 'nix-command flakes' build --impure --expr \
-      "(builtins.getFlake ''github:kamalmarhubi/dotfiles-nix'').homeFor {
-         system = builtins.currentSystem;
-         username = ''$USER'';
-         homeDirectory = ''$HOME'';
-      }"
+    nix run github:nix-community/home-manager -- \
+      switch --impure --flake github:kamalmarhubi/dotfiles-nix#bootstrap
 
-then running the generated
+optionally with `--dry-run` or `--verbose` as well.
 
-    result/activate
-
-possibly with `DRY_RUN=1 VERBOSE=1` in the environment to see what it'll do.
+The `--impure` is needed because the bootstrap config reads from the
+environment, which is disallowed by default when using flakes.
 
 Finally add an entry to the `homeConfigurations` output so that
 
@@ -21,6 +16,7 @@ Finally add an entry to the `homeConfigurations` output so that
 
 works.
 
+[install nix]: https://zero-to-nix.com/start/install
 
 ## Note for non-kamals
 

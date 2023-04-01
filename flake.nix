@@ -73,6 +73,13 @@
       # For bootstrapping systems that aren't aleady in the homeConfigurations output.
       inherit homeFor;
       homeConfigurations = {
+        # NB This reads env vars and so requires --impure.
+        "bootstrap" = homeFor {
+          system = builtins.currentSystem;
+          username = builtins.getEnv "USER";
+          homeDirectory = builtins.getEnv "HOME";
+        };
+
         "kamal@kx7" = homeFor {
           system = "x86_64-linux";
         };
