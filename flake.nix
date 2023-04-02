@@ -85,6 +85,7 @@
         };
         "kamal@mimolette" = homeFor {
           system = "aarch64-darwin";
+          extraModules = [./personal.nix];
         };
         "kamal@kamal-FL932PQ21V" = homeFor {
           system = "aarch64-darwin";
