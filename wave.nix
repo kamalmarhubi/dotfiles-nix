@@ -10,9 +10,11 @@
 
   home.packages = with pkgs; [
     asdf-vm
+    cmake
     git-lfs
     k9s
     (wrapHelm kubernetes-helm {plugins = [kubernetes-helmPlugins.helm-diff];})
+    ninja
     pgcli
     pgformatter
   ];
