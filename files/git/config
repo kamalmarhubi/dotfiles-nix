@@ -17,7 +17,7 @@
 [diff]
 	mnemonicPrefix = true
 	renames = copies
-	algorithm = histogram
+	algorithm = patience
 	indentHeuristic = true
 	colorMoved = dimmed-zebra
 	colorMovedWS = allow-indentation-change
