@@ -9,8 +9,10 @@
   '';
 
   home.packages = with pkgs; [
+    argocd
     asdf-vm
     cmake
+    colordiff
     git-lfs
     k9s
     (wrapHelm kubernetes-helm {plugins = [kubernetes-helmPlugins.helm-diff];})
