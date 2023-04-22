@@ -14,6 +14,7 @@
     cmake
     colordiff
     git-lfs
+    go
     k9s
     (wrapHelm kubernetes-helm {plugins = [kubernetes-helmPlugins.helm-diff];})
     ninja
