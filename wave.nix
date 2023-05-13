@@ -12,6 +12,7 @@
     argocd
     asdf-vm
     cmake
+    colima
     colordiff
     git-lfs
     go
