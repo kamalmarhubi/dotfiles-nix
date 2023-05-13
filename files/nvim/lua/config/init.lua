@@ -25,11 +25,11 @@ require('neodev').setup()
 require('lazy-lsp').setup {
   -- Should probably switch to explicitly listing ones I want?
   excluded_servers = {
-    "efm",
     "diagnosticls",
+    "efm",
     "jedi_language_server",
-    "pylsp",
     "ltex",
+    "pylsp",
     "sqls",
   },
   default_config = {
