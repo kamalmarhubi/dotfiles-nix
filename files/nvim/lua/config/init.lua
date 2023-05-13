@@ -30,6 +30,7 @@ require('lazy-lsp').setup {
     "jedi_language_server",
     "pylsp",
     "ltex",
+    "sqls",
   },
   default_config = {
     on_attach = function(client, buffnr)
