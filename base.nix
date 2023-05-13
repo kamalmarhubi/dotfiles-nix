@@ -6,6 +6,7 @@
     entr
     fd
     graphicsmagick
+    mtr
     nushell
     poetry
     pstree
