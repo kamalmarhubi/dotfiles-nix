@@ -8,6 +8,9 @@
 [push]
 	default = current
 
+[delta]
+	navigate = true
+	light = true
 [rebase]
 	autosquash = true
 	autostash = true

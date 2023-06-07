@@ -9,6 +9,7 @@
     # };
 
     packages = with pkgs; [
+      delta
       git
       # git-branchless
       # git-filter-repo
