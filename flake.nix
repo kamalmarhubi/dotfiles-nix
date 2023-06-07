@@ -64,8 +64,8 @@
             ./dotfiles-nix.nix
             ./fish.nix
             ./fonts.nix
-            ./git.nix
             ./nvim.nix
+            ./vcs.nix
             ./wezterm.nix
           ]
           ++ extraModules;

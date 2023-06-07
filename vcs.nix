@@ -11,8 +11,10 @@
     packages = with pkgs; [
       delta
       git
-      # git-branchless
       # git-filter-repo
+      jujutsu
+      git-branchless
+      sapling
     ];
   };
 
