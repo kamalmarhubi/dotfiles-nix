@@ -2,6 +2,7 @@
   programs.fish.enable = true;
 
   home.packages = with pkgs; [
+    _1password
     atool
     entr
     fd
