@@ -18,6 +18,7 @@
     go
     k9s
     (wrapHelm kubernetes-helm {plugins = [kubernetes-helmPlugins.helm-diff];})
+    kustomize
     ninja
     pgcli
     pgformatter
