@@ -68,6 +68,11 @@
 	}; \
 	f"
 
+# Include system file; if not present git helpfully ignores it.
+# Do this at the end to allow overriding defaults above.
+[include]
+	path = config.system
+
 # Include local file; if not present git helpfully ignores it.
 # Do this at the end to allow overriding defaults above.
 [include]
