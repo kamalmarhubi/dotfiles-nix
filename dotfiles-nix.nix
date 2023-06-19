@@ -4,7 +4,7 @@
   lib,
   ...
 }: let
-  targetDir = "${config.xdg.dataHome}/dotfiles-nix";
+  targetDir = "${config.xdg.configHome}/home-manager";
   repoUrl = "https://github.com/kamalmarhubi/dotfiles-nix.git";
   checkGitRepoOriginIfPresent = pkgs.writeShellApplication {
     name = "check-git-repo-origin-if-present";
@@ -21,7 +21,7 @@
       test ! -e "$target_dir" && $VERBOSE_ECHO "$target_dir does not exist" && exit 0
 
       $VERBOSE_ECHO "Checking if $target_dir is a directory"
-      test -d "$target_dir" || die "$target_dir exists but is not a directory"
+      test -d "$target_dir" -a ! -L "$target_dir" || die "$target_dir exists but is not a directory"
       $VERBOSE_ECHO "$target_dir is a directory"
 
       $VERBOSE_ECHO "Checking if $target_dir is a git repo"
@@ -54,12 +54,12 @@ in {
     checkGitRepoOriginIfPresent = lib.hm.dag.entryBefore ["writeBoundary"] ''
       ${checkGitRepoOriginIfPresent}/bin/check-git-repo-origin-if-present
     '';
-    cloneGitRepoIfNeeded = lib.hm.dag.entryAfter ["writeBoundary"] ''
+    zzzcloneGitRepoIfNeeded = lib.hm.dag.entryAfter ["writeBoundary"] ''
       ${cloneGitRepoIfNeeded}/bin/clone-git-repo-if-needed
     '';
   };
   xdg.configFile."nix/nix.conf".text = ''
     experimental-features = nix-command flakes
   '';
-  xdg.configFile."home-manager".source = config.lib.file.mkOutOfStoreSymlink targetDir;
+  # xdg.configFile."home-manager".source = config.lib.file.mkOutOfStoreSymlink targetDir;
 }
