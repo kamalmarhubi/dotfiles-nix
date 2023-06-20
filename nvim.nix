@@ -16,5 +16,5 @@
       tree-sitter
     ];
   };
-  xdg.configFile."nvim".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.dataHome}/dotfiles-nix/files/nvim";
+  xdg.configFile."nvim".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/nvim";
 }
