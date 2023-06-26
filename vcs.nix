@@ -1,6 +1,8 @@
 {
   config,
   pkgs,
+  inputs,
+  system,
   ...
 }: {
   home = {
@@ -12,7 +14,7 @@
       delta
       git
       # git-filter-repo
-      jujutsu
+      inputs.jj.outputs.packages.${system}.jujutsu
       git-branchless
       sapling
     ];
