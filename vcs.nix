@@ -24,11 +24,13 @@
   xdg.configFile."git/config.mine".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/git/config.mine";
   xdg.configFile."git/config.system".text = let
     credentialHelper =
-      if pkgs.stdenv.isLinux then "libsecret"
-      else if pkgs.stdenv.isDarwin then "osxkeychain"
+      if pkgs.stdenv.isLinux
+      then "libsecret"
+      else if pkgs.stdenv.isDarwin
+      then "osxkeychain"
       else "";
   in ''
-  [credential]
-  	helper = ${credentialHelper}
+    [credential]
+    	helper = ${credentialHelper}
   '';
 }
