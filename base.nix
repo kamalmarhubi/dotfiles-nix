@@ -7,6 +7,7 @@
     entr
     fd
     graphicsmagick
+    magic-wormhole
     mtr
     nushell
     poetry
