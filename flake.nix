@@ -7,7 +7,6 @@
       url = "github:nix-community/home-manager";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    flake-utils.url = "github:numtide/flake-utils";
     mkalias = {
       url = "github:reckenrode/mkalias";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -27,9 +26,14 @@
   outputs = {
     nixpkgs,
     home-manager,
-    flake-utils,
     ...
   } @ inputs: let
+    eachSystem = nixpkgs.lib.genAttrs [
+      "aarch64-darwin"
+      "aarch64-linux"
+      "x86_64-darwin"
+      "x86_64-linux"
+    ];
     homeDirectoryFor = system: username:
       if builtins.match ".*darwin" system != null
       then "/Users/${username}"
@@ -99,7 +103,7 @@
         };
       };
     }
-    // flake-utils.lib.eachDefaultSystem (system: {
-      formatter = nixpkgs.legacyPackages.${system}.alejandra;
-    });
+    // {
+      formatter = eachSystem (system: nixpkgs.legacyPackages.${system}.alejandra);
+    };
 }
