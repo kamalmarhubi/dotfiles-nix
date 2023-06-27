@@ -17,4 +17,5 @@
     ];
   };
   xdg.configFile."nvim".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/nvim";
+  xdg.configFile."lazyvim".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/lazyvim";
 }
