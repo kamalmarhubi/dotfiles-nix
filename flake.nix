@@ -22,7 +22,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     git-branchless = {
-      url = "github:arxanas/git-branchless";
+      url = "github:arxanas/git-branchless/arxanas/record";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
