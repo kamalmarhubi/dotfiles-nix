@@ -1,0 +1,7 @@
+[user]
+name = "Kamal Al Marhubi"
+email = "kamal@marhubi.com"
+
+[ui]
+default-command = "log"
+diff-editor = ["scm-diff-editor", "--dir-diff", "$left", "$right"]

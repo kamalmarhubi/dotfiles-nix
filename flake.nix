@@ -21,6 +21,10 @@
       url = "github:martinvonz/jj";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    git-branchless = {
+      url = "github:arxanas/git-branchless";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs = {
