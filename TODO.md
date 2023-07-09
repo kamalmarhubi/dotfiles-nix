@@ -6,6 +6,22 @@ Look at: https://trello.com/b/lobyPOvA/dev-tools
 
 - move work specific stuff out of main config so I can commit it
 
+## general nix system
+
+Idea: add nix-darwin to manage
+- mac app store applications
+- homebrew stuff as needed
+- variety of defaults
+- launchd agent or daemon to ensure that pam_tid.so is in /etc/pam.d/sudo
+
+Things to read about managing home-manager + nix-darwin:
+- https://github.com/kclejeune/system
+- https://xyno.space/post/nix-darwin-introduction
+
+### desired properties
+
+I like having the bootstrap command; can that be made to work with a nix-darwin managed thingy?
+
 ## neovim
 
 ## Learning from actually doing any work
