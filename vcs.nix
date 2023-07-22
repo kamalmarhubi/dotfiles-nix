@@ -11,9 +11,9 @@
     else config.xdg.configHome;
 in {
   home = {
-    # shellAliases = {
-    #   git = "git-branchless wrap --";
-    # };
+    shellAliases = {
+      git = "git-branchless wrap --";
+    };
 
     packages = with pkgs; [
       delta
