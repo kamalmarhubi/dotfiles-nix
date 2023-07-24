@@ -4,6 +4,7 @@
   home.packages = with pkgs; [
     _1password
     atool
+    cargo
     entr
     fd
     graphicsmagick
