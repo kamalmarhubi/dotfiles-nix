@@ -22,6 +22,7 @@
     magic-wormhole
     mtr
     nushell
+    pipx
     poetry
     pstree
     pv
