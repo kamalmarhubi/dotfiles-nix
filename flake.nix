@@ -22,7 +22,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     git-branchless = {
-      url = "github:arxanas/git-branchless/arxanas/record";
+      url = "github:arxanas/git-branchless";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     # TODO: Replace with jvsn/dig-pretty afther this PR merges:
