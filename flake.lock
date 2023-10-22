@@ -1,22 +1,5 @@
 {
   "nodes": {
-    "dig-pretty": {
-      "flake": false,
-      "locked": {
-        "lastModified": 1690778843,
-        "narHash": "sha256-qiWenmCYOPTVxVVx6omKbs4oXZW1uv1t7Y++fD26aCc=",
-        "owner": "kamalmarhubi",
-        "repo": "dig-pretty",
-        "rev": "9ca308d82c91ecffe0f3de002901e2ca62c65314",
-        "type": "github"
-      },
-      "original": {
-        "owner": "kamalmarhubi",
-        "ref": "push-kwolwwmonnql",
-        "repo": "dig-pretty",
-        "type": "github"
-      }
-    },
     "flake-compat": {
       "flake": false,
       "locked": {
@@ -212,7 +195,6 @@
     },
     "root": {
       "inputs": {
-        "dig-pretty": "dig-pretty",
         "git-branchless": "git-branchless",
         "home-manager": "home-manager",
         "jj": "jj",

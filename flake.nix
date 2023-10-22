@@ -25,12 +25,6 @@
       url = "github:arxanas/git-branchless";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    # TODO: Replace with jvsn/dig-pretty afther this PR merges:
-    #   https://github.com/jvns/dig-pretty/pull/2
-    dig-pretty = {
-      url = "github:kamalmarhubi/dig-pretty/push-kwolwwmonnql";
-      flake = false;
-    };
   };
 
   outputs = {
