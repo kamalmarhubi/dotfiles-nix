@@ -22,6 +22,7 @@
     pv
     ripgrep
     tree
+    trippy
     wget
   ];
 
