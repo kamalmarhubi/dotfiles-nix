@@ -12,6 +12,7 @@
     entr
     fd
     graphicsmagick
+    jdk17
     magic-wormhole
     mtr
     nushell
