@@ -3,11 +3,12 @@
 	name = Kamal Al Marhubi
 [init]
 	defaultBranch = main
+[merge]
+	conflictStyle = zdiff3
 [pull]
 	ff = only
 [push]
 	default = current
-
 [delta]
 	navigate = true
 	light = true
