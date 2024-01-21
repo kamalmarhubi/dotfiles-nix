@@ -27,6 +27,8 @@
     wget
   ];
 
+  xdg.enable = true;
+
   # For whatever reason, the installer didn't put this somewhere that
   # fish would see. Since the nix-daemon.fish file guards against
   # double-sourcing, there's no harm including this in all systems.
