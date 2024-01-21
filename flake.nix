@@ -28,20 +28,23 @@
     home-manager,
     ...
   } @ inputs: let
-    eachSystem = nixpkgs.lib.genAttrs [
+    systems = [
       "aarch64-darwin"
       "aarch64-linux"
       "x86_64-darwin"
       "x86_64-linux"
     ];
-    homeDirectoryFor = system: username:
-      if builtins.match ".*darwin" system != null
-      then "/Users/${username}"
-      else "/home/${username}";
-    homeFor = {
+    eachSystem = nixpkgs.lib.genAttrs systems;
+    isDarwin = system: builtins.elem system inputs.nixpkgs.lib.platforms.darwin;
+    homePrefix = system:
+      if isDarwin system
+      then "/Users"
+      else "/home";
+
+    mkHomeConfig = {
       username ? "kamal",
       system,
-      homeDirectory ? homeDirectoryFor system username,
+      homeDirectory ? "${homePrefix system}/${username}",
       extraModules ? [],
       ...
     }: let
@@ -80,24 +83,24 @@
       };
   in
     {
-      # For bootstrapping systems that aren't aleady in the homeConfigurations output.
-      inherit homeFor;
+      inherit mkHomeConfig;
       homeConfigurations = {
+        # For bootstrapping systems that aren't aleady in the homeConfigurations output.
         # NB This reads env vars and so requires --impure.
-        "bootstrap" = homeFor {
+        "bootstrap" = mkHomeConfig {
           system = builtins.currentSystem;
           username = builtins.getEnv "USER";
           homeDirectory = builtins.getEnv "HOME";
         };
 
-        "kamal@kx7" = homeFor {
+        "kamal@kx7" = mkHomeConfig {
           system = "x86_64-linux";
         };
-        "kamal@mimolette" = homeFor {
+        "kamal@mimolette" = mkHomeConfig {
           system = "aarch64-darwin";
           extraModules = [./personal.nix];
         };
-        "kamal@kamal-FL932PQ21V" = homeFor {
+        "kamal@kamal-FL932PQ21V" = mkHomeConfig {
           system = "aarch64-darwin";
           extraModules = [./wave.nix];
         };
