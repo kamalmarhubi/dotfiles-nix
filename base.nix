@@ -21,6 +21,7 @@
     pstree
     pv
     ripgrep
+    shellcheck
     tree
     trippy
     wget
