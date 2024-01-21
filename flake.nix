@@ -7,10 +7,6 @@
       url = "github:nix-community/home-manager";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    mkalias = {
-      url = "github:reckenrode/mkalias";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
     neovim = {
       # Switch this to use upstream neovim flake after 0.9.0 is released?
       # url = "github:neovim/neovim?dir=contrib";
