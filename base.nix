@@ -27,6 +27,10 @@
     wget
   ];
 
+  nixpkgs.allowUnfreePackages = [
+    "1password-cli"
+  ];
+
   xdg.enable = true;
 
   # For whatever reason, the installer didn't put this somewhere that

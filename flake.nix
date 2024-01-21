@@ -55,8 +55,6 @@
         modules =
           [
             {
-              # Workaround for https://github.com/nix-community/home-manager/issues/2942
-              nixpkgs.config.allowUnfreePredicate = _: true;
               nix.registry.nixpkgs.flake = nixpkgs;
               programs = {
                 home-manager.enable = true;
@@ -67,6 +65,7 @@
                 stateVersion = "22.11";
               };
             }
+            ./unfree.nix
             ./base.nix
             ./darwin.nix
             ./dotfiles-nix.nix
