@@ -57,6 +57,7 @@
         extraSpecialArgs = {inherit inputs system;};
         modules =
           [
+            ./modules/home-manager
             {
               nix.registry.nixpkgs.flake = nixpkgs;
               programs = {
@@ -68,16 +69,6 @@
                 stateVersion = "22.11";
               };
             }
-            ./unfree.nix
-            ./base.nix
-            ./darwin.nix
-            ./dotfiles-nix.nix
-            ./emacs.nix
-            ./fish.nix
-            ./fonts.nix
-            ./nvim.nix
-            ./vcs.nix
-            ./wezterm.nix
           ]
           ++ extraModules;
       };
@@ -98,11 +89,11 @@
         };
         "kamal@mimolette" = mkHomeConfig {
           system = "aarch64-darwin";
-          extraModules = [./personal.nix];
+          extraModules = [./modules/home-manager/personal.nix];
         };
         "kamal@kamal-FL932PQ21V" = mkHomeConfig {
           system = "aarch64-darwin";
-          extraModules = [./wave.nix];
+          extraModules = [./modules/home-manager/wave.nix];
         };
       };
     }
