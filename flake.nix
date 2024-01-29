@@ -7,6 +7,10 @@
       url = "github:nix-community/home-manager";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    nix-darwin = {
+      url = "github:LnL7/nix-darwin";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     neovim = {
       # Switch this to use upstream neovim flake after 0.9.0 is released?
       # url = "github:neovim/neovim?dir=contrib";
@@ -26,6 +30,7 @@
   outputs = {
     nixpkgs,
     home-manager,
+    nix-darwin,
     ...
   } @ inputs: let
     systems = [
@@ -40,6 +45,21 @@
       if isDarwin system
       then "/Users"
       else "/home";
+
+    mkDarwinConfig = {
+      system ? "aarch64-darwin",
+      extraModules ? [],
+    }:
+      nix-darwin.lib.darwinSystem {
+        inherit system;
+        modules =
+          [
+            home-manager.darwinModules.home-manager
+            ./modules/darwin
+          ]
+          ++ extraModules;
+        specialArgs = {inherit inputs system;};
+      };
 
     mkHomeConfig = {
       username ? "kamal",
@@ -73,7 +93,11 @@
       };
   in
     {
-      inherit mkHomeConfig;
+      darwinConfigurations = {
+        "kamal-FL932PQ21V" = mkDarwinConfig {
+          system = "aarch64-darwin";
+        };
+      };
       homeConfigurations = {
         # For bootstrapping systems that aren't aleady in the homeConfigurations output.
         # NB This reads env vars and so requires --impure.
