@@ -6,6 +6,7 @@
   imports = [../home-manager/unfree.nix];
   nixpkgs.config.allowUnfree = true;
   services.nix-daemon.enable = true;
+  services.karabiner-elements.enable = true;
   nix.settings.experimental-features = "nix-command flakes";
   programs.fish.enable = true;
   users.users.kamal.home = "/Users/kamal";
