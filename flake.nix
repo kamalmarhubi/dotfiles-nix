@@ -56,6 +56,9 @@
           [
             home-manager.darwinModules.home-manager
             ./modules/darwin
+            {
+              nix.registry.nixpkgs.flake = nixpkgs;
+            }
           ]
           ++ extraModules;
         specialArgs = {inherit inputs system;};
