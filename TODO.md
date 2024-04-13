@@ -22,6 +22,16 @@ Things to read about managing home-manager + nix-darwin:
 
 I like having the bootstrap command; can that be made to work with a nix-darwin managed thingy?
 
+#### 2024-02-04
+looks like answer to this is "yes" but with a bit of care. some sources I've looked at:
+- https://www.reddit.com/r/NixOS/comments/jznwne/effectively_combining_homemanager_and_nixdarwin/
+  - https://github.com/kclejeune/system
+
+
+Some frustrations: it would be ideal to set [useUserPackages] to true, however it breaks my path.
+
+[useUserPackages]: https://nix-community.github.io/home-manager/nix-darwin-options.xhtml#nix-darwin-opt-home-manager.useUserPackages
+
 ## neovim
 
 ## Learning from actually doing any work
