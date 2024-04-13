@@ -2,6 +2,7 @@
   imports = [
     ./unfree.nix
     ./base.nix
+    ./emacs.nix
     ./darwin.nix
     ./dotfiles-nix.nix
     ./emacs.nix
