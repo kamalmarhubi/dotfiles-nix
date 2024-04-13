@@ -18,6 +18,7 @@ in {
     packages = with pkgs; [
       delta
       git
+      git-lfs
       # git-filter-repo
       inputs.jj.outputs.packages.${system}.jujutsu
       inputs.git-branchless.outputs.packages.${system}.git-branchless

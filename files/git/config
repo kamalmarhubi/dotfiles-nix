@@ -82,3 +82,8 @@
 # Override email address as kamal@marhubi.com for my github repos.
 [includeIf "hasconfig:remote.*.url:https://github.com/kamalmarhubi/**"]
 	path = config.mine
+[filter "lfs"]
+	clean = git-lfs clean -- %f
+	smudge = git-lfs smudge -- %f
+	process = git-lfs filter-process
+	required = true
