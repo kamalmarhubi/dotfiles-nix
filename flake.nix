@@ -100,6 +100,10 @@
         "kamal-FL932PQ21V" = mkDarwinConfig {
           system = "aarch64-darwin";
         };
+        # Huh? Logging in to the kamal-personal account seems to change the hostname?
+        "kamal-personal-FL932PQ21V" = mkDarwinConfig {
+          system = "aarch64-darwin";
+        };
       };
       homeConfigurations = {
         # For bootstrapping systems that aren't aleady in the homeConfigurations output.
@@ -118,6 +122,11 @@
           extraModules = [./modules/home-manager/personal.nix];
         };
         "kamal@kamal-FL932PQ21V" = mkHomeConfig {
+          system = "aarch64-darwin";
+          extraModules = [./modules/home-manager/wave.nix];
+        };
+        # Huh? Logging in to the kamal-personal account seems to change the hostname?
+        "kamal@kamal-personal-FL932PQ21V" = mkHomeConfig {
           system = "aarch64-darwin";
           extraModules = [./modules/home-manager/wave.nix];
         };
