@@ -104,6 +104,9 @@
         "kamal-personal-FL932PQ21V" = mkDarwinConfig {
           system = "aarch64-darwin";
         };
+        "mimolette" = mkDarwinConfig {
+          system = "aarch64-darwin";
+        };
       };
       homeConfigurations = {
         # For bootstrapping systems that aren't aleady in the homeConfigurations output.
