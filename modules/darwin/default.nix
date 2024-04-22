@@ -17,5 +17,8 @@
   home-manager.useGlobalPkgs = true;
   # home-manager.useUserPackages = true;
   home-manager.users.kamal = import ../home-manager;
-  home-manager.extraSpecialArgs = {inherit inputs system;};
+  home-manager.extraSpecialArgs = {
+    inherit inputs system;
+    dotFilesNixHomeManagerInstallationType = "nix-darwin";
+  };
 }

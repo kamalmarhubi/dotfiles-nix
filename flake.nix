@@ -77,7 +77,10 @@
         inherit pkgs;
 
         # Make inputs and system available to all modules.
-        extraSpecialArgs = {inherit inputs system;};
+        extraSpecialArgs = {
+          inherit inputs system;
+          dotFilesNixHomeManagerInstallationType = "standalone";
+        };
         modules =
           [
             ./modules/home-manager
@@ -97,6 +100,10 @@
   in
     {
       darwinConfigurations = {
+        "bootstrap" = mkDarwinConfig {
+          system = builtins.currentSystem;
+        };
+
         "kamal-FL932PQ21V" = mkDarwinConfig {
           system = "aarch64-darwin";
         };

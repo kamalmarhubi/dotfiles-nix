@@ -2,9 +2,14 @@
   config,
   pkgs,
   lib,
+  dotFilesNixHomeManagerInstallationType,
   ...
 }: let
-  targetDir = "${config.xdg.configHome}/home-manager";
+  targetDirName =
+    if dotFilesNixHomeManagerInstallationType == "standalone"
+    then "home-manager"
+    else "dotfiles-nix";
+  targetDir = "${config.xdg.configHome}/${targetDirName}";
   repoUrl = "https://github.com/kamalmarhubi/dotfiles-nix.git";
   checkGitRepoOriginIfPresent = pkgs.writeShellApplication {
     name = "check-git-repo-origin-if-present";
@@ -61,5 +66,4 @@ in {
   xdg.configFile."nix/nix.conf".text = ''
     experimental-features = nix-command flakes
   '';
-  # xdg.configFile."home-manager".source = config.lib.file.mkOutOfStoreSymlink targetDir;
 }
