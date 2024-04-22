@@ -1,6 +1,10 @@
 [user]
 	email = kamal@marhubi.com
 	name = Kamal Al Marhubi
+[core]
+	pager = delta --side-by-side
+[interactive]
+	diffFilter = delta --color-only
 [init]
 	defaultBranch = main
 [merge]
