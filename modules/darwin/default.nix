@@ -4,7 +4,6 @@
   ...
 }: {
   imports = [
-    ../home-manager/unfree.nix
     ./sudo.nix
   ];
   nixpkgs.config.allowUnfree = true;

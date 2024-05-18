@@ -1,6 +1,6 @@
 {...}: {
   imports = [
-    ./unfree.nix
+    ../unfree.nix
     ./base.nix
     ./darwin.nix
     ./dotfiles-nix.nix
