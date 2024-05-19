@@ -47,6 +47,10 @@
       then "/Users"
       else "/home";
 
+    registryConfig = {
+      nix.registry.nixpkgs.flake = inputs.nixpkgs;
+      nix.registry.unstable.flake = inputs.unstable;
+    };
     mkDarwinConfig = {
       system ? "aarch64-darwin",
       extraModules ? [],
@@ -56,10 +60,8 @@
         modules =
           [
             home-manager.darwinModules.home-manager
+            registryConfig
             ./modules/darwin
-            {
-              nix.registry.nixpkgs.flake = nixpkgs;
-            }
           ]
           ++ extraModules;
         specialArgs = {inherit inputs system;};
@@ -85,12 +87,9 @@
         modules =
           [
             ./modules/home-manager
+            registryConfig
             {
-              nix.registry.nixpkgs.flake = nixpkgs;
-              programs = {
-                home-manager.enable = true;
-              };
-
+              programs.home-manager.enable = true;
               home = {
                 inherit username homeDirectory;
               };
