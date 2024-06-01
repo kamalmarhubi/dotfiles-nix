@@ -17,6 +17,27 @@ with lib; {
       dockutil
       gawk
     ];
+    launchd.agents.setPath = let
+      setPath = pkgs.writeShellApplication {
+        name = "set-path";
+        text = ''
+          path_from_system="$(unset PATH; eval "$(/usr/libexec/path_helper -s)"; echo "$PATH")"
+          uid="$(id -u)"
+
+          /bin/launchctl setenv PATH "${config.home.homeDirectory}/.nix-profile/bin:/etc/profiles/per-user/${config.home.username}/bin:/run/current-system/sw/bin:$path_from_system"
+
+          /bin/launchctl kickstart -k "gui/$uid/com.apple.Finder"
+          /bin/launchctl kickstart -k "gui/$uid/com.apple.Spotlight"
+          /bin/launchctl kickstart -k "gui/$uid/com.apple.Dock.agent"
+        '';
+      };
+    in {
+      enable = true;
+      config = {
+        Program = "${setPath}/bin/set-path";
+        RunAtLoad = true;
+      };
+    };
     home.activation.trampolineApps = let
       apps = pkgs.buildEnv {
         name = "home-manager-applications";
