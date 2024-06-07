@@ -9,8 +9,10 @@ in {
   home.packages = with pkgs; [
     argocd
     asdf-vm
+    circleci-cli
     cmake
     cmctl
+    crane
     colima
     colordiff
     git-lfs
