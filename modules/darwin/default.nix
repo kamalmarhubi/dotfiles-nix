@@ -2,6 +2,7 @@
   inputs,
   system,
   pkgs,
+  extraHomeModules ? [],
   ...
 }: {
   imports = [
@@ -11,7 +12,7 @@
   services.nix-daemon.enable = true;
   services.karabiner-elements.enable = true;
   nix.settings.experimental-features = "nix-command flakes";
-  environment.shells = [ pkgs.fish ];
+  environment.shells = [pkgs.fish];
   programs.fish.enable = true;
   users.users.kamal.home = "/Users/kamal";
   users.users.kamal.name = "kamal";
@@ -21,7 +22,7 @@
   '';
   home-manager.useGlobalPkgs = true;
   home-manager.useUserPackages = true;
-  home-manager.users.kamal = import ../home-manager;
+  home-manager.users.kamal = import ../home-manager {extraModules = extraHomeModules;};
   home-manager.extraSpecialArgs = {
     inherit inputs system;
     dotFilesNixHomeManagerInstallationType = "nix-darwin";

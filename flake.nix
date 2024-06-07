@@ -54,6 +54,7 @@
     mkDarwinConfig = {
       system ? "aarch64-darwin",
       extraModules ? [],
+      extraHomeModules ? [],
     }:
       nix-darwin.lib.darwinSystem {
         inherit system;
@@ -64,7 +65,7 @@
             ./modules/darwin
           ]
           ++ extraModules;
-        specialArgs = {inherit inputs system;};
+        specialArgs = {inherit inputs system extraHomeModules;};
       };
 
     mkHomeConfig = {
@@ -106,10 +107,12 @@
 
         "kamal-FL932PQ21V" = mkDarwinConfig {
           system = "aarch64-darwin";
+          extraHomeModules = [./modules/home-manager/wave.nix];
         };
         # Huh? Logging in to the kamal-personal account seems to change the hostname?
         "kamal-personal-FL932PQ21V" = mkDarwinConfig {
           system = "aarch64-darwin";
+          extraHomeModules = [./modules/home-manager/wave.nix];
         };
         "mimolette" = mkDarwinConfig {
           system = "aarch64-darwin";
