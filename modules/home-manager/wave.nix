@@ -6,10 +6,6 @@
 }: let
   terraformPluginCache = "${config.xdg.cacheHome}/terraform/plugin-cache";
 in {
-  programs.fish.shellInit = ''
-    source $HOME/.nix-profile/share/asdf-vm/asdf.fish
-  '';
-
   home.packages = with pkgs; [
     argocd
     asdf-vm
