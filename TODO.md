@@ -13,6 +13,7 @@ Idea: add nix-darwin to manage
 - homebrew stuff as needed
 - variety of defaults
 - launchd agent or daemon to ensure that pam_tid.so is in /etc/pam.d/sudo
+  Note: this would be made unnecessary by https://github.com/LnL7/nix-darwin/pull/787
 
 Things to read about managing home-manager + nix-darwin:
 - https://github.com/kclejeune/system
@@ -31,6 +32,12 @@ looks like answer to this is "yes" but with a bit of care. some sources I've loo
 Some frustrations: it would be ideal to set [useUserPackages] to true, however it breaks my path.
 
 [useUserPackages]: https://nix-community.github.io/home-manager/nix-darwin-options.xhtml#nix-darwin-opt-home-manager.useUserPackages
+
+Idea to fix this: create a launchd thing that calls launchctl setenv to ensure path is at the front
+needs: path_helper
+also needed to make emacs work?
+
+ I did this?
 
 ## neovim
 
