@@ -19,10 +19,9 @@ in {
       delta
       git
       git-lfs
+      git-branchless
+      jujutsu
       # git-filter-repo
-      inputs.jj.outputs.packages.${system}.jujutsu
-      inputs.git-branchless.outputs.packages.${system}.git-branchless
-      inputs.git-branchless.outputs.packages.${system}.scm-diff-editor
       lazygit
       sapling
     ];
