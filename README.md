@@ -10,7 +10,7 @@ nix-darwin module (together with additional system config).
 
 To bootstrap a standalone home-manager setup, [install nix] and run:
 
-    nix run github:nix-community/home-manager/release-23.11 -- \
+    nix run github:nix-community/home-manager/release-24.05 -- \
       switch --impure --flake github:kamalmarhubi/dotfiles-nix#bootstrap
 
 optionally with `--dry-run` or `--verbose` as well.
