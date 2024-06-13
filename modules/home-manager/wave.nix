@@ -2,6 +2,8 @@
   config,
   pkgs,
   lib,
+  inputs,
+  system,
   ...
 }: let
   terraformPluginCache = "${config.xdg.cacheHome}/terraform/plugin-cache";
@@ -24,6 +26,15 @@ in {
     pgcli
     pgformatter
     steampipe
+    # Current vagrant doesn't build because of a build failure in grpc that may
+    # be related to https://github.com/grpc/grpc/issues/35148
+    #
+    # Could probably try to fix it by setting
+    #   BUNDLE_BUILD__GRPC=--with-cflags=-Wno-error=incompatible-function-pointer-types
+    # in the environment?
+    #
+    # (At least chatgpt thinks so...)
+    inputs.nixpkgs-2305.legacyPackages.${system}.vagrant
     yaml2json
   ];
 
