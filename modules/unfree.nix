@@ -1,5 +1,6 @@
-# Copied from
+# Modified from
 #   https://github.com/NixOS/nixpkgs/issues/197325#issuecomment-1579420085
+# to allow passing a package instead of its name.
 {
   lib,
   config,
@@ -7,13 +8,14 @@
 }: {
   options = with lib; {
     nixpkgs.allowUnfreePackages = mkOption {
-      type = with types; listOf str;
+      type = types.listOf types.package;
       default = [];
-      example = ["steam" "steam-original"];
     };
   };
 
-  config = {
-    nixpkgs.config.allowUnfreePredicate = pkg: builtins.elem (lib.getName pkg) config.nixpkgs.allowUnfreePackages;
+  config = let
+    allowed = lib.map lib.getName config.allowUnfreePackages;
+  in {
+    nixpkgs.config.allowUnfreePredicate = pkg: builtins.elem (lib.getName pkg) allowed;
   };
 }

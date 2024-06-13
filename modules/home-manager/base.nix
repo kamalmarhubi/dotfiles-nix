@@ -27,8 +27,8 @@
     wget
   ];
 
-  nixpkgs.allowUnfreePackages = [
-    "1password-cli"
+  nixpkgs.allowUnfreePackages = with pkgs; [
+    _1password
   ];
 
   xdg.enable = true;
