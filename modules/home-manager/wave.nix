@@ -14,9 +14,9 @@ in {
     circleci-cli
     cmake
     cmctl
-    crane
     colima
     colordiff
+    crane
     git-lfs
     go
     k9s
