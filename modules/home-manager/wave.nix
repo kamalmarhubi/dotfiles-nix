@@ -9,6 +9,7 @@
   terraformPluginCache = "${config.xdg.cacheHome}/terraform/plugin-cache";
 in {
   home.packages = with pkgs; [
+    ansible
     argocd
     asdf-vm
     circleci-cli
