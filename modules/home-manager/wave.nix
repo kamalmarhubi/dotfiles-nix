@@ -28,6 +28,7 @@ in {
     pgcli
     pgformatter
     steampipe
+    sshpass
     # Current vagrant doesn't build because of a build failure in grpc that may
     # be related to https://github.com/grpc/grpc/issues/35148
     #
