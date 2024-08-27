@@ -24,7 +24,12 @@ in {
     pgcli
     pgformatter
     steampipe
+    vault
     yaml2json
+  ];
+
+  nixpkgs.allowUnfreePackages = with pkgs; [
+    vault
   ];
 
   xdg.configFile."git/config.local".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/git/config.wave";
