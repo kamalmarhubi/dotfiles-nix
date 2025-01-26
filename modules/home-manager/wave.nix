@@ -9,6 +9,7 @@ in {
   home.packages = with pkgs; [
     argocd
     asdf-vm
+    awscli2
     circleci-cli
     cmake
     cmctl
