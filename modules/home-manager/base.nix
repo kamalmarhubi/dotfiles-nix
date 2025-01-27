@@ -6,7 +6,7 @@
   programs.fish.enable = true;
 
   home.packages = with pkgs; [
-    _1password
+    _1password-cli
     atool
     cargo
     entr
@@ -28,7 +28,7 @@
   ];
 
   nixpkgs.allowUnfreePackages = with pkgs; [
-    _1password
+    _1password-cli
   ];
 
   xdg.enable = true;

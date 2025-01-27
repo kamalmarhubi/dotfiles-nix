@@ -9,7 +9,7 @@
   system.activationScripts.preActivation.text = let
     sudoersTmp = "/etc/sudoers.d/99-timestamp_timeout_tmp";
   in ''
-    sudo cat > ${sudoersTmp} <<EOF
+    sudo tee ${sudoersTmp} <<EOF
     Defaults        timestamp_timeout=-1  # Indefinite
     EOF
     sudo --validate

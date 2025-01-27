@@ -2,21 +2,23 @@
   description = "Kamal pretends to use nix?";
 
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-24.05-darwin";
+    nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-24.11-darwin";
     unstable.url = "github:nixos/nixpkgs/nixpkgs-unstable";
     home-manager = {
-      url = "github:nix-community/home-manager/release-24.05";
+      url = "github:nix-community/home-manager/release-24.11";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     nix-darwin = {
-      url = "github:LnL7/nix-darwin";
+      url = "github:LnL7/nix-darwin/nix-darwin-24.11";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Hack because I just need neovim to work.
+    nixpkgs-for-neovim.url = "github:nixos/nixpkgs/nixpkgs-24.05-darwin";
     neovim = {
       # Switch this to use upstream neovim flake after 0.9.0 is released?
       # url = "github:neovim/neovim?dir=contrib";
-      url = "github:nix-community/neovim-nightly-overlay";
-      inputs.nixpkgs.follows = "nixpkgs";
+      url = "github:nix-community/neovim-nightly-overlay/ef968b8411938ee11ed8a3a5c5b46cba4bdbe142";
+      inputs.nixpkgs.follows = "nixpkgs-for-neovim";
     };
   };
 
