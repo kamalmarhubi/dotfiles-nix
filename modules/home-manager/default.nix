@@ -9,8 +9,8 @@
       ./fish.nix
       ./fonts.nix
       ./nvim.nix
+      ./terminal.nix
       ./vcs.nix
-      ./wezterm.nix
     ]
     ++ extraModules;
   home.stateVersion = "22.11";

@@ -1,0 +1,3 @@
+theme = tokyonight-day
+font-family = "Iosevka Fixed Slab"
+copy-on-select = clipboard
