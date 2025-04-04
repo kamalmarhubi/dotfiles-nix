@@ -6,6 +6,7 @@
   programs.fish.enable = true;
 
   home.packages = with pkgs; [
+    nur.repos.gigamonster256.ghostty-darwin
     _1password-cli
     atool
     cargo
