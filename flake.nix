@@ -4,6 +4,10 @@
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-24.11-darwin";
     unstable.url = "github:nixos/nixpkgs/nixpkgs-unstable";
+    nur = {
+      url = "github:nix-community/NUR";
+      inputs.nixpkgs.follows = "unstable";
+    };
     home-manager = {
       url = "github:nix-community/home-manager/release-24.11";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -26,6 +30,7 @@
     nixpkgs,
     home-manager,
     nix-darwin,
+    nur,
     ...
   } @ inputs: let
     systems = [
@@ -54,6 +59,7 @@
         inherit system;
         modules =
           [
+            nur.modules.darwin.default
             home-manager.darwinModules.home-manager
             registryConfig
             ./modules/darwin
@@ -81,6 +87,7 @@
         };
         modules =
           [
+            nur.modules.homeManager.default
             ./modules/home-manager
             registryConfig
             {
