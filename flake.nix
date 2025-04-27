@@ -28,11 +28,20 @@
 
   outputs = {
     nixpkgs,
+    unstable,
     home-manager,
     nix-darwin,
     nur,
     ...
   } @ inputs: let
+    unstableOverlayModule = {
+        nixpkgs.overlays = [(final: prev: {
+       unstable = import unstable {
+         system = prev.system;
+         config = prev.config;
+       };
+     }
+     )];};
     systems = [
       "aarch64-darwin"
       "aarch64-linux"
@@ -59,6 +68,7 @@
         inherit system;
         modules =
           [
+            unstableOverlayModule
             nur.modules.darwin.default
             home-manager.darwinModules.home-manager
             registryConfig
@@ -87,6 +97,7 @@
         };
         modules =
           [
+            unstableOverlayModule
             nur.modules.homeManager.default
             ./modules/home-manager
             registryConfig

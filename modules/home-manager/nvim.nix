@@ -12,7 +12,7 @@
 
     packages = with pkgs; [
       inputs.neovim.packages.${system}.default
-      nodejs
+      unstable.nodejs
       tree-sitter
     ];
   };
