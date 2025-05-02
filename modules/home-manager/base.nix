@@ -10,6 +10,7 @@
     cargo
     entr
     fd
+    ffmpeg
     graphicsmagick
     jdk17
     magic-wormhole
