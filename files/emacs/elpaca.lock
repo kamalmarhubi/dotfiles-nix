@@ -1,0 +1,25 @@
+((compat :source #2="elpaca-menu-lock-file" :recipe
+	 (:package #1="compat" :repo
+		   ("https://github.com/emacs-compat/compat" . #1#)
+		   :files
+		   ("*"
+		    (:exclude ".git"))
+		   :source "GNU ELPA" :protocol https :inherit t :depth treeless :ref "7179960b7c82a7cca6bac60d79dd7fe09ae390a0"))
+ (no-littering :source #2# :recipe
+	       (:package "no-littering" :fetcher github :repo "emacscollective/no-littering" :files
+			 ("*.el" "*.el.in" "dir" "*.info" "*.texi" "*.texinfo" "doc/dir" "doc/*.info" "doc/*.texi" "doc/*.texinfo" "lisp/*.el" "docs/dir" "docs/*.info" "docs/*.texi" "docs/*.texinfo"
+			  (:exclude ".dir-locals.el" "test.el" "tests.el" "*-test.el" "*-tests.el" "LICENSE" "README*" "*-pkg.el"))
+			 :source "MELPA" :protocol https :inherit t :depth treeless :wait t :ref "5596cc6586b3d1ce77d7c9e5385a0809fbad4eb6"))
+ (elpaca-use-package :source #2# :recipe
+		     (:package "elpaca-use-package" :wait t :repo "https://github.com/progfolio/elpaca.git" :files
+			       ("extensions/elpaca-use-package.el")
+			       :main "extensions/elpaca-use-package.el" :build
+			       (:not elpaca--compile-info)
+			       :source "Elpaca extensions" :protocol https :inherit t :depth treeless :ref "400eb4c897498d46f2851fa7e866c7a493749148"))
+ (elpaca :source #2# :recipe
+	 (:source nil :protocol https :inherit ignore :depth treeless :repo "https://github.com/progfolio/elpaca.git" :ref "400eb4c897498d46f2851fa7e866c7a493749148" :files
+		  (:defaults "elpaca-test.el"
+			     (:exclude "extensions"))
+		  :build
+		  (:not elpaca--activate-package)
+		  :package "elpaca")))
