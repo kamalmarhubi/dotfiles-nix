@@ -67,3 +67,10 @@
   (setq no-littering-etc-directory (expand-file-name "etc" user-emacs-directory)
         no-littering-var-directory (expand-file-name "var" k/emacs-data-directory))
   (require 'no-littering))
+
+;; Get env vars from shell when in graphical mode.
+(use-package exec-path-from-shell
+  :ensure t
+  :if (display-graphic-p)
+  :custom (exec-path-from-shell-variables '("PATH" "MANPATH"))
+  :config (exec-path-from-shell-initialize))
