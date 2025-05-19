@@ -74,3 +74,25 @@
   :if (display-graphic-p)
   :custom (exec-path-from-shell-variables '("PATH" "MANPATH"))
   :config (exec-path-from-shell-initialize))
+
+(defun k/op-read (ref)
+  (string-trim (shell-command-to-string (format "op --account=PNGVKX37O5CSHJXPCJHSSAL4OQ read '%s'" ref))))
+
+(defun k/make-op-reader (ref)
+  (let ((cache nil))
+    (lambda ()
+      (or cache
+          (setq cache (k/op-read ref))))))
+
+(use-package transient
+  :ensure t)
+
+(use-package gptel
+  :ensure t
+  :after (transient)
+  :commands (gptel gptel-send gptel-menu)
+  :custom
+  (gptel-default-mode 'org-mode)
+  (gptel-model 'claude-3-7-sonnet-20250219)
+  :config
+  (setopt gptel-backend (gptel-make-anthropic "Claude" :stream t :key (k/make-op-reader "op://Private/Anthropic/credential"))))

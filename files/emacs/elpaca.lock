@@ -23,8 +23,18 @@
 				 ("*.el" "*.el.in" "dir" "*.info" "*.texi" "*.texinfo" "doc/dir" "doc/*.info" "doc/*.texi" "doc/*.texinfo" "lisp/*.el" "docs/dir" "docs/*.info" "docs/*.texi" "docs/*.texinfo"
 				  (:exclude ".dir-locals.el" "test.el" "tests.el" "*-test.el" "*-tests.el" "LICENSE" "README*" "*-pkg.el"))
 				 :source "elpaca-menu-lock-file" :protocol https :inherit t :depth treeless :ref "4896a797252fbfdac32fb77508500ac7d220f717"))
+ (gptel :source "elpaca-menu-lock-file" :recipe
+	(:package "gptel" :repo "karthink/gptel" :fetcher github :files
+		  ("*.el" "*.el.in" "dir" "*.info" "*.texi" "*.texinfo" "doc/dir" "doc/*.info" "doc/*.texi" "doc/*.texinfo" "lisp/*.el" "docs/dir" "docs/*.info" "docs/*.texi" "docs/*.texinfo"
+		   (:exclude ".dir-locals.el" "test.el" "tests.el" "*-test.el" "*-tests.el" "LICENSE" "README*" "*-pkg.el"))
+		  :source "elpaca-menu-lock-file" :protocol https :inherit t :depth treeless :ref "fcdbe074140bf7b9c027a3478902edafe8ec76f8"))
  (no-littering :source "elpaca-menu-lock-file" :recipe
 	       (:package "no-littering" :fetcher github :repo "emacscollective/no-littering" :files
 			 ("*.el" "*.el.in" "dir" "*.info" "*.texi" "*.texinfo" "doc/dir" "doc/*.info" "doc/*.texi" "doc/*.texinfo" "lisp/*.el" "docs/dir" "docs/*.info" "docs/*.texi" "docs/*.texinfo"
 			  (:exclude ".dir-locals.el" "test.el" "tests.el" "*-test.el" "*-tests.el" "LICENSE" "README*" "*-pkg.el"))
-			 :source "elpaca-menu-lock-file" :protocol https :inherit t :depth treeless :wait t :ref "5596cc6586b3d1ce77d7c9e5385a0809fbad4eb6")))
+			 :source "elpaca-menu-lock-file" :protocol https :inherit t :depth treeless :wait t :ref "5596cc6586b3d1ce77d7c9e5385a0809fbad4eb6"))
+ (transient :source "elpaca-menu-lock-file" :recipe
+	    (:package "transient" :fetcher github :repo "magit/transient" :files
+		      ("*.el" "*.el.in" "dir" "*.info" "*.texi" "*.texinfo" "doc/dir" "doc/*.info" "doc/*.texi" "doc/*.texinfo" "lisp/*.el" "docs/dir" "docs/*.info" "docs/*.texi" "docs/*.texinfo"
+		       (:exclude ".dir-locals.el" "test.el" "tests.el" "*-test.el" "*-tests.el" "LICENSE" "README*" "*-pkg.el"))
+		      :source "elpaca-menu-lock-file" :protocol https :inherit t :depth treeless :ref "41b6e06cf56c029465fae72dc4c6e16cfd304e47")))
