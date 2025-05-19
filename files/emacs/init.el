@@ -59,6 +59,7 @@
 
 (use-package emacs
   :custom
+  (blink-cursor-mode nil)
   (inhibit-startup-screen t))
 
 (use-package no-littering
