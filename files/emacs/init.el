@@ -148,3 +148,9 @@
     (bray-state-stack-push 'insert)))
 
  (define-key k/bray-state-insert-map (kbd "<escape>") 'bray-state-stack-pop))
+
+(use-package activities
+  :ensure t
+  :init
+  (activities-mode)
+  (activities-tabs-mode))

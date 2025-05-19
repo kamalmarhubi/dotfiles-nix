@@ -1,4 +1,11 @@
-((bray :source "elpaca-menu-lock-file" :recipe
+((activities :source "elpaca-menu-lock-file" :recipe
+	     (:package "activities" :repo
+		       ("https://github.com/alphapapa/activities.el.git" . "activities")
+		       :files
+		       ("*"
+			(:exclude ".git"))
+		       :source "elpaca-menu-lock-file" :protocol https :inherit t :depth treeless :ref "d735c0f2c714ac98248ee17d765bfa8310201d53"))
+ (bray :source "elpaca-menu-lock-file" :recipe
        (:package "bray" :fetcher codeberg :repo "ideasman42/emacs-bray" :files
 		 ("*.el" "*.el.in" "dir" "*.info" "*.texi" "*.texinfo" "doc/dir" "doc/*.info" "doc/*.texi" "doc/*.texinfo" "lisp/*.el" "docs/dir" "docs/*.info" "docs/*.texi" "docs/*.texinfo"
 		  (:exclude ".dir-locals.el" "test.el" "tests.el" "*-test.el" "*-tests.el" "LICENSE" "README*" "*-pkg.el"))
@@ -38,6 +45,13 @@
 			 ("*.el" "*.el.in" "dir" "*.info" "*.texi" "*.texinfo" "doc/dir" "doc/*.info" "doc/*.texi" "doc/*.texinfo" "lisp/*.el" "docs/dir" "docs/*.info" "docs/*.texi" "docs/*.texinfo"
 			  (:exclude ".dir-locals.el" "test.el" "tests.el" "*-test.el" "*-tests.el" "LICENSE" "README*" "*-pkg.el"))
 			 :source "elpaca-menu-lock-file" :protocol https :inherit t :depth treeless :wait t :ref "5596cc6586b3d1ce77d7c9e5385a0809fbad4eb6"))
+ (persist :source "elpaca-menu-lock-file" :recipe
+	  (:package "persist" :repo
+		    ("https://github.com/emacsmirror/gnu_elpa" . "persist")
+		    :branch "externals/persist" :files
+		    ("*"
+		     (:exclude ".git"))
+		    :source "elpaca-menu-lock-file" :protocol https :inherit t :depth treeless :ref "bf9a52b8608f00a86cdf5b82207fc7bbc747566c"))
  (transient :source "elpaca-menu-lock-file" :recipe
 	    (:package "transient" :fetcher github :repo "magit/transient" :files
 		      ("*.el" "*.el.in" "dir" "*.info" "*.texi" "*.texinfo" "doc/dir" "doc/*.info" "doc/*.texi" "doc/*.texinfo" "lisp/*.el" "docs/dir" "docs/*.info" "docs/*.texi" "docs/*.texinfo"
