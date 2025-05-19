@@ -57,6 +57,10 @@
     (elpaca-write-lock-file elpaca-lock-file))
   :hook (elpaca-post-queue . k/elpaca-write-lock-file))
 
+(use-package emacs
+  :custom
+  (inhibit-startup-screen t))
+
 (use-package no-littering
   ;; :wait is required to make sure this gets required before anything else
   ;; can make a mess of things.
