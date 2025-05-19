@@ -60,7 +60,8 @@
 (use-package emacs
   :custom
   (blink-cursor-mode nil)
-  (inhibit-startup-screen t))
+  (inhibit-startup-screen t)
+  (inhibit-startup-echo-area-message (user-login-name)))
 
 (use-package no-littering
   ;; :wait is required to make sure this gets required before anything else
