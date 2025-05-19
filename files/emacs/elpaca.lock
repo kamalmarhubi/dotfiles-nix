@@ -45,6 +45,25 @@
 			 ("*.el" "*.el.in" "dir" "*.info" "*.texi" "*.texinfo" "doc/dir" "doc/*.info" "doc/*.texi" "doc/*.texinfo" "lisp/*.el" "docs/dir" "docs/*.info" "docs/*.texi" "docs/*.texinfo"
 			  (:exclude ".dir-locals.el" "test.el" "tests.el" "*-test.el" "*-tests.el" "LICENSE" "README*" "*-pkg.el"))
 			 :source "elpaca-menu-lock-file" :protocol https :inherit t :depth treeless :wait t :ref "5596cc6586b3d1ce77d7c9e5385a0809fbad4eb6"))
+ (org :source "elpaca-menu-lock-file" :recipe
+      (:package "org" :repo
+		("https://git.sr.ht/~bzg/org-mode" . "org")
+		:pre-build
+		(progn
+		  (require 'elpaca-menu-org)
+		  (setq elpaca-menu-org-make-manual t)
+		  (elpaca-menu-org--build))
+		:autoloads "org-loaddefs.el" :depth treeless :build
+		(:not elpaca--generate-autoloads-async)
+		:files
+		(:defaults
+		 ("etc/styles/" "etc/styles/*" "doc/*.texi"))
+		:source "elpaca-menu-lock-file" :protocol https :inherit t :ref "7eafc194d2c3a42b84a319847f66ec6bdfea183c"))
+ (org-modern :source "elpaca-menu-lock-file" :recipe
+	     (:package "org-modern" :repo "minad/org-modern" :fetcher github :files
+		       ("*.el" "*.el.in" "dir" "*.info" "*.texi" "*.texinfo" "doc/dir" "doc/*.info" "doc/*.texi" "doc/*.texinfo" "lisp/*.el" "docs/dir" "docs/*.info" "docs/*.texi" "docs/*.texinfo"
+			(:exclude ".dir-locals.el" "test.el" "tests.el" "*-test.el" "*-tests.el" "LICENSE" "README*" "*-pkg.el"))
+		       :source "elpaca-menu-lock-file" :protocol https :inherit t :depth treeless :ref "6d375b9dfb8b0fb9df2c342889f94dcb653437dc"))
  (persist :source "elpaca-menu-lock-file" :recipe
 	  (:package "persist" :repo
 		    ("https://github.com/emacsmirror/gnu_elpa" . "persist")

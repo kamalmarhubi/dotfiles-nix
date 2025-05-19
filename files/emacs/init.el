@@ -93,6 +93,15 @@
 (use-package transient
   :ensure t)
 
+;; Need 9.7+ for gptel's org-mode-branching-context to work.
+(use-package org
+  :ensure t)
+
+(use-package org-modern
+  :ensure t
+  :hook ((org-mode . org-modern-mode)
+         (org-agenda-finalize . org-modern-agenda)))
+
 (use-package gptel
   :ensure t
   :after (transient)
