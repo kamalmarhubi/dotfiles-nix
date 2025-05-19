@@ -96,3 +96,51 @@
   (gptel-model 'claude-3-7-sonnet-20250219)
   :config
   (setopt gptel-backend (gptel-make-anthropic "Claude" :stream t :key (k/make-op-reader "op://Private/Anthropic/credential"))))
+
+(use-package bray
+ :ensure t
+ :commands (bray-mode)
+ :hook ((after-change-major-mode . (lambda ()
+   (when (and (not (minibufferp)) (not (derived-mode-p 'special-mode)))
+     (bray-mode)))))
+ :config
+
+ ;; Typical normal/insert states.
+ (defvar k/bray-state-normal-map (make-keymap))
+ (defvar k/bray-state-insert-map (make-keymap))
+
+ (setopt bray-state-default 'normal)
+ (setopt bray-state-definitions
+       (list
+        (list
+         :id 'normal
+         :cursor-type 'hollow
+         :lighter "<N>"
+         :keymaps (list '(t . k/bray-state-normal-map)))
+
+        (list
+         :id 'insert
+         :cursor-type 'bar
+         :lighter "<I>"
+         :keymaps (list '(t . k/bray-state-insert-map))
+
+         ;; Optional.
+         :is-input t)))
+
+ ;; Optional, a quick way to mask insertion.
+ (define-key k/bray-state-normal-map [remap self-insert-command] 'ignore)
+
+ ;; HJKL & 'I' for insert mode.
+ (define-key k/bray-state-normal-map (kbd "h") 'backward-char)
+ (define-key k/bray-state-normal-map (kbd "j") 'next-line)
+ (define-key k/bray-state-normal-map (kbd "k") 'previous-line)
+ (define-key k/bray-state-normal-map (kbd "l") 'forward-char)
+
+ ;; Insert mode & escape to leave.
+ (define-key
+  k/bray-state-normal-map (kbd "i")
+  (lambda ()
+    (interactive)
+    (bray-state-stack-push 'insert)))
+
+ (define-key k/bray-state-insert-map (kbd "<escape>") 'bray-state-stack-pop))
