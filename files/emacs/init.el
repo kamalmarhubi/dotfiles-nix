@@ -61,7 +61,10 @@
   :custom
   (blink-cursor-mode nil)
   (inhibit-startup-screen t)
-  (inhibit-startup-echo-area-message (user-login-name)))
+  (inhibit-startup-echo-area-message (user-login-name))
+  :config
+  (recentf-mode 1)
+  (savehist-mode 1))
 
 (use-package no-littering
   ;; :wait is required to make sure this gets required before anything else
@@ -165,3 +168,26 @@
   :init
   (activities-mode)
   (activities-tabs-mode))
+
+(use-package vertico
+  :ensure t
+  :custom
+  (vertico-cycle t)
+  (vertico-resize nil)
+  :config
+  (vertico-mode 1))
+
+(use-package marginalia
+  :ensure t
+  :config
+  (marginalia-mode 1))
+
+(use-package orderless
+  :ensure t
+  :custom
+  (completion-styles '(orderless basic)))
+
+;; Consider adding bindings:
+;;   https://github.com/minad/consult/blob/main/README.org#use-package-example
+(use-package consult
+  :ensure t)
