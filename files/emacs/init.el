@@ -45,7 +45,7 @@
 
 ;; Install & enable elpaca's use-package support.
 (elpaca elpaca-use-package
- (elpaca-use-package-mode))
+ (elpaca-use-package-mode 1))
 
 (use-package elpaca
   :no-require t  ; elpaca is required in the installer code above.
@@ -120,7 +120,7 @@
  :commands (bray-mode)
  :hook ((after-change-major-mode . (lambda ()
    (when (and (not (minibufferp)) (not (derived-mode-p 'special-mode)))
-     (bray-mode)))))
+     (bray-mode 1)))))
  :config
 
  ;; Typical normal/insert states.
@@ -165,9 +165,9 @@
 
 (use-package activities
   :ensure t
-  :init
-  (activities-mode)
-  (activities-tabs-mode))
+  :config
+  (activities-mode 1)
+  (activities-tabs-mode 1))
 
 (use-package vertico
   :ensure t
