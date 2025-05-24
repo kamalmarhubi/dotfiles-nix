@@ -12,7 +12,7 @@
     fd
     ffmpeg
     graphicsmagick
-    jdk17
+    jdk
     magic-wormhole
     mtr
     nushell
