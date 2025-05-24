@@ -107,11 +107,21 @@
 
 (use-package gptel
   :ensure t
-  :after (transient)
+
   :commands (gptel gptel-send gptel-menu)
   :custom
   (gptel-default-mode 'org-mode)
   (gptel-model 'claude-3-7-sonnet-20250219)
+  (gptel-prompt-prefix-alist
+          '((markdown-mode . "REQ> ")
+            (org-mode . "REQ> ")
+            (text-mode . "REQ> ")))
+  (gptel-response-prefix-alist
+          '((markdown-mode . "RES> ")
+            (org-mode . "RES> ")
+            (text-mode . "RES> ")))
+
+  (gptel-org-branching-context t)
   :config
   (setopt gptel-backend (gptel-make-anthropic "Claude" :stream t :key (k/make-op-reader "op://Private/Anthropic/credential"))))
 
