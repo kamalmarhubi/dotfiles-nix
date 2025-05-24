@@ -42,6 +42,20 @@
        };
      }
      )];};
+    # mkOverlayModule = nixpkgsInput: packageNames:
+    #       { config, lib, ... }: {
+    #         nixpkgs.overlays = [
+    #           (final: prev:
+    #             let
+    #               pkgs = import nixpkgsInput { system = prev.system; };
+    #               getPackage = name: { ${name} = pkgs.${name}; };
+    #             in
+    #             if builtins.isList packageNames
+    #             then builtins.foldl' (acc: name: acc // getPackage name) {} packageNames
+    #             else getPackage packageNames
+    #           )
+    #         ];
+    #       };
     systems = [
       "aarch64-darwin"
       "aarch64-linux"
