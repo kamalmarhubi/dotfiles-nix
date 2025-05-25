@@ -1,5 +1,42 @@
 {
   "nodes": {
+    "emacs30-macport-overlay": {
+      "inputs": {
+        "emacs30-macport-pkgs": "emacs30-macport-pkgs",
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1748197396,
+        "narHash": "sha256-8ZmK89+QKqW4jZk7xd2aWOE7WT7FXuRzVuOKbROydXQ=",
+        "owner": "what-the-functor",
+        "repo": "nix-emacs30-macport-overlay",
+        "rev": "8012248478fa08e29d3f53842c38326f858b2735",
+        "type": "github"
+      },
+      "original": {
+        "owner": "what-the-functor",
+        "repo": "nix-emacs30-macport-overlay",
+        "type": "github"
+      }
+    },
+    "emacs30-macport-pkgs": {
+      "locked": {
+        "lastModified": 1743625445,
+        "narHash": "sha256-L11FaB4as3XP5yugivNw0PybBsA0Xo/4mVAUCwStxSA=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "e69459daa70f1c496dc5a0142449d894a02ab034",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "e69459daa70f1c496dc5a0142449d894a02ab034",
+        "type": "github"
+      }
+    },
     "flake-compat": {
       "flake": false,
       "locked": {
@@ -197,6 +234,7 @@
     },
     "root": {
       "inputs": {
+        "emacs30-macport-overlay": "emacs30-macport-overlay",
         "home-manager": "home-manager",
         "neovim": "neovim",
         "nix-darwin": "nix-darwin",
