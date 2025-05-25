@@ -34,18 +34,17 @@
     nur,
     ...
   } @ inputs: let
-    unstableOverlayModule = {
-      nixpkgs.overlays = [
-        (
-          final: prev: {
-            unstable = import unstable {
-              system = prev.system;
-              config = prev.config;
-            };
-          }
-        )
-      ];
+    mkOverlayModule = overlay: {
+      nixpkgs.overlays = [overlay];
     };
+    unstableOverlayModule = mkOverlayModule (
+      final: prev: {
+        unstable = import unstable {
+          system = prev.system;
+          config = prev.config;
+        };
+      }
+    );
     # mkOverlayModule = nixpkgsInput: packageNames:
     #       { config, lib, ... }: {
     #         nixpkgs.overlays = [
