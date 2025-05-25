@@ -7,6 +7,7 @@
 }: {
   imports = [
     ./sudo.nix
+    ../unfree.nix
   ];
   system.stateVersion = 5;
   nixpkgs.config.allowUnfree = true;
