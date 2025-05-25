@@ -16,27 +16,25 @@
   };
   config = let
     hasHomeManagerConfig = config ? home-manager;
-  in lib.mkMerge [
-    (lib.mkIf hasHomeManagerConfig {
-      nixpkgs.config.allowUnfreePredicate =
-        let
+  in
+    lib.mkMerge [
+      (lib.mkIf hasHomeManagerConfig {
+        nixpkgs.config.allowUnfreePredicate = let
           topLevelUnfree = config.nixpkgs.allowUnfreePackages;
-          homeManagerUnfree =
-            lib.flatten (lib.mapAttrsToList
-              (_: userConfig: userConfig.nixpkgs.allowUnfreePackages or [])
-              config.home-manager.users);
+          homeManagerUnfree = lib.flatten (lib.mapAttrsToList
+            (_: userConfig: userConfig.nixpkgs.allowUnfreePackages or [])
+            config.home-manager.users);
           allUnfree = topLevelUnfree ++ homeManagerUnfree;
           allowed = lib.map lib.getName allUnfree;
         in
-        pkg: builtins.elem (lib.getName pkg) allowed;
-    })
-    (lib.mkIf (!hasHomeManagerConfig) {
-      # Assumed to be standalone home-manager config.
-      nixpkgs.config.allowUnfreePredicate =
-        let
+          pkg: builtins.elem (lib.getName pkg) allowed;
+      })
+      (lib.mkIf (!hasHomeManagerConfig) {
+        # Assumed to be standalone home-manager config.
+        nixpkgs.config.allowUnfreePredicate = let
           allowed = lib.map lib.getName config.nixpkgs.allowUnfreePackages;
         in
-        pkg: builtins.elem (lib.getName pkg) allowed;
-    })
-  ];
+          pkg: builtins.elem (lib.getName pkg) allowed;
+      })
+    ];
 }

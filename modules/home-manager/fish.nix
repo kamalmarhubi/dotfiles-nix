@@ -1,4 +1,8 @@
-{config, pkgs, ...}: {
+{
+  config,
+  pkgs,
+  ...
+}: {
   programs.fish.enable = true;
   # TODO(25.05): Remove this; temporary to get fish 4.0 for built-in OSC
   #              stuffs.
