@@ -10,8 +10,6 @@
     ../unfree.nix
   ];
   system.stateVersion = 5;
-  nixpkgs.config.allowUnfree = true;
-  services.nix-daemon.enable = true;
   # services.karabiner-elements.enable = true;
   # nix.configureBuildUsers = true;
   nix.settings.experimental-features = "nix-command flakes";
