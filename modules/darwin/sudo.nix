@@ -1,5 +1,5 @@
 {
-  security.pam.enableSudoTouchIdAuth = true;
+  security.pam.services.sudo_local.touchIdAuth = true;
   # Default to requiring authentication on every sudo invocation...
   environment.etc."sudoers.d/10-timestamp_timeout".text = ''
     Defaults        timestamp_timeout=0

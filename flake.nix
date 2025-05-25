@@ -2,18 +2,18 @@
   description = "Kamal pretends to use nix?";
 
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-24.11-darwin";
+    nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-25.05-darwin";
     unstable.url = "github:nixos/nixpkgs/nixpkgs-unstable";
     nur = {
       url = "github:nix-community/NUR";
       inputs.nixpkgs.follows = "unstable";
     };
     home-manager = {
-      url = "github:nix-community/home-manager/release-24.11";
+      url = "github:nix-community/home-manager/release-25.05";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     nix-darwin = {
-      url = "github:LnL7/nix-darwin/nix-darwin-24.11";
+      url = "github:nix-darwin/nix-darwin/nix-darwin-25.05";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     # Hack because I just need neovim to work.
@@ -134,6 +134,14 @@
         "kamal-FL932PQ21V" = mkDarwinConfig {
           system = "aarch64-darwin";
           extraHomeModules = [./modules/home-manager/wave.nix];
+          # Error message is confusing since I don't think I did any of these:
+          #   Possible causes include setting up a new Nix installation with an
+          #   existing nix-darwin configuration, setting up a new nix-darwin
+          #   installation with an existing Nix installation, or manually increasing
+          #   your `system.stateVersion` setting.
+          extraModules = [
+            {ids.gids.nixbld = 30000;} # New default is 350.
+          ];
         };
         # Huh? Logging in to the kamal-personal account seems to change the hostname?
         "kamal-personal-FL932PQ21V" = mkDarwinConfig {

@@ -20,10 +20,10 @@ in {
       git
       git-lfs
       git-branchless
-      unstable.jujutsu  # from unstable because version in stable as some CVE
+      jujutsu  # from unstable because version in stable as some CVE
       # git-filter-repo
       lazygit
-      unstable.sapling  # from unstable to avoid needing to build nodejs 20
+      sapling  # from unstable to avoid needing to build nodejs 20
     ];
   };
 
