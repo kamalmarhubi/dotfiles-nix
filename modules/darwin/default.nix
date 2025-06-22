@@ -7,9 +7,11 @@
 }: {
   imports = [
     ../unfree.nix
+    ./karabiner-driverkit-virtualhiddevice.nix
   ];
   system.stateVersion = 5;
   # services.karabiner-elements.enable = true;
+  services.karabiner-driverkit-virtualhiddevice.enable = true;
 
   # Set up touch id authentication for sudo.
   security.pam.services.sudo_local.touchIdAuth = true;
