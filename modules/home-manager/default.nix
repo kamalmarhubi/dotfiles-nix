@@ -8,6 +8,7 @@
       ./emacs.nix
       ./fish.nix
       ./fonts.nix
+      ./llm.nix
       ./nvim.nix
       ./terminal.nix
       ./vcs.nix
