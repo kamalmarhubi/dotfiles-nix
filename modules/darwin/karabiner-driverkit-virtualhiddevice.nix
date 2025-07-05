@@ -30,12 +30,24 @@ in
     '';
 
     launchd.daemons.start_karabiner_driverkit_virtualhiddevice = {
-      script = ''
-        exec "${karabinerDriverPackage.driver}/Applications/.Karabiner-VirtualHIDDevice-Manager.app/Contents/MacOS/Karabiner-VirtualHIDDevice-Manager" activate
-      '';
       serviceConfig = {
         Label = "start_karabiner_driverkit_virtualhiddevice";
+        ProgramArguments = [
+          "${karabinerDriverPackage.driver}/Applications/.Karabiner-VirtualHIDDevice-Manager.app/Contents/MacOS/Karabiner-VirtualHIDDevice-Manager"
+          "activate"
+        ];
         RunAtLoad = true;
+      };
+    };
+
+    launchd.daemons.karabiner_virtualhiddevice_daemon = {
+      serviceConfig = {
+        Label = "karabiner_virtualhiddevice_daemon";
+        ProgramArguments = [
+          "${karabinerDriverPackage.driver}/Library/Application Support/org.pqrs/Karabiner-DriverKit-VirtualHIDDevice/Applications/Karabiner-VirtualHIDDevice-Daemon.app/Contents/MacOS/Karabiner-VirtualHIDDevice-Daemon"
+        ];
+        RunAtLoad = true;
+        KeepAlive = true;
       };
     };
   };

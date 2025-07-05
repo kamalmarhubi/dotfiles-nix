@@ -1,0 +1,13 @@
+;; Simple test config - caps lock becomes escape
+(defcfg
+  process-unmapped-keys no
+  log-layer-changes true
+)
+
+(defsrc
+  caps
+)
+
+(deflayer default
+  esc
+)

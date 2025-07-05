@@ -10,8 +10,23 @@
     ./karabiner-driverkit-virtualhiddevice.nix
   ];
   system.stateVersion = 5;
+  system.primaryUser = "kamal";
   # services.karabiner-elements.enable = true;
-  services.karabiner-driverkit-virtualhiddevice.enable = true;
+  services.karabiner-elements = {
+    enable = true;
+    package = pkgs.karabiner-elements.overrideAttrs (old: {
+      version = "14.13.0";
+
+      src = pkgs.fetchurl {
+        inherit (old.src) url;
+        hash = "sha256-gmJwoht/Tfm5qMecmq1N6PSAIfWOqsvuHU8VDJY8bLw=";
+      };
+
+      dontFixup = true;
+    });
+  };
+  environment.systemPackages = [ pkgs.kanata ];
+  # services.karabiner-driverkit-virtualhiddevice.enable = true;
 
   # Set up touch id authentication for sudo.
   security.pam.services.sudo_local.touchIdAuth = true;
