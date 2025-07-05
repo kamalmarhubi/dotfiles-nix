@@ -1,0 +1,11 @@
+* emacs
+** org-mode
+*** TODO make it look nicer
+*** structures
+**** TODO org-ql
+** gptel
+** general input
+*** TODO combobulate?
+*** TODO bray?
+** other nice things
+*** TODO activities.el
