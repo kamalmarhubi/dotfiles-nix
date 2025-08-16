@@ -18,6 +18,7 @@ in {
     packages = with pkgs; [
       delta
       git
+      git-absorb
       git-lfs
       git-branchless
       jujutsu # from unstable because version in stable as some CVE
