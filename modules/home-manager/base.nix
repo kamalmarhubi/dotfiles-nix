@@ -7,6 +7,7 @@
     nur.repos.gigamonster256.ghostty-darwin
     _1password-cli
     atool
+    bun
     cargo
     entr
     fd
