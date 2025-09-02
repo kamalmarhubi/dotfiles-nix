@@ -2,3 +2,6 @@ theme = tokyonight-day
 font-family = "Iosevka Fixed Slab"
 copy-on-select = clipboard
 keybind = shift+enter=text:\n
+# Consider just one side? This should really work for Canadian as a keyboard
+# choice as well.
+macos-option-as-alt = true
