@@ -3,7 +3,11 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-25.05-darwin";
-    unstable.url = "github:nixos/nixpkgs/nixpkgs-unstable";
+
+    # Temporarily use unmerged PR upgrading claude-code past 1.0.111 for token
+    # count output while processing.
+    unstable.url = "github:nixos/nixpkgs/pull/442309/head";
+    # unstable.url = "github:nixos/nixpkgs/nixpkgs-unstable";
     nur = {
       url = "github:nix-community/NUR";
       inputs.nixpkgs.follows = "unstable";
