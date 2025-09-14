@@ -4,29 +4,30 @@
   pkgs,
   extraHomeModules ? [],
   ...
-}: {
+}: let
+  # Use local packages for testing
+  localPkgs = inputs.nixpkgs-local.legacyPackages.${system};
+in {
   imports = [
     ../unfree.nix
-    ./karabiner-driverkit-virtualhiddevice.nix
+    # Use local nix-darwin modules
+    "${inputs.nix-darwin-local}/modules/services/karabiner-driverkit-virtualhiddevice"
+    "${inputs.nix-darwin-local}/modules/services/kanata"
   ];
   system.stateVersion = 5;
   system.primaryUser = "kamal";
-  # services.karabiner-elements.enable = true;
-  services.karabiner-elements = {
+  
+  # Use our new kanata + karabiner-driverkit setup
+  services.kanata = {
     enable = true;
-    package = pkgs.karabiner-elements.overrideAttrs (old: {
-      version = "14.13.0";
-
-      src = pkgs.fetchurl {
-        inherit (old.src) url;
-        hash = "sha256-gmJwoht/Tfm5qMecmq1N6PSAIfWOqsvuHU8VDJY8bLw=";
-      };
-
-      dontFixup = true;
-    });
+    package = localPkgs.kanata;
+    configFile = "${config.system.primaryUserHome}/.config/kanata/kanata.kbd";
   };
-  environment.systemPackages = [ pkgs.kanata ];
-  # services.karabiner-driverkit-virtualhiddevice.enable = true;
+  
+  services.karabiner-driverkit-virtualhiddevice = {
+    enable = true;
+    package = localPkgs.karabiner-driverkit-virtualhiddevice;
+  };
 
   # Set up touch id authentication for sudo.
   security.pam.services.sudo_local.touchIdAuth = true;
