@@ -1,50 +1,55 @@
-#|
-This minimal config changes Caps Lock to act as Caps Lock on quick tap, but
-if held, it will act as Left Ctrl. It also changes the backtick/grave key to
-act as backtick/grave on quick tap, but change ijkl keys to arrow keys on hold.
-
-This text between the two pipe+octothorpe sequences is a multi-line comment.
-|#
-
-;; Text after double-semicolons are single-line comments.
-
-#|
-One defcfg entry may be added, which is used for configuration key-pairs. These
-configurations change kanata's behaviour at a more global level than the other
-configuration entries.
-|#
+;; Kanata CAGS Home Row Mods Configuration for macOS
+;; Based on "timeless" approach using bilateral combinations
 
 (defcfg
-  #|
-  This configuration will process all keys pressed inside of kanata, even if
-  they are not mapped in defsrc. This is so that certain actions can activate
-  at the right time for certain input sequences. By default, unmapped keys are
-  not processed through kanata due to a Windows issue related to AltGr. If you
-  use AltGr in your keyboard, you will likely want to follow the simple.kbd
-  file while unmapping lctl and ralt from defsrc.
-  |#
   process-unmapped-keys yes
+  log-layer-changes true
 )
 
+;; Variables for timing (following urob's ZMK timeless approach)
+(defvar
+  tap-timeout 280    ;; Long timeout since timing becomes irrelevant
+  hold-timeout 280   ;; Same as tap for consistency
+)
+
+;; Full keyboard layout
 (defsrc
-  caps grv         i
-              j    k    l
-  lsft rsft
+  esc  1    2    3    4    5    6    7    8    9    0    -    =    bspc
+  tab  q    w    e    r    t    y    u    i    o    p    [    ]    \
+  caps a    s    d    f    g    h    j    k    l    ;    '    ret
+  lsft z    x    c    v    b    n    m    ,    .    /    rsft
+  lctl lmet lalt           spc            ralt rmet rctl
 )
 
-(deflayer default
-  @cap @grv        _
-              _    _    _
-  _    _
-)
-
-(deflayer arrows
-  _    _           up
-              left down rght
-  _    _
-)
-
+;; CAGS Home Row Mods for macOS  
+;; Left hand:  a=Ctrl, s=Option, d=Command, f=Shift
+;; Right hand: j=Shift, k=Command, l=Option, ;=Ctrl
 (defalias
-  cap (tap-hold-press 200 200 caps lctl)
-  grv (tap-hold-press 200 200 grv (layer-toggle arrows))
+  ;; Left hand home row mods - SAME hand keys trigger early tap
+  a-ctrl (tap-hold-release-keys $tap-timeout $hold-timeout a lctl 
+           (q w e r t s d f g z x c v b caps lsft lctl lmet lalt))
+  s-opt  (tap-hold-release-keys $tap-timeout $hold-timeout s lalt 
+           (q w e r t a d f g z x c v b caps lsft lctl lmet lalt))
+  d-cmd  (tap-hold-release-keys $tap-timeout $hold-timeout d lmet 
+           (q w e r t a s f g z x c v b caps lsft lctl lmet lalt))
+  f-sft  (tap-hold-release-keys $tap-timeout $hold-timeout f lsft 
+           (q w e r t a s d g z x c v b caps lsft lctl lmet lalt))
+  
+  ;; Right hand home row mods - SAME hand keys trigger early tap  
+  j-sft  (tap-hold-release-keys $tap-timeout $hold-timeout j rsft 
+           (y u i o p [ ] \ h k l ; ' n m , . / rsft ralt rmet rctl))
+  k-cmd  (tap-hold-release-keys $tap-timeout $hold-timeout k rmet 
+           (y u i o p [ ] \ h j l ; ' n m , . / rsft ralt rmet rctl))
+  l-opt  (tap-hold-release-keys $tap-timeout $hold-timeout l ralt 
+           (y u i o p [ ] \ h j k ; ' n m , . / rsft ralt rmet rctl))
+  ;-ctrl (tap-hold-release-keys $tap-timeout $hold-timeout ; rctl 
+           (y u i o p [ ] \ h j k l ' n m , . / rsft ralt rmet rctl))
+)
+
+(deflayer base
+  esc  1    2    3    4    5    6    7    8    9    0    -    =    bspc
+  tab  q    w    e    r    t    y    u    i    o    p    [    ]    \
+  caps @a-ctrl @s-opt @d-cmd @f-sft g h @j-sft @k-cmd @l-opt @;-ctrl ' ret
+  lsft z    x    c    v    b    n    m    ,    .    /    rsft
+  lctl lmet lalt           spc            ralt rmet rctl
 )

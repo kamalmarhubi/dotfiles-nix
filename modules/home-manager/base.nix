@@ -1,6 +1,7 @@
 {
   pkgs,
   inputs,
+  config,
   ...
 }: {
   home.packages = with pkgs; [
@@ -14,6 +15,7 @@
     ffmpeg
     graphicsmagick
     jdk
+    kanata
     magic-wormhole
     mtr
     nushell

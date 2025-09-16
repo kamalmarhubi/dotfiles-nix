@@ -1,4 +1,5 @@
 {
+  config,
   inputs,
   system,
   pkgs,
@@ -22,6 +23,7 @@ in {
     enable = true;
     package = localPkgs.kanata;
     configFile = "${config.system.primaryUserHome}/.config/kanata/kanata.kbd";
+    keepAlive = false;  # Make it easy to kill and have it stay dead while iterating.
   };
   
   services.karabiner-driverkit-virtualhiddevice = {
