@@ -24,6 +24,8 @@
 ;; - Kanata bilateral combinations: https://github.com/jtroo/kanata/issues/1006
 ;; - Home row mod guide: https://precondition.github.io/home-row-mods
 ;; - macOS modifier order: https://precondition.github.io/home-row-mods#home-row-mods-order
+;; - Advanced fast typing detection (not implemented): https://github.com/jtroo/kanata/discussions/1656#discussioncomment-14382030
+;;   (might require newer kanata version for virtual key state management)
 
 (defcfg
   process-unmapped-keys yes  ;; Process keys not in defsrc to enable early hold detection for tap-hold actions
