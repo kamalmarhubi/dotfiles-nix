@@ -7,6 +7,13 @@
 ;; - Opposite-hand combinations (e.g., f+h) activate modifiers immediately
 ;; - Context determines behavior, not timing windows
 ;;
+;; Function Key Mapping (fixes macOS consumer control conversion):
+;; Without kanata: Volume keys send consumer control codes → work properly
+;; With kanata: Kanata intercepts consumer controls → converts to F-key scancodes
+;; Solution: Map F-keys back to proper media controls
+;; F1/F2=Brightness up/down, F10=Mute, F11/F12=Volume down/up
+;; F3-F9=Transparent (_) - send normal F-keys
+;;
 ;; CAGS Layout for macOS:
 ;; Left:  a=Ctrl, s=Option, d=Command, f=Shift  
 ;; Right: j=Shift, k=Command, l=Option, ;=Ctrl
@@ -19,7 +26,7 @@
 ;; - macOS modifier order: https://precondition.github.io/home-row-mods#home-row-mods-order
 
 (defcfg
-  process-unmapped-keys yes
+  process-unmapped-keys yes  ;; Process keys not in defsrc to enable early hold detection for tap-hold actions
   log-layer-changes true
 )
 
@@ -29,9 +36,10 @@
   hold-timeout 280   ;; Same as tap for consistency
 )
 
-;; Full keyboard layout
+;; Full keyboard layout including function keys for media controls
 (defsrc
-  esc  1    2    3    4    5    6    7    8    9    0    -    =    bspc
+  esc  f1   f2   f3   f4   f5   f6   f7   f8   f9   f10  f11  f12  
+  grv  1    2    3    4    5    6    7    8    9    0    -    =    bspc
   tab  q    w    e    r    t    y    u    i    o    p    [    ]    \
   caps a    s    d    f    g    h    j    k    l    ;    '    ret
   lsft z    x    c    v    b    n    m    ,    .    /    rsft
@@ -64,7 +72,8 @@
 )
 
 (deflayer base
-  esc  1    2    3    4    5    6    7    8    9    0    -    =    bspc
+  esc  brdn brup  _    _    _    _    _    _    _    mute vold volu
+  grv  1    2    3    4    5    6    7    8    9    0    -    =    bspc
   tab  q    w    e    r    t    y    u    i    o    p    [    ]    \
   caps @a-ctrl @s-opt @d-cmd @f-sft g h @j-sft @k-cmd @l-opt @;-ctrl ' ret
   lsft z    x    c    v    b    n    m    ,    .    /    rsft
