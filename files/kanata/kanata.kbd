@@ -1,5 +1,22 @@
 ;; Kanata CAGS Home Row Mods Configuration for macOS
-;; Based on "timeless" approach using bilateral combinations
+;; 
+;; "Timeless" home row modifiers using bilateral combinations.
+;; Uses opposite-hand detection instead of timing precision.
+;;
+;; - Same-hand combinations (e.g., f+g) type letters normally  
+;; - Opposite-hand combinations (e.g., f+h) activate modifiers immediately
+;; - Context determines behavior, not timing windows
+;;
+;; CAGS Layout for macOS:
+;; Left:  a=Ctrl, s=Option, d=Command, f=Shift  
+;; Right: j=Shift, k=Command, l=Option, ;=Ctrl
+;;
+;; References:
+;; - urob's ZMK config: https://github.com/urob/zmk-config
+;; - QMK Chordal Hold: https://github.com/qmk/qmk_firmware/pull/24560
+;; - Kanata bilateral combinations: https://github.com/jtroo/kanata/issues/1006
+;; - Home row mod guide: https://precondition.github.io/home-row-mods
+;; - macOS modifier order: https://precondition.github.io/home-row-mods#home-row-mods-order
 
 (defcfg
   process-unmapped-keys yes
