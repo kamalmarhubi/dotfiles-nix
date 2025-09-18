@@ -56,6 +56,7 @@
       }
     );
     emacs30OverlayModule = mkOverlayModule emacs30-macport-overlay.overlays.default;
+    customPackagesOverlayModule = import ./pkgs { lib = nixpkgs.lib; };
     # mkOverlayModule = nixpkgsInput: packageNames:
     #       { config, lib, ... }: {
     #         nixpkgs.overlays = [
@@ -98,6 +99,7 @@
           [
             unstableOverlayModule
             emacs30OverlayModule
+            customPackagesOverlayModule
             nur.modules.darwin.default
             home-manager.darwinModules.home-manager
             registryConfig
@@ -128,6 +130,7 @@
           [
             unstableOverlayModule
             emacs30OverlayModule
+            customPackagesOverlayModule
             nur.modules.homeManager.default
             ./modules/home-manager
             registryConfig
