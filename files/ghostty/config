@@ -1,4 +1,4 @@
-theme = tokyonight-day
+theme = TokyoNight Day
 font-family = "Iosevka Fixed Slab"
 copy-on-select = clipboard
 keybind = shift+enter=text:\n
