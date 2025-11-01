@@ -6,8 +6,8 @@
 
     # Temporarily use unmerged PR upgrading claude-code past 1.0.111 for token
     # count output while processing.
-    unstable.url = "github:nixos/nixpkgs/pull/442309/head";
-    # unstable.url = "github:nixos/nixpkgs/nixpkgs-unstable";
+    unstable.url = "github:nixos/nixpkgs/nixpkgs-unstable";
+    master.url = "github:nixos/nixpkgs/master";
     nur = {
       url = "github:nix-community/NUR";
       inputs.nixpkgs.follows = "unstable";
@@ -38,6 +38,7 @@
   outputs = {
     nixpkgs,
     unstable,
+    master,
     home-manager,
     nix-darwin,
     nur,
@@ -50,6 +51,14 @@
     unstableOverlayModule = mkOverlayModule (
       final: prev: {
         unstable = import unstable {
+          system = prev.system;
+          config = prev.config;
+        };
+      }
+    );
+    masterOverlayModule = mkOverlayModule (
+      final: prev: {
+        master = import master {
           system = prev.system;
           config = prev.config;
         };
@@ -87,6 +96,7 @@
     registryConfig = {
       nix.registry.nixpkgs.flake = inputs.nixpkgs;
       nix.registry.unstable.flake = inputs.unstable;
+      nix.registry.master.flake = inputs.master;
     };
     mkDarwinConfig = {
       system ? "aarch64-darwin",
@@ -98,6 +108,7 @@
         modules =
           [
             unstableOverlayModule
+            masterOverlayModule
             emacs30OverlayModule
             customPackagesOverlayModule
             nur.modules.darwin.default
@@ -129,6 +140,7 @@
         modules =
           [
             unstableOverlayModule
+            masterOverlayModule
             emacs30OverlayModule
             customPackagesOverlayModule
             nur.modules.homeManager.default

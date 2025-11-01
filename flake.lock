@@ -110,6 +110,22 @@
         "type": "github"
       }
     },
+    "master": {
+      "locked": {
+        "lastModified": 1760370824,
+        "narHash": "sha256-Xakl7ChYLY9SfS5bYk0v95qk0RSfHuVDbZez+BkSHXk=",
+        "owner": "nixos",
+        "repo": "nixpkgs",
+        "rev": "ffa6a008042a185369d13f9ab7238242d5e98545",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nixos",
+        "ref": "master",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
     "neovim": {
       "inputs": {
         "flake-compat": "flake-compat",
@@ -236,6 +252,7 @@
       "inputs": {
         "emacs30-macport-overlay": "emacs30-macport-overlay",
         "home-manager": "home-manager",
+        "master": "master",
         "neovim": "neovim",
         "nix-darwin": "nix-darwin",
         "nixpkgs": "nixpkgs",
@@ -267,16 +284,16 @@
     },
     "unstable": {
       "locked": {
-        "lastModified": 1757666741,
-        "narHash": "sha256-kd7t096jkNy67L2B2cEGYPZCa+PRF5DcBJqk35rAVz8=",
+        "lastModified": 1761880412,
+        "narHash": "sha256-QoJjGd4NstnyOG4mm4KXF+weBzA2AH/7gn1Pmpfcb0A=",
         "owner": "nixos",
         "repo": "nixpkgs",
-        "rev": "e6451ec7268a6b278f00175807228c50e141b839",
+        "rev": "a7fc11be66bdfb5cdde611ee5ce381c183da8386",
         "type": "github"
       },
       "original": {
         "owner": "nixos",
-        "ref": "pull/442309/head",
+        "ref": "nixpkgs-unstable",
         "repo": "nixpkgs",
         "type": "github"
       }
