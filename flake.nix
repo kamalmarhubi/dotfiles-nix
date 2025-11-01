@@ -20,9 +20,6 @@
       url = "github:nix-darwin/nix-darwin/nix-darwin-25.05";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    # TODO(NixOS/nixpkgs#392960): Remove this overlay once there's a way to use emacs30-macport in nixpkgs.
-    emacs30-macport-overlay = {
-      url = "github:what-the-functor/nix-emacs30-macport-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     # Hack because I just need neovim to work.
@@ -42,7 +39,6 @@
     home-manager,
     nix-darwin,
     nur,
-    emacs30-macport-overlay,
     ...
   } @ inputs: let
     mkOverlayModule = overlay: {
@@ -64,7 +60,6 @@
         };
       }
     );
-    emacs30OverlayModule = mkOverlayModule emacs30-macport-overlay.overlays.default;
     customPackagesOverlayModule = import ./pkgs { lib = nixpkgs.lib; };
     # mkOverlayModule = nixpkgsInput: packageNames:
     #       { config, lib, ... }: {
@@ -109,7 +104,6 @@
           [
             unstableOverlayModule
             masterOverlayModule
-            emacs30OverlayModule
             customPackagesOverlayModule
             nur.modules.darwin.default
             home-manager.darwinModules.home-manager
@@ -141,7 +135,6 @@
           [
             unstableOverlayModule
             masterOverlayModule
-            emacs30OverlayModule
             customPackagesOverlayModule
             nur.modules.homeManager.default
             ./modules/home-manager

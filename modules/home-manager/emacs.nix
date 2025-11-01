@@ -1,14 +1,13 @@
 {
   config,
   pkgs,
-  inputs,
-  system,
   ...
 }: {
   home.packages = with pkgs; [
     (
       if stdenv.isDarwin
-      then emacs30-macport
+      # TODO(25.11): Switch back to stable once it's released.
+      then unstable.emacs-macport
       else emacs
     )
   ];
