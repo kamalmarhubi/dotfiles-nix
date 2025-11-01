@@ -14,6 +14,7 @@
     fd
     ffmpeg
     graphicsmagick
+    gron
     jdk
     kanata
     magic-wormhole
