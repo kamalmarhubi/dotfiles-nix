@@ -156,6 +156,23 @@
         "type": "github"
       }
     },
+    "nix-darwin-local": {
+      "inputs": {
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1759000680,
+        "narHash": "sha256-zW1aSCm4ekLozM+bj6IYSVpI0EIFbOBeaRSOpygp4MA=",
+        "path": "/Users/kamal/clones/nix/nix-darwin",
+        "type": "path"
+      },
+      "original": {
+        "path": "/Users/kamal/clones/nix/nix-darwin",
+        "type": "path"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1748022455,
@@ -216,6 +233,7 @@
         "master": "master",
         "neovim": "neovim",
         "nix-darwin": "nix-darwin",
+        "nix-darwin-local": "nix-darwin-local",
         "nixpkgs": "nixpkgs",
         "nixpkgs-for-neovim": "nixpkgs-for-neovim",
         "nur": "nur",

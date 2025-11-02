@@ -21,6 +21,9 @@
       url = "github:nix-darwin/nix-darwin/nix-darwin-25.05";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    # Local testing inputs
+    nix-darwin-local = {
+      url = "path:/Users/kamal/clones/nix/nix-darwin";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     # Hack because I just need neovim to work.
@@ -39,6 +42,7 @@
     master,
     home-manager,
     nix-darwin,
+    nix-darwin-local,
     nur,
     ...
   } @ inputs: let
