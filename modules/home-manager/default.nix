@@ -3,7 +3,6 @@
     [
       ../unfree.nix
       ./base.nix
-      ./darwin.nix
       ./dotfiles-nix.nix
       ./emacs.nix
       ./fish.nix
@@ -14,5 +13,5 @@
       ./vcs.nix
     ]
     ++ extraModules;
-  home.stateVersion = "22.11";
+  home.stateVersion = "25.11";
 }

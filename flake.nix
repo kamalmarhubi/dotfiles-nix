@@ -13,8 +13,9 @@
       inputs.nixpkgs.follows = "unstable";
     };
     home-manager = {
-      url = "github:nix-community/home-manager/release-25.05";
-      inputs.nixpkgs.follows = "nixpkgs";
+      # TODO(25.11): Switch back from master; change nixpkgs.follows back to nixpkgs.
+      url = "github:nix-community/home-manager";
+      inputs.nixpkgs.follows = "unstable";
     };
     nix-darwin = {
       url = "github:nix-darwin/nix-darwin/nix-darwin-25.05";
