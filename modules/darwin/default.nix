@@ -5,15 +5,12 @@
   pkgs,
   extraHomeModules ? [],
   ...
-}: let
-  # Use local packages for testing
-  localPkgs = inputs.nixpkgs-local.legacyPackages.${system};
-in {
+}: {
   imports = [
     ../unfree.nix
-    # Use local nix-darwin modules
-    "${inputs.nix-darwin-local}/modules/services/karabiner-driverkit-virtualhiddevice"
-    "${inputs.nix-darwin-local}/modules/services/kanata"
+    # Use local modules until upstream nix-darwin modules are ready
+    ./karabiner-driverkit-virtualhiddevice
+    ./kanata
   ];
   system.stateVersion = 5;
   system.primaryUser = "kamal";
@@ -33,14 +30,16 @@ in {
   # Use our new kanata + karabiner-driverkit setup
   services.kanata = {
     enable = true;
-    package = localPkgs.kanata;
+    # TODO^2: Uncomment below two lines after getting nix to 2.18 or higher.
+    # TODO: Remove after v1.10.0 is released - https://github.com/jtroo/kanata/releases
+    # package = pkgs.mine.kanata;
     configFile = "${config.system.primaryUserHome}/.config/kanata/kanata.kbd";
-    keepAlive = false;  # Make it easy to kill and have it stay dead while iterating.
+    keepAlive = false;  # Easier for development - no auto-restart
   };
-  
+
   services.karabiner-driverkit-virtualhiddevice = {
     enable = true;
-    package = localPkgs.karabiner-driverkit-virtualhiddevice;
+    package = pkgs.master.karabiner-dk;
   };
 
   # Set up touch id authentication for sudo.
