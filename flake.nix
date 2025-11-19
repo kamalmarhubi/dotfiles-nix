@@ -59,6 +59,28 @@
         };
       }
     );
+    # Helper to make it easy to replace specific packges from a different
+    # nixpkgs; useful for catching unmerged PRs or other branches. The
+    # packageInputMap argument is an attrSet like
+    #     with inputs; { some-package-name = some-input-name; }
+    # which would result in using some-package-name from the referenced input.
+    mkPackageReplacementOverlayModule = packageInputMap:
+      mkOverlayModule (
+        final: prev:
+          builtins.foldl'
+            (acc: packageName:
+              let
+                nixpkgsInput = packageInputMap.${packageName};
+                pkgs = import nixpkgsInput {
+                  system = prev.system;
+                  config = prev.config;
+                };
+              in
+                acc // { ${packageName} = pkgs.${packageName}; }
+            )
+            {}
+            (builtins.attrNames packageInputMap)
+      );
     # A module to use lix instead of CppNix. Adapated from
     #   https://lix.systems/add-to-config/#advanced-change
     # This should not be included in standalone home-manager configs.
@@ -89,20 +111,6 @@
       registryConfig
     ];
 
-    # mkOverlayModule = nixpkgsInput: packageNames:
-    #       { config, lib, ... }: {
-    #         nixpkgs.overlays = [
-    #           (final: prev:
-    #             let
-    #               pkgs = import nixpkgsInput { system = prev.system; };
-    #               getPackage = name: { ${name} = pkgs.${name}; };
-    #             in
-    #             if builtins.isList packageNames
-    #             then builtins.foldl' (acc: name: acc // getPackage name) {} packageNames
-    #             else getPackage packageNames
-    #           )
-    #         ];
-    #       };
     systems = [
       "aarch64-darwin"
       "aarch64-linux"
