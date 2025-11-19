@@ -75,7 +75,20 @@
       ];
       nix.package = pkgs.lixPackageSets.stable.lix;
     };
-    customPackagesOverlayModule = import ./pkgs { lib = nixpkgs.lib; };
+    myPackagesOverlayModule = import ./pkgs { lib = nixpkgs.lib; };
+
+    # Common overlays used by both darwin and standalone home-manager configs
+    commonOverlayModules = [
+      unstableOverlayModule
+      masterOverlayModule
+      myPackagesOverlayModule
+    ];
+
+    # Common modules used by both darwin and standalone home-manager configs
+    commonModules = commonOverlayModules ++ [
+      registryConfig
+    ];
+
     # mkOverlayModule = nixpkgsInput: packageNames:
     #       { config, lib, ... }: {
     #         nixpkgs.overlays = [
@@ -116,14 +129,11 @@
       nix-darwin.lib.darwinSystem {
         inherit system;
         modules =
-          [
-            unstableOverlayModule
-            masterOverlayModule
-            customPackagesOverlayModule
+          commonModules
+          ++ [
             lixModule
             nur.modules.darwin.default
             home-manager.darwinModules.home-manager
-            registryConfig
             ./modules/darwin
           ]
           ++ extraModules;
@@ -148,13 +158,10 @@
           dotFilesNixHomeManagerInstallationType = "standalone";
         };
         modules =
-          [
-            unstableOverlayModule
-            masterOverlayModule
-            customPackagesOverlayModule
+          commonModules
+          ++ [
             nur.modules.homeManager.default
             ./modules/home-manager
-            registryConfig
             {
               programs.home-manager.enable = true;
               home = {
