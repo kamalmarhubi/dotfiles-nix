@@ -59,6 +59,22 @@
         };
       }
     );
+    # A module to use lix instead of CppNix. Adapated from
+    #   https://lix.systems/add-to-config/#advanced-change
+    # This should not be included in standalone home-manager configs.
+    lixModule = {pkgs, ...}: {
+      nixpkgs.overlays = [
+        (final: prev: {
+          inherit (final.lixPackageSets.stable)
+            nixpkgs-review
+            nix-direnv
+            nix-eval-jobs
+            nix-fast-build
+            colmena;
+        })
+      ];
+      nix.package = pkgs.lixPackageSets.stable.lix;
+    };
     customPackagesOverlayModule = import ./pkgs { lib = nixpkgs.lib; };
     # mkOverlayModule = nixpkgsInput: packageNames:
     #       { config, lib, ... }: {
@@ -104,6 +120,7 @@
             unstableOverlayModule
             masterOverlayModule
             customPackagesOverlayModule
+            lixModule
             nur.modules.darwin.default
             home-manager.darwinModules.home-manager
             registryConfig
