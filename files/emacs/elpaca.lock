@@ -23,7 +23,7 @@
    "elpaca-menu-lock-file" :recipe
    (:source nil :protocol https :inherit ignore :depth treeless :repo
 	    "https://github.com/progfolio/elpaca.git" :ref
-	    "45c56a968fd5903bbcbb1fafbf3b6e50e64c4393" :files
+	    "b5ef5f19ac1224853234c9acdac0ec9ea1c440a1" :files
 	    (:defaults "elpaca-test.el" (:exclude "extensions"))
 	    :build (:not elpaca--activate-package) :package "elpaca"))
  (elpaca-use-package :source "elpaca-menu-lock-file" :recipe
@@ -36,7 +36,7 @@
 			       :build (:not elpaca--compile-info)
 			       :source "Elpaca extensions" :protocol
 			       https :inherit t :depth treeless :ref
-			       "45c56a968fd5903bbcbb1fafbf3b6e50e64c4393"))
+			       "b5ef5f19ac1224853234c9acdac0ec9ea1c440a1"))
  (exec-path-from-shell :source "elpaca-menu-lock-file" :recipe
 		       (:package "exec-path-from-shell" :fetcher
 				 github :repo
