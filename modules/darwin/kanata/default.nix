@@ -39,16 +39,30 @@ in
 
   config = mkIf cfg.enable {
     # Ensure the virtual HID device driver is available
-    services.karabiner-driverkit-virtualhiddevice.enable = mkDefault true;
+    # Use the darwinDriver from kanata package for automatic version coordination
+    services.karabiner-driverkit-virtualhiddevice = {
+      enable = mkDefault true;
+      package = mkDefault cfg.package.darwinDriver;
+    };
 
     environment.systemPackages = [ cfg.package ];
+
+    # Copy kanata to stable path for TCC permissions
+    # macOS TCC permissions are path-specific, so we need a stable path
+    # that doesn't change when nix store paths change
+    system.activationScripts.postActivation.text = ''
+      echo "copying kanata to /Library/Application Support/org.nixos.kanata/ for stable TCC permissions..." >&2
+      mkdir -p "/Library/Application Support/org.nixos.kanata"
+      cp -f "${lib.getExe cfg.package}" "/Library/Application Support/org.nixos.kanata/kanata"
+      chmod +x "/Library/Application Support/org.nixos.kanata/kanata"
+    '';
 
     # Run as system daemon to access HID devices (requires root permissions)
     launchd.daemons.kanata = {
       serviceConfig = {
-        Program = "${lib.getExe cfg.package}";
+        Program = "/Library/Application Support/org.nixos.kanata/kanata";
         ProgramArguments = [
-          "${lib.getExe cfg.package}"
+          "/Library/Application Support/org.nixos.kanata/kanata"
           "--cfg"
           "${cfg.configFile}"
         ];

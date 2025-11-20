@@ -8,6 +8,11 @@
     # count output while processing.
     unstable.url = "github:nixos/nixpkgs/nixpkgs-unstable";
     master.url = "github:nixos/nixpkgs/master";
+
+    # Catch the bump to 1.10 which uses karabiner-dk 6:
+    #   https://github.com/NixOS/nixpkgs/pull/461152
+    # TODO(25.11): At some point this will be available in unstable.
+    nixpkgs-kanata-pr.url = "github:nixos/nixpkgs/pull/461152/head";
     nur = {
       url = "github:nix-community/NUR";
       inputs.nixpkgs.follows = "unstable";
@@ -104,6 +109,9 @@
       unstableOverlayModule
       masterOverlayModule
       myPackagesOverlayModule
+      (mkPackageReplacementOverlayModule (with inputs; {
+        kanata = nixpkgs-kanata-pr;
+      }))
     ];
 
     # Common modules used by both darwin and standalone home-manager configs

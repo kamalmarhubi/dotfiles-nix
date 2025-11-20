@@ -16,18 +16,12 @@
   system.primaryUser = "kamal";
 
   # Use our new kanata + karabiner-driverkit setup
+  # The kanata service automatically enables karabiner-driverkit-virtualhiddevice
+  # and sets its package to kanata's darwinDriver for version coordination
   services.kanata = {
     enable = true;
-    # TODO^2: Uncomment below two lines after getting nix to 2.18 or higher.
-    # TODO: Remove after v1.10.0 is released - https://github.com/jtroo/kanata/releases
-    # package = pkgs.mine.kanata;
     configFile = "${config.system.primaryUserHome}/.config/kanata/kanata.kbd";
     keepAlive = false;  # Easier for development - no auto-restart
-  };
-
-  services.karabiner-driverkit-virtualhiddevice = {
-    enable = true;
-    package = pkgs.master.karabiner-dk;
   };
 
   # Set up touch id authentication for sudo.
