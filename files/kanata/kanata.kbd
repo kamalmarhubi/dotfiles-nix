@@ -1,41 +1,74 @@
-;; Kanata CAGS Home Row Mods Configuration for macOS
+;; kamal's kanata config
+;;
+;; Features:
+;; - home-row mods with a fast typing layer activated with a
+;;   virtual key.
+;; - excludes same-hand mods from firing for non-shift so that, eg, `an`
+;;   doesn't act like ^N and `kn` doesn't act like cmd+K.
+;; - ensures media keys work under macos: somehow knata seems to break the
+;;   translation from F-keys
+;;
+;; Known issues:
+;; - vim jkl movement key reptetition requires double tap to initiate
+;;   repetition; attempted tap-hold-press but didn't work as expected
+;; - sometimes fails to fire mods when typing fast, eg, `f/` instead of `?`;
+;;   made a brief attempt at some key-history stuff but it didn't seem to work
 ;; 
-;; "Timeless" home row modifiers using bilateral combinations.
-;; Uses opposite-hand detection instead of timing precision.
-;;
-;; - Same-hand combinations (e.g., f+g) type letters normally  
-;; - Opposite-hand combinations (e.g., f+h) activate modifiers immediately
-;; - Context determines behavior, not timing windows
-;;
-;; Function Key Mapping (fixes macOS consumer control conversion):
-;; Without kanata: Volume keys send consumer control codes → work properly
-;; With kanata: Kanata intercepts consumer controls → converts to F-key scancodes
-;; Solution: Map F-keys back to proper media controls
-;; F1/F2=Brightness up/down, F10=Mute, F11/F12=Volume down/up
-;; F3-F9=Transparent (_) - send normal F-keys
-;;
-;; CAGS Layout for macOS:
-;; Left:  a=Ctrl, s=Option, d=Command, f=Shift  
-;; Right: j=Shift, k=Command, l=Option, ;=Ctrl
+;; This is mostly from a comment in a kanata discussion thread about avoiding
+;; unintended home-row mod activation combined with pieces of "timeless home
+;; row mods".
 ;;
 ;; References:
-;; - urob's ZMK config: https://github.com/urob/zmk-config
-;; - QMK Chordal Hold: https://github.com/qmk/qmk_firmware/pull/24560
-;; - Kanata bilateral combinations: https://github.com/jtroo/kanata/issues/1006
 ;; - Home row mod guide: https://precondition.github.io/home-row-mods
 ;; - macOS modifier order: https://precondition.github.io/home-row-mods#home-row-mods-order
-;; - Advanced fast typing detection (not implemented): https://github.com/jtroo/kanata/discussions/1656#discussioncomment-14382030
-;;   (might require newer kanata version for virtual key state management)
+;; - urob's ZMK config mention of timeless home-row mods: https://github.com/urob/zmk-config/blob/f58172110543d6694b6463e21df945139b091b3f/readme.md#timeless-homerow-mods
+;; - QMK Chordal Hold: https://github.com/qmk/qmk_firmware/pull/24560
+;; - Kanata bilateral combinations: https://github.com/jtroo/kanata/issues/1006
+;; - Advanced fast typing detection: https://github.com/jtroo/kanata/discussions/1656#discussioncomment-14382030
 
 (defcfg
-  process-unmapped-keys yes  ;; Process keys not in defsrc to enable early hold detection for tap-hold actions
-  log-layer-changes true
+  process-unmapped-keys true
+  log-layer-changes false
 )
 
-;; Variables for timing (following urob's ZMK timeless approach)
+(defvirtualkeys
+  fast (layer-while-held typing)
+)
+
 (defvar
-  tap-timeout 280    ;; Long timeout since timing becomes irrelevant
-  hold-timeout 280   ;; Same as tap for consistency
+  tot 220  ;; time out tap
+  toh 160  ;; time out hold
+
+  ;; Same-hand key lists for bilateral combinations (prevents same-hand mod activation)
+  left-hand-keys (q w e r t a s d f g z x c v b caps lsft lctl lmet lalt)
+  right-hand-keys (y u i o p [ ] \ h j k l ; ' n m , . / rsft ralt rmet rctl)
+)
+
+;; Template for home row mods with fast typing detection
+(deftemplate homerowmod (timeouttap timeouthold keytap keyhold)
+  (tap-hold $timeouttap $timeouthold
+    (multi $keytap @.tp)
+    $keyhold
+  )
+)
+
+;; Template for non-shift mods with same-hand prevention
+;; Triggers early tap if same-hand key is pressed (prevents accidental mods from "know" or "at")
+(deftemplate homerowmod-bilateral (timeouttap timeouthold keytap keyhold samehandkeys)
+  (tap-hold-release-keys $timeouttap $timeouthold
+    (multi $keytap @.tp)
+    $keyhold
+    $samehandkeys
+  )
+)
+
+
+(defalias
+  ;; Trigger typing layer when keys are pressed within 55ms
+  .tp (hold-for-duration 55 fast)
+  ;; Explicitly exit typing layer when space is pressed
+  .spc-typing (multi (on-press release-vkey fast) spc)
+
 )
 
 ;; Full keyboard layout including function keys for media controls
@@ -48,36 +81,40 @@
   lctl lmet lalt           spc            ralt rmet rctl
 )
 
-;; CAGS Home Row Mods for macOS  
+;; CAGS Home Row Mods for macOS with fast typing detection + bilateral combinations
 ;; Left hand:  a=Ctrl, s=Option, d=Command, f=Shift
 ;; Right hand: j=Shift, k=Command, l=Option, ;=Ctrl
+;; Using uniform 160ms hold timeout for all keys
+;; Non-shift mods use bilateral (same-hand prevention), shift keys use regular tap-hold
 (defalias
-  ;; Left hand home row mods - SAME hand keys trigger early tap
-  a-ctrl (tap-hold-release-keys $tap-timeout $hold-timeout a lctl 
-           (q w e r t s d f g z x c v b caps lsft lctl lmet lalt))
-  s-opt  (tap-hold-release-keys $tap-timeout $hold-timeout s lalt 
-           (q w e r t a d f g z x c v b caps lsft lctl lmet lalt))
-  d-cmd  (tap-hold-release-keys $tap-timeout $hold-timeout d lmet 
-           (q w e r t a s f g z x c v b caps lsft lctl lmet lalt))
-  f-sft  (tap-hold-release-keys $tap-timeout $hold-timeout f lsft 
-           (q w e r t a s d g z x c v b caps lsft lctl lmet lalt))
-  
-  ;; Right hand home row mods - SAME hand keys trigger early tap  
-  j-sft  (tap-hold-release-keys $tap-timeout $hold-timeout j rsft 
-           (y u i o p [ ] \ h k l ; ' n m , . / rsft ralt rmet rctl))
-  k-cmd  (tap-hold-release-keys $tap-timeout $hold-timeout k rmet 
-           (y u i o p [ ] \ h j l ; ' n m , . / rsft ralt rmet rctl))
-  l-opt  (tap-hold-release-keys $tap-timeout $hold-timeout l ralt 
-           (y u i o p [ ] \ h j k ; ' n m , . / rsft ralt rmet rctl))
-  ;-ctrl (tap-hold-release-keys $tap-timeout $hold-timeout ; rctl 
-           (y u i o p [ ] \ h j k l ' n m , . / rsft ralt rmet rctl))
+  ;; Left hand home row mods (a/s/d use bilateral to prevent same-hand mods like "at")
+  a-ctrl (t! homerowmod-bilateral $tot $toh a lctl $left-hand-keys)
+  s-opt  (t! homerowmod-bilateral $tot $toh s lalt $left-hand-keys)
+  d-cmd  (t! homerowmod-bilateral $tot $toh d lmet $left-hand-keys)
+  f-sft  (t! homerowmod $tot $toh f lsft)
+
+  ;; Right hand home row mods (k/l/; use bilateral to prevent same-hand mods like "know")
+  j-sft  (t! homerowmod $tot $toh j rsft)
+  k-cmd  (t! homerowmod-bilateral $tot $toh k rmet $right-hand-keys)
+  l-opt  (t! homerowmod-bilateral $tot $toh l ralt $right-hand-keys)
+  ;-ctrl (t! homerowmod-bilateral $tot $toh ; rctl $right-hand-keys)
 )
 
 (deflayer base
   esc  brdn brup  _    _    _    _    _    _    _    mute vold volu
   grv  1    2    3    4    5    6    7    8    9    0    -    =    bspc
-  tab  q    w    e    r    t    y    u    i    o    p    [    ]    \
-  caps @a-ctrl @s-opt @d-cmd @f-sft g h @j-sft @k-cmd @l-opt @;-ctrl ' ret
-  lsft z    x    c    v    b    n    m    ,    .    /    rsft
-  lctl lmet lalt           spc            ralt rmet rctl
+  tab  (multi q @.tp) (multi w @.tp) (multi e @.tp) (multi r @.tp) (multi t @.tp) (multi y @.tp) (multi u @.tp) (multi i @.tp) (multi o @.tp) (multi p @.tp) [    ]    \
+  caps @a-ctrl @s-opt @d-cmd @f-sft (multi g @.tp) (multi h @.tp) @j-sft @k-cmd @l-opt @;-ctrl ' ret
+  lsft (multi z @.tp) (multi x @.tp) (multi c @.tp) (multi v @.tp) (multi b @.tp) (multi n @.tp) (multi m @.tp) ,    .    /    rsft
+  lctl lmet lalt           @.spc-typing            ralt rmet rctl
+)
+
+;; Typing layer - when fast typing is detected, disable home row mods
+(deflayer typing
+  _    _    _    _    _    _    _    _    _    _    _    _    _
+  _    _    _    _    _    _    _    _    _    _    _    _    _    _
+  _    q    w    e    r    t    y    u    i    o    p    _    _    _
+  _    a    s    d    f    g    h    j    k    l    ;    _    _
+  _    z    x    c    v    b    n    m    _    _    _    _
+  _    _    _              _              _    _    _
 )
