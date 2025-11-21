@@ -64,7 +64,9 @@
   (inhibit-startup-echo-area-message (user-login-name))
   :config
   (recentf-mode 1)
-  (savehist-mode 1))
+  (savehist-mode 1)
+  ;; Suppress elpaca core stale version warning
+  (add-to-list 'warning-suppress-types '(elpaca core stale)))
 
 (use-package no-littering
   ;; :wait is required to make sure this gets required before anything else
