@@ -127,6 +127,12 @@
   :config
   (setopt gptel-backend (gptel-make-anthropic "Claude" :stream t :key (k/make-op-reader "op://Private/Anthropic/credential"))))
 
+(use-package agent-shell
+  :ensure t
+  :custom
+  (agent-shell-file-completion-enabled t)
+  (agent-shell-preferred-agent-config (agent-shell-anthropic-make-claude-code-config)))
+
 (use-package activities
   :ensure t
   :config

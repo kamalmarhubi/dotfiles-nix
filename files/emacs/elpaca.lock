@@ -1,4 +1,16 @@
-((activities :source "elpaca-menu-lock-file" :recipe
+((acp :source "elpaca-menu-lock-file" :recipe
+      (:package "acp" :fetcher github :repo "xenodium/acp.el" :files
+		("*.el" "*.el.in" "dir" "*.info" "*.texi" "*.texinfo"
+		 "doc/dir" "doc/*.info" "doc/*.texi" "doc/*.texinfo"
+		 "lisp/*.el" "docs/dir" "docs/*.info" "docs/*.texi"
+		 "docs/*.texinfo"
+		 (:exclude ".dir-locals.el" "test.el" "tests.el"
+			   "*-test.el" "*-tests.el" "LICENSE"
+			   "README*" "*-pkg.el"))
+		:source "elpaca-menu-lock-file" :protocol https
+		:inherit t :depth treeless :ref
+		"3c6a39c09684145b82721b506b80fa857664258a"))
+ (activities :source "elpaca-menu-lock-file" :recipe
 	     (:package "activities" :repo
 		       ("https://github.com/alphapapa/activities.el.git"
 			. "activities")
@@ -6,6 +18,20 @@
 		       "elpaca-menu-lock-file" :protocol https
 		       :inherit t :depth treeless :ref
 		       "d735c0f2c714ac98248ee17d765bfa8310201d53"))
+ (agent-shell :source "elpaca-menu-lock-file" :recipe
+	      (:package "agent-shell" :fetcher github :repo
+			"xenodium/agent-shell" :files
+			("*.el" "*.el.in" "dir" "*.info" "*.texi"
+			 "*.texinfo" "doc/dir" "doc/*.info"
+			 "doc/*.texi" "doc/*.texinfo" "lisp/*.el"
+			 "docs/dir" "docs/*.info" "docs/*.texi"
+			 "docs/*.texinfo"
+			 (:exclude ".dir-locals.el" "test.el"
+				   "tests.el" "*-test.el" "*-tests.el"
+				   "LICENSE" "README*" "*-pkg.el"))
+			:source "elpaca-menu-lock-file" :protocol
+			https :inherit t :depth treeless :ref
+			"086d316836687f3c3e59201e8a2e213fe6951550"))
  (consult :source "elpaca-menu-lock-file" :recipe
 	  (:package "consult" :repo "minad/consult" :fetcher github
 		    :files
@@ -146,6 +172,20 @@
 		    "elpaca-menu-lock-file" :protocol https :inherit t
 		    :depth treeless :ref
 		    "bf9a52b8608f00a86cdf5b82207fc7bbc747566c"))
+ (shell-maker :source "elpaca-menu-lock-file" :recipe
+	      (:package "shell-maker" :fetcher github :repo
+			"xenodium/shell-maker" :files
+			("*.el" "*.el.in" "dir" "*.info" "*.texi"
+			 "*.texinfo" "doc/dir" "doc/*.info"
+			 "doc/*.texi" "doc/*.texinfo" "lisp/*.el"
+			 "docs/dir" "docs/*.info" "docs/*.texi"
+			 "docs/*.texinfo"
+			 (:exclude ".dir-locals.el" "test.el"
+				   "tests.el" "*-test.el" "*-tests.el"
+				   "LICENSE" "README*" "*-pkg.el"))
+			:source "elpaca-menu-lock-file" :protocol
+			https :inherit t :depth treeless :ref
+			"a83134afe5404b4c82e871389ab4ab0a01104d53"))
  (transient :source "elpaca-menu-lock-file" :recipe
 	    (:package "transient" :fetcher github :repo
 		      "magit/transient" :files
