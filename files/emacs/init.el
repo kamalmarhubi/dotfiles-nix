@@ -131,7 +131,42 @@
   :ensure t
   :custom
   (agent-shell-file-completion-enabled t)
-  (agent-shell-preferred-agent-config (agent-shell-anthropic-make-claude-code-config)))
+  (agent-shell-preferred-agent-config (agent-shell-anthropic-make-claude-code-config))
+  (agent-shell-show-welcome-message nil)
+  (agent-shell-display-action '((display-buffer-in-side-window)
+                                 (side . right)
+                                 (slot . 0)
+                                 (window-width . 0.4)
+                                 (dedicated . t)
+                                 (window-parameters . ((no-delete-other-windows . t)))))
+  :config
+  (defun k/agent-shell-bookmark-make-record ()
+    (unless (derived-mode-p 'agent-shell-mode)
+      (error "Not in an agent shell buffer"))
+    (let* ((agent-config (map-elt (agent-shell--state) :agent-config))
+           (mode-line-name (map-elt agent-config :mode-line-name)))
+      `(,(buffer-name)
+        (handler . k/agent-shell-bookmark-jump)
+        (agent-mode-line-name . ,mode-line-name)
+        (working-directory . ,(agent-shell-cwd)))))
+
+  (defun k/agent-shell-bookmark-jump (bookmark)
+    (let* ((mode-line-name (bookmark-prop-get bookmark 'agent-mode-line-name))
+           (working-directory (bookmark-prop-get bookmark 'working-directory))
+           ;; Find config by mode-line-name, fall back to preferred config
+           (agent-config (or (seq-find (lambda (config)
+                                         (equal (map-elt config :mode-line-name) mode-line-name))
+                                       agent-shell-agent-configs)
+                             agent-shell-preferred-agent-config))
+           (buffer nil))
+      (let ((default-directory working-directory))
+        (setq buffer (agent-shell-start :config agent-config)))
+      (switch-to-buffer buffer)
+      buffer))
+
+  (add-hook 'agent-shell-mode-hook
+            (lambda ()
+              (setq-local bookmark-make-record-function #'k/agent-shell-bookmark-make-record))))
 
 (use-package activities
   :ensure t
