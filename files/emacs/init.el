@@ -66,7 +66,8 @@
   (recentf-mode 1)
   (savehist-mode 1)
   ;; Suppress elpaca core stale version warning
-  (add-to-list 'warning-suppress-types '(elpaca core stale)))
+  (add-to-list 'warning-suppress-types '(elpaca core stale))
+  (load-theme 'modus-operandi-tinted t))
 
 (use-package no-littering
   ;; :wait is required to make sure this gets required before anything else
