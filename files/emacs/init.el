@@ -55,6 +55,17 @@
   (defun k/elpaca-write-lock-file ()
     (interactive)
     (elpaca-write-lock-file elpaca-lock-file))
+  (defun k/elpaca-unpin-and-update (id)
+    "Remove pin from package ID's recipe and update it."
+    (interactive (list (elpaca--read-queued "Unpin and update package: ")))
+    (let ((e (or (elpaca-get id) (user-error "Package %S is not queued" id))))
+      ;; Remove :ref, :pin, and :tag from the recipe
+      (setf (elpaca<-recipe e)
+            (cl-loop for (key val) on (elpaca<-recipe e) by #'cddr
+                     unless (memq key '(:ref :pin :tag))
+                     append (list key val)))
+      ;; Now update the package
+      (elpaca-update id t)))
   :hook (elpaca-post-queue . k/elpaca-write-lock-file))
 
 (use-package emacs
