@@ -65,6 +65,7 @@
   :config
   (recentf-mode 1)
   (savehist-mode 1)
+  (repeat-mode 1)
   ;; Suppress elpaca core stale version warning
   (add-to-list 'warning-suppress-types '(elpaca core stale))
   (load-theme 'modus-operandi-tinted t))
