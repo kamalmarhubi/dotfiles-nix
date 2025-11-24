@@ -253,6 +253,27 @@
 		:source "elpaca-menu-lock-file" :protocol https
 		:inherit t :ref
 		"7eafc194d2c3a42b84a319847f66ec6bdfea183c"))
+ (org-contrib :source "elpaca-menu-lock-file" :recipe
+	      (:package "org-contrib" :host github :repo
+			"emacsmirror/org-contrib" :files (:defaults)
+			:source "elpaca-menu-lock-file" :protocol
+			https :inherit t :depth treeless :ref
+			"90e1d6bd6288615233dae273f0525a43a9d8779d"))
+ (org-hide-drawers :source "elpaca-menu-lock-file" :recipe
+		   (:package "org-hide-drawers" :fetcher github :repo
+			     "krisbalintona/org-hide-drawers" :files
+			     ("*.el" "*.el.in" "dir" "*.info" "*.texi"
+			      "*.texinfo" "doc/dir" "doc/*.info"
+			      "doc/*.texi" "doc/*.texinfo" "lisp/*.el"
+			      "docs/dir" "docs/*.info" "docs/*.texi"
+			      "docs/*.texinfo"
+			      (:exclude ".dir-locals.el" "test.el"
+					"tests.el" "*-test.el"
+					"*-tests.el" "LICENSE"
+					"README*" "*-pkg.el"))
+			     :source "MELPA" :protocol https :inherit
+			     t :depth treeless :ref
+			     "15c8fa7fe5b15e09a751699ce780dde7edf7b5bd"))
  (org-modern :source "elpaca-menu-lock-file" :recipe
 	     (:package "org-modern" :repo "minad/org-modern" :fetcher
 		       github :files

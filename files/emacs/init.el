@@ -120,6 +120,20 @@
   :hook ((org-mode . org-modern-mode)
          (org-agenda-finalize . org-modern-agenda)))
 
+(use-package org-contrib
+  :ensure t
+  :after org
+  :custom
+  (org-expiry-inactive-timestamps t)
+  :config
+  (require 'org-expiry)
+  (org-expiry-insinuate))
+
+(use-package org-hide-drawers
+  :ensure t
+  :after org
+  :hook (org-mode . org-hide-drawers-mode))
+
 (use-package gptel
   :ensure t
 
