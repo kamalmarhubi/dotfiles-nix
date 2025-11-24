@@ -216,3 +216,18 @@
   (corfu-auto t)
   :config
   (global-corfu-mode 1))
+
+(use-package magit
+  :ensure t
+  :after transient
+  :bind ("C-x g" . magit-status)
+  :custom
+  (magit-define-global-key-bindings 'recommended)
+  (magit-refresh-status-buffer nil))
+
+(use-package git-modes
+  :ensure t)
+
+(use-package forge
+  :ensure t
+  :after magit)
