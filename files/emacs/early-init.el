@@ -24,3 +24,7 @@
 (push '(menu-bar-lines . 0) default-frame-alist)
 (setq tool-bar-mode nil
       menu-bar-mode nil)
+
+;; Start with full screen width
+;; TODO: Probably want to make this depend on the width of the screen?
+(push '(fullscreen . maximized) default-frame-alist)

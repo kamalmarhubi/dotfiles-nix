@@ -197,3 +197,10 @@
 ;;   https://github.com/minad/consult/blob/main/README.org#use-package-example
 (use-package consult
   :ensure t)
+
+(use-package corfu
+  :ensure t
+  :custom
+  (corfu-auto t)
+  :config
+  (global-corfu-mode 1))
