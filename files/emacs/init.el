@@ -245,3 +245,6 @@
 (use-package forge
   :ensure t
   :after magit)
+
+(use-package terraform-mode
+  :ensure t)

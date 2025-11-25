@@ -311,6 +311,22 @@
 			:source "elpaca-menu-lock-file" :protocol
 			https :inherit t :depth treeless :ref
 			"a83134afe5404b4c82e871389ab4ab0a01104d53"))
+ (terraform-mode :source "elpaca-menu-lock-file" :recipe
+		 (:package "terraform-mode" :repo
+			   "hcl-emacs/terraform-mode" :fetcher github
+			   :files
+			   ("*.el" "*.el.in" "dir" "*.info" "*.texi"
+			    "*.texinfo" "doc/dir" "doc/*.info"
+			    "doc/*.texi" "doc/*.texinfo" "lisp/*.el"
+			    "docs/dir" "docs/*.info" "docs/*.texi"
+			    "docs/*.texinfo"
+			    (:exclude ".dir-locals.el" "test.el"
+				      "tests.el" "*-test.el"
+				      "*-tests.el" "LICENSE" "README*"
+				      "*-pkg.el"))
+			   :source "MELPA" :protocol https :inherit t
+			   :depth treeless :ref
+			   "01635df3625c0cec2bb4613a6f920b8569d41009"))
  (transient :source "elpaca-menu-lock-file" :recipe
 	    (:package "transient" :fetcher github :repo
 		      "magit/transient" :files
