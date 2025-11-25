@@ -114,7 +114,9 @@
 
 ;; Need 9.7+ for gptel's org-mode-branching-context to work.
 (use-package org
-  :ensure t)
+  :ensure t
+  :custom
+  (org-todo-keywords '((sequence "TODO(t)" "PROG(p)" "|" "DONE(d)" "CNCL(c)"))))
 
 (use-package org-modern
   :ensure t
