@@ -227,7 +227,7 @@
 (use-package corfu
   :ensure t
   :custom
-  (corfu-auto t)
+  (corfu-auto nil)
   :config
   (global-corfu-mode 1))
 
