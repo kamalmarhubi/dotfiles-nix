@@ -73,6 +73,7 @@
   (blink-cursor-mode nil)
   (inhibit-startup-screen t)
   (inhibit-startup-echo-area-message (user-login-name))
+  (tab-bar-new-tab-choice "*scratch*")
   :config
   (recentf-mode 1)
   (savehist-mode 1)
