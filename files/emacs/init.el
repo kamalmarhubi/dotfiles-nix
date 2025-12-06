@@ -227,6 +227,21 @@
 (use-package consult
   :ensure t)
 
+(use-package embark
+  :ensure t
+  :bind
+  (("C-." . embark-act)         ;; pick some comfortable binding
+  ("C-;" . embark-dwim)        ;; good alternative: M-.
+  ("C->" . embark-act-all)
+  ("C-h B" . embark-bindings)) ;; alternative for `describe-bindings'
+  :init
+  (setq prefix-help-command #'embark-prefix-help-command))
+
+(use-package embark-consult
+  :ensure t ; only need to install it, embark loads it after consult if found
+  :hook
+  (embark-collect-mode . consult-preview-at-point-mode))
+
 (use-package corfu
   :ensure t
   :custom

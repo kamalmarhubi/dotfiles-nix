@@ -101,6 +101,19 @@
 		    "elpaca-menu-lock-file" :protocol https :inherit t
 		    :depth treeless :ref
 		    "e1908de2cf2c7b77798ef6645d514dded1d7f8a4"))
+ (embark :source "elpaca-menu-lock-file" :recipe
+	 (:package "embark" :repo "oantolin/embark" :fetcher github
+		   :files ("embark.el" "embark-org.el" "embark.texi")
+		   :source "MELPA" :protocol https :inherit t :depth
+		   treeless :ref
+		   "7b3b2fa239c34c2e304eab4367a4f5924c047e2b"))
+ (embark-consult :source "elpaca-menu-lock-file" :recipe
+		 (:package "embark-consult" :repo "oantolin/embark"
+			   :fetcher github :files
+			   ("embark-consult.el") :source "MELPA"
+			   :protocol https :inherit t :depth treeless
+			   :ref
+			   "7b3b2fa239c34c2e304eab4367a4f5924c047e2b"))
  (exec-path-from-shell :source "elpaca-menu-lock-file" :recipe
 		       (:package "exec-path-from-shell" :fetcher
 				 github :repo
