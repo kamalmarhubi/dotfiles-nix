@@ -112,6 +112,14 @@
 (use-package transient
   :ensure t)
 
+(use-package with-editor
+  :config
+  (shell-command-with-editor-mode t)
+  (add-hook 'shell-mode-hook  'with-editor-export-editor)
+  (add-hook 'eshell-mode-hook 'with-editor-export-editor)
+  (add-hook 'term-exec-hook   'with-editor-export-editor)
+  (add-hook 'vterm-mode-hook  'with-editor-export-editor))
+
 ;; Need 9.7+ for gptel's org-mode-branching-context to work.
 (use-package org
   :ensure t
