@@ -55,6 +55,16 @@
   (defun k/elpaca-write-lock-file ()
     (interactive)
     (elpaca-write-lock-file elpaca-lock-file))
+  (defun k/elpaca--mark-init-if-from-init-file (order &optional queue)
+    "Mark ORDER as init package when eval'd from a buffer visiting
+user-init-file. This allows packages added to init.el to be included in
+the lock file even when eval'd interactively rather than during Emacs
+startup."
+    (when-let* ((e (elpaca-get (elpaca--first order)))
+                (file (buffer-file-name))
+                ((file-equal-p file user-init-file)))
+      (setf (elpaca<-init e) t)))
+  (advice-add 'elpaca--queue :after #'k/elpaca--mark-init-if-from-init-file)
   (defun k/elpaca-unpin-and-update (id)
     "Remove pin from package ID's recipe and update it."
     (interactive (list (elpaca--read-queued "Unpin and update package: ")))
