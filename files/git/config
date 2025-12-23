@@ -21,6 +21,7 @@
 	autostash = true
 	abbreviateCommands = true
 	rescheduleFailedExec = true
+	updateRefs = true
 
 [diff]
 	mnemonicPrefix = true
