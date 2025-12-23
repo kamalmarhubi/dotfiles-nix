@@ -301,6 +301,23 @@
 		       :source "elpaca-menu-lock-file" :protocol https
 		       :inherit t :depth treeless :ref
 		       "6d375b9dfb8b0fb9df2c342889f94dcb653437dc"))
+ (org-reverse-datetree :source "elpaca-menu-lock-file" :recipe
+		       (:package "org-reverse-datetree" :fetcher
+				 github :repo
+				 "akirak/org-reverse-datetree" :files
+				 ("*.el" "*.el.in" "dir" "*.info"
+				  "*.texi" "*.texinfo" "doc/dir"
+				  "doc/*.info" "doc/*.texi"
+				  "doc/*.texinfo" "lisp/*.el"
+				  "docs/dir" "docs/*.info"
+				  "docs/*.texi" "docs/*.texinfo"
+				  (:exclude ".dir-locals.el" "test.el"
+					    "tests.el" "*-test.el"
+					    "*-tests.el" "LICENSE"
+					    "README*" "*-pkg.el"))
+				 :source "MELPA" :protocol https
+				 :inherit t :depth treeless :ref
+				 "e5a84b19976ad3a2e1d85a69b9a8e43998183c51"))
  (persist :source "elpaca-menu-lock-file" :recipe
 	  (:package "persist" :repo
 		    ("https://github.com/emacsmirror/gnu_elpa"

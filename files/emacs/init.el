@@ -145,6 +145,25 @@
   :after org
   :hook (org-mode . org-hide-drawers-mode))
 
+(use-package org-reverse-datetree
+  :ensure t
+  :after org
+  :init
+  (setq-default org-reverse-datetree-level-formats '("%G-W%V" "[%Y-%m-%d %a]")))
+
+(use-package org-capture
+  :ensure nil
+  :after org
+  :custom
+  (org-capture-templates
+   ;; TODO: make this system context dependent somehow. Personal systems won't have wave.org.
+   '(("t" "TODO" entry
+      (file+function "~/wave/plan/wave.org"
+                     (lambda () (org-reverse-datetree-goto-date-in-file)))
+      "* TODO %?"
+      :empty-lines 1
+      :hook org-expiry-insert-created))))
+
 (use-package gptel
   :ensure t
 
