@@ -9,7 +9,7 @@
 			   "README*" "*-pkg.el"))
 		:source "elpaca-menu-lock-file" :protocol https
 		:inherit t :depth treeless :ref
-		"3c6a39c09684145b82721b506b80fa857664258a"))
+		"7b67facc657a7388a53ea8bba5d6e7eba20fa3e0"))
  (activities :source "elpaca-menu-lock-file" :recipe
 	     (:package "activities" :repo
 		       ("https://github.com/alphapapa/activities.el.git"
@@ -31,7 +31,7 @@
 				   "LICENSE" "README*" "*-pkg.el"))
 			:source "elpaca-menu-lock-file" :protocol
 			https :inherit t :depth treeless :ref
-			"9d4ec760f475aed2a141bcd0293587df150ac0b7"))
+			"2d41df60b7571aa74fdac26cbf6fdadfbbed5d8b"))
  (closql :source "elpaca-menu-lock-file" :recipe
 	 (:package "closql" :fetcher github :repo "magit/closql"
 		   :files
@@ -342,7 +342,7 @@
 				   "LICENSE" "README*" "*-pkg.el"))
 			:source "elpaca-menu-lock-file" :protocol
 			https :inherit t :depth treeless :ref
-			"a83134afe5404b4c82e871389ab4ab0a01104d53"))
+			"eab26a7af450d3f7e83b5a61ef2b7b347700b640"))
  (terraform-mode :source "elpaca-menu-lock-file" :recipe
 		 (:package "terraform-mode" :repo
 			   "hcl-emacs/terraform-mode" :fetcher github
