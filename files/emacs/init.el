@@ -123,8 +123,9 @@ startup."
   :ensure t)
 
 (use-package with-editor
+  :ensure t
   :config
-  (shell-command-with-editor-mode t)
+  (shell-command-with-editor-mode 1)
   (add-hook 'shell-mode-hook  'with-editor-export-editor)
   (add-hook 'eshell-mode-hook 'with-editor-export-editor)
   (add-hook 'term-exec-hook   'with-editor-export-editor)
