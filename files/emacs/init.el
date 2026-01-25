@@ -169,7 +169,7 @@ startup."
   :custom
   (org-capture-templates
    ;; TODO: make this system context dependent somehow. Personal systems won't have wave.org.
-   '(("t" "TODO" entry
+   '(("t" "todo" entry
       (file+function "~/wave/plan/wave.org"
                      (lambda () (org-reverse-datetree-goto-date-in-file)))
       "* TODO %?"
