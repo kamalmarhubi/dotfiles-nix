@@ -175,6 +175,60 @@ startup."
                      (lambda () (org-reverse-datetree-goto-date-in-file)))
       "* TODO %?"
       :empty-lines 1
+      :hook org-expiry-insert-created)
+     ("l" "log" entry
+      (file+function "~/wave/plan/wave.org"
+                     (lambda () (org-reverse-datetree-goto-date-in-file)))
+      "* DONE %?"
+      :empty-lines 1
+      :hook org-expiry-insert-created)
+     ("n" "note" entry
+      (file+function "~/wave/plan/wave.org"
+                     (lambda () (org-reverse-datetree-goto-date-in-file)))
+      "* %?"
+      :empty-lines 1
+      :hook org-expiry-insert-created)
+     ("s" "start of day" entry
+      (file+function "~/wave/plan/wave.org"
+                     (lambda () (org-reverse-datetree-goto-date-in-file)))
+      "* TODO Start of day checklist
+- [ ] What's my main focus today?
+  %?
+- [ ] Anything to prep or flag for standup?
+- [ ] Any code reviews in my queue?
+- [ ] Any follow-ups or responses I owe?"
+      :empty-lines 1
+      :hook org-expiry-insert-created)
+     ("e" "end of day" entry
+      (file+function "~/wave/plan/wave.org"
+                     (lambda () (org-reverse-datetree-goto-date-in-file)))
+      "* TODO End of day checklist
+- [ ] Tickets updated with current state + next step?
+- [ ] Did I do work that isn't captured? → log it
+- [ ] Anything blocked or at risk? → flag before logging off
+- [ ] Code reviews: caught up or falling behind?
+- [ ] Did I work on my main focus, or get pulled elsewhere? → if elsewhere, is that visible?"
+      :empty-lines 1
+      :hook org-expiry-insert-created)
+     ("S" "start of week" entry
+      (file+function "~/wave/plan/wave.org"
+                     (lambda () (org-reverse-datetree-goto-date-in-file)))
+      "* TODO Start of week checklist
+- [ ] What's committed this week?
+- [ ] Is it broken down into tickets before I start?
+- [ ] WIP check: how many things am I juggling? (aim for 2-3)
+- [ ] Any schedule or availability changes to communicate?"
+      :empty-lines 1
+      :hook org-expiry-insert-created)
+     ("E" "end of week" entry
+      (file+function "~/wave/plan/wave.org"
+                     (lambda () (org-reverse-datetree-goto-date-in-file)))
+      "* TODO End of week checklist
+- [ ] What did I actually ship/complete?
+- [ ] Anything I said I'd do that didn't happen? → flagged + why?
+- [ ] How did code reviews go this week?
+- [ ] Visibility gut-check: would my manager know what I did without asking?"
+      :empty-lines 1
       :hook org-expiry-insert-created))))
 
 (use-package gptel
