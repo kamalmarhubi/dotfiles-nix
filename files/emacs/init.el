@@ -166,6 +166,7 @@ startup."
 (use-package org-capture
   :ensure nil
   :after org
+  :bind ("C-c c" . org-capture)
   :custom
   (org-capture-templates
    ;; TODO: make this system context dependent somehow. Personal systems won't have wave.org.
