@@ -135,7 +135,8 @@ startup."
 (use-package org
   :ensure t
   :custom
-  (org-todo-keywords '((sequence "TODO(t)" "PROG(p)" "|" "DONE(d)" "CNCL(c)"))))
+  (org-todo-keywords '((sequence "TODO(t)" "PROG(p)" "|" "DONE(d)" "CNCL(c)")))
+  (org-agenda-files '("~/wave/plan/wave.org")))
 
 (use-package org-modern
   :ensure t
