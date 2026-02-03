@@ -5,7 +5,7 @@
   ...
 }: {
   home.packages = with pkgs; [
-    nur.repos.gigamonster256.ghostty-darwin
+    nur.repos.AusCyber.ghostty-bin
     _1password-cli
     atool
     bun

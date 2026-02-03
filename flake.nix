@@ -2,28 +2,23 @@
   description = "Kamal pretends to use nix?";
 
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-25.05-darwin";
+    nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-25.11-darwin";
 
     # Temporarily use unmerged PR upgrading claude-code past 1.0.111 for token
     # count output while processing.
     unstable.url = "github:nixos/nixpkgs/nixpkgs-unstable";
     master.url = "github:nixos/nixpkgs/master";
 
-    # Catch the bump to 1.10 which uses karabiner-dk 6:
-    #   https://github.com/NixOS/nixpkgs/pull/461152
-    # TODO(25.11): At some point this will be available in unstable.
-    nixpkgs-kanata-pr.url = "github:nixos/nixpkgs/pull/461152/head";
     nur = {
       url = "github:nix-community/NUR";
       inputs.nixpkgs.follows = "unstable";
     };
     home-manager = {
-      # TODO(25.11): Switch back from master; change nixpkgs.follows back to nixpkgs.
-      url = "github:nix-community/home-manager";
-      inputs.nixpkgs.follows = "unstable";
+      url = "github:nix-community/home-manager/release-25.11";
+      inputs.nixpkgs.follows = "nixpkgs";
     };
     nix-darwin = {
-      url = "github:nix-darwin/nix-darwin/nix-darwin-25.05";
+      url = "github:nix-darwin/nix-darwin/nix-darwin-25.11";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     # Hack because I just need neovim to work.
@@ -51,7 +46,7 @@
     unstableOverlayModule = mkOverlayModule (
       final: prev: {
         unstable = import unstable {
-          system = prev.system;
+          system = prev.stdenv.hostPlatform.system;
           config = prev.config;
         };
       }
@@ -59,7 +54,7 @@
     masterOverlayModule = mkOverlayModule (
       final: prev: {
         master = import master {
-          system = prev.system;
+          system = prev.stdenv.hostPlatform.system;
           config = prev.config;
         };
       }
@@ -77,7 +72,7 @@
               let
                 nixpkgsInput = packageInputMap.${packageName};
                 pkgs = import nixpkgsInput {
-                  system = prev.system;
+                  system = prev.stdenv.hostPlatform.system;
                   config = prev.config;
                 };
               in
@@ -110,7 +105,7 @@
       masterOverlayModule
       myPackagesOverlayModule
       (mkPackageReplacementOverlayModule (with inputs; {
-        kanata = nixpkgs-kanata-pr;
+        kanata = unstable;
       }))
     ];
 

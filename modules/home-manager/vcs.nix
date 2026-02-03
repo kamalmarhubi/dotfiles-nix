@@ -16,8 +16,8 @@
       git-absorb
       git-lfs
       git-branchless
-      # TODO(25.11): Consider going back to stable?
-      unstable.jujutsu # 0.34 is latest; stable nixpkgs-25.05-darwin is on 0.29
+      # jj moves too fast for the semi-annual nixpkgs releases.
+      unstable.jujutsu
       # git-filter-repo
       lazygit
     ];

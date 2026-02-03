@@ -11,7 +11,7 @@ in
 {
   options.services.karabiner-driverkit-virtualhiddevice = {
     enable = mkEnableOption "Karabiner DriverKit Virtual HID Device";
-    package = mkPackageOption pkgs "karabiner-driverkit-virtualhiddevice" { };
+    package = mkPackageOption pkgs "karabiner-dk" { };
   };
 
   config = mkIf cfg.enable {

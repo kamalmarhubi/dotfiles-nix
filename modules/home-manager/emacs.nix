@@ -5,8 +5,7 @@
 }: let
   emacs =
     if pkgs.stdenv.isDarwin
-    # TODO(25.11): Switch back to stable once it's released.
-    then pkgs.unstable.emacs-macport
+    then pkgs.emacs-macport
     else pkgs.emacs;
 in {
   home.packages = [
