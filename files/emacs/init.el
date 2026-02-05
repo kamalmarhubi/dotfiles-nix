@@ -76,7 +76,9 @@ startup."
                      append (list key val)))
       ;; Now update the package
       (elpaca-update id t)))
-  :hook (elpaca-post-queue . k/elpaca-write-lock-file))
+  :hook (elpaca-after-init . (lambda ()
+                               (k/elpaca-write-lock-file)
+                               (add-hook 'elpaca-post-queue-hook #'k/elpaca-write-lock-file))))
 
 (use-package emacs
   :custom
