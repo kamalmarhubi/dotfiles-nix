@@ -256,39 +256,40 @@ startup."
 (use-package agent-shell
   :ensure t
   :custom
-  (agent-shell-file-completion-enabled t)
-  (agent-shell-preferred-agent-config (agent-shell-anthropic-make-claude-code-config))
+  (agent-shell-preferred-agent-config 'claude-code)
   (agent-shell-show-welcome-message nil)
   (agent-shell-display-action '((display-buffer-in-side-window)
-                                 (side . right)
-                                 (slot . 0)
-                                 (window-width . 0.4)
-                                 (dedicated . t)
-                                 (window-parameters . ((no-delete-other-windows . t)))))
+                                (side . right)
+                                (slot . 0)
+                                (window-width . 0.4)
+                                (dedicated . t)
+                                (window-parameters . ((no-delete-other-windows . t)))))
   :config
   (defun k/agent-shell-bookmark-make-record ()
     (unless (derived-mode-p 'agent-shell-mode)
       (error "Not in an agent shell buffer"))
     (let* ((agent-config (map-elt (agent-shell--state) :agent-config))
-           (mode-line-name (map-elt agent-config :mode-line-name)))
+           (identifier (map-elt agent-config :identifier)))
       `(,(buffer-name)
         (handler . k/agent-shell-bookmark-jump)
-        (agent-mode-line-name . ,mode-line-name)
+        (agent-identifier . ,identifier)
         (working-directory . ,(agent-shell-cwd)))))
 
   (defun k/agent-shell-bookmark-jump (bookmark)
-    (let* ((mode-line-name (bookmark-prop-get bookmark 'agent-mode-line-name))
+    (let* ((identifier (bookmark-prop-get bookmark 'agent-identifier))
+           (mode-line-name (bookmark-prop-get bookmark 'agent-mode-line-name))
            (working-directory (bookmark-prop-get bookmark 'working-directory))
-           ;; Find config by mode-line-name, fall back to preferred config
-           (agent-config (or (seq-find (lambda (config)
-                                         (equal (map-elt config :mode-line-name) mode-line-name))
-                                       agent-shell-agent-configs)
-                             agent-shell-preferred-agent-config))
-           (buffer nil))
+           ;; Find config by identifier or mode-line-name (for backwards compatibility), falling
+           ;; back to preferred config.
+           (agent-config (or (when identifier
+                               (seq-find (lambda (c) (eq (map-elt c :identifier) identifier))
+					 agent-shell-agent-configs))
+                             (when mode-line-name
+                               (seq-find (lambda (c) (equal (map-elt c :mode-line-name) mode-line-name))
+					 agent-shell-agent-configs))
+			     agent-shell-preferred-agent-config)))
       (let ((default-directory working-directory))
-        (setq buffer (agent-shell-start :config agent-config)))
-      (switch-to-buffer buffer)
-      buffer))
+        (agent-shell-start :config agent-config))))
 
   (add-hook 'agent-shell-mode-hook
             (lambda ()
