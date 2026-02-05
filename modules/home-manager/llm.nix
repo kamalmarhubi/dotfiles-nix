@@ -2,12 +2,12 @@
   pkgs,
   ...
 }: {
-  home.packages = with pkgs; [
-    unstable.claude-code
-    master.claude-code-acp
+  home.packages = with pkgs.llm-agents; [
+    claude-code
+    claude-code-acp
   ];
 
-  nixpkgs.allowUnfreePackages = with pkgs; [
-    unstable.claude-code
+  nixpkgs.allowUnfreePackages = with pkgs.llm-agents; [
+    claude-code
   ];
 }

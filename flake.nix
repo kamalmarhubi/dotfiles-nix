@@ -8,6 +8,10 @@
     # count output while processing.
     unstable.url = "github:nixos/nixpkgs/nixpkgs-unstable";
     master.url = "github:nixos/nixpkgs/master";
+    llm-agents = {
+      url = "github:numtide/llm-agents.nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
 
     nur = {
       url = "github:nix-community/NUR";
@@ -38,6 +42,7 @@
     home-manager,
     nix-darwin,
     nur,
+    llm-agents,
     ...
   } @ inputs: let
     mkOverlayModule = overlay: {
@@ -107,6 +112,8 @@
       (mkPackageReplacementOverlayModule (with inputs; {
         kanata = unstable;
       }))
+      # For more up-to-date claude-code{-acp} &c than from nixpkgs.
+      {nixpkgs.overlays = [llm-agents.overlays.default];}
     ];
 
     # Common modules used by both darwin and standalone home-manager configs
