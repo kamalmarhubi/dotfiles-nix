@@ -205,6 +205,7 @@ startup."
       (file+function "~/wave/plan/wave.org"
                      (lambda () (org-reverse-datetree-goto-date-in-file)))
       "* TODO End of day checklist
+- [ ] fire and forget?
 - [ ] Tickets updated with current state + next step?
 - [ ] Did I do work that isn't captured? → log it
 - [ ] Anything blocked or at risk? → flag before logging off
