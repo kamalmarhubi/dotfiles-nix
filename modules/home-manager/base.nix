@@ -18,6 +18,11 @@
     jdk
     kanata
     magic-wormhole
+    (pkgs.runCommand "moreutils-selected" {} ''
+      mkdir -p $out/bin
+      ln -s ${moreutils}/bin/vipe $out/bin/
+      ln -s ${moreutils}/bin/sponge $out/bin/
+    '')
     mtr
     nushell
     pipx
