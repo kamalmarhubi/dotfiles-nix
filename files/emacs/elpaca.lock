@@ -78,6 +78,12 @@
 		  :source "elpaca-menu-lock-file" :protocol https
 		  :inherit t :depth treeless :ref
 		  "9d5fc8f4898cb6d89b17547b9ac0781f91713042"))
+ (dash :source "elpaca-menu-lock-file" :recipe
+       (:package "dash" :fetcher github :repo "magnars/dash.el" :files
+		 ("dash.el" "dash.texi") :source
+		 "elpaca-menu-lock-file" :protocol https :inherit t
+		 :depth treeless :ref
+		 "fb443e7a6e660ba849cafcd01021d9aac3ac6764"))
  (elpaca :source
    "elpaca-menu-lock-file" :recipe
    (:source nil :protocol https :inherit ignore :depth treeless :repo
@@ -93,9 +99,8 @@
 			       :main
 			       "extensions/elpaca-use-package.el"
 			       :build (:not elpaca--compile-info)
-			       :source "elpaca-menu-lock-file"
-			       :protocol https :inherit t :depth
-			       treeless :ref
+			       :source "Elpaca extensions" :protocol
+			       https :inherit t :depth treeless :ref
 			       "b5ef5f19ac1224853234c9acdac0ec9ea1c440a1"))
  (emacsql :source "elpaca-menu-lock-file" :recipe
 	  (:package "emacsql" :fetcher github :repo "magit/emacsql"
@@ -106,15 +111,15 @@
  (embark :source "elpaca-menu-lock-file" :recipe
 	 (:package "embark" :repo "oantolin/embark" :fetcher github
 		   :files ("embark.el" "embark-org.el" "embark.texi")
-		   :source "MELPA" :protocol https :inherit t :depth
-		   treeless :ref
+		   :source "elpaca-menu-lock-file" :protocol https
+		   :inherit t :depth treeless :ref
 		   "7b3b2fa239c34c2e304eab4367a4f5924c047e2b"))
  (embark-consult :source "elpaca-menu-lock-file" :recipe
 		 (:package "embark-consult" :repo "oantolin/embark"
 			   :fetcher github :files
-			   ("embark-consult.el") :source "MELPA"
-			   :protocol https :inherit t :depth treeless
-			   :ref
+			   ("embark-consult.el") :source
+			   "elpaca-menu-lock-file" :protocol https
+			   :inherit t :depth treeless :ref
 			   "7b3b2fa239c34c2e304eab4367a4f5924c047e2b"))
  (exec-path-from-shell :source "elpaca-menu-lock-file" :recipe
 		       (:package "exec-path-from-shell" :fetcher
@@ -175,6 +180,19 @@
 		  :source "elpaca-menu-lock-file" :protocol https
 		  :inherit t :depth treeless :ref
 		  "7e103f3d03ccd40e7272b842dd462b27cb5a8da5"))
+ (hcl-mode :source "elpaca-menu-lock-file" :recipe
+	   (:package "hcl-mode" :repo "hcl-emacs/hcl-mode" :fetcher
+		     github :files
+		     ("*.el" "*.el.in" "dir" "*.info" "*.texi"
+		      "*.texinfo" "doc/dir" "doc/*.info" "doc/*.texi"
+		      "doc/*.texinfo" "lisp/*.el" "docs/dir"
+		      "docs/*.info" "docs/*.texi" "docs/*.texinfo"
+		      (:exclude ".dir-locals.el" "test.el" "tests.el"
+				"*-test.el" "*-tests.el" "LICENSE"
+				"README*" "*-pkg.el"))
+		     :source "elpaca-menu-lock-file" :protocol https
+		     :inherit t :depth treeless :ref
+		     "1da895ed75d28d9f87cbf9b74f075d90ba31c0ed"))
  (llama :source "elpaca-menu-lock-file" :recipe
 	(:package "llama" :fetcher github :repo "tarsius/llama" :files
 		  ("llama.el" ".dir-locals.el") :source
@@ -317,8 +335,9 @@
 					    "tests.el" "*-test.el"
 					    "*-tests.el" "LICENSE"
 					    "README*" "*-pkg.el"))
-				 :source "MELPA" :protocol https
-				 :inherit t :depth treeless :ref
+				 :source "elpaca-menu-lock-file"
+				 :protocol https :inherit t :depth
+				 treeless :ref
 				 "e5a84b19976ad3a2e1d85a69b9a8e43998183c51"))
  (persist :source "elpaca-menu-lock-file" :recipe
 	  (:package "persist" :repo
@@ -356,8 +375,8 @@
 				      "tests.el" "*-test.el"
 				      "*-tests.el" "LICENSE" "README*"
 				      "*-pkg.el"))
-			   :source "MELPA" :protocol https :inherit t
-			   :depth treeless :ref
+			   :source "elpaca-menu-lock-file" :protocol
+			   https :inherit t :depth treeless :ref
 			   "01635df3625c0cec2bb4613a6f920b8569d41009"))
  (transient :source "elpaca-menu-lock-file" :recipe
 	    (:package "transient" :fetcher github :repo
@@ -404,7 +423,7 @@
 			"*-pkg.el"))
 	     :source "elpaca-menu-lock-file" :protocol https :inherit
 	     t :depth treeless :ref
-	     "72e80f1236237f346d9692ab8e793798b8c038c5"))
+	     "bf6c5d9297adbf64b7f74f7472f08399312f65b4"))
  (yaml :source "elpaca-menu-lock-file" :recipe
        (:package "yaml" :repo "zkry/yaml.el" :fetcher github :files
 		 ("*.el" "*.el.in" "dir" "*.info" "*.texi" "*.texinfo"
