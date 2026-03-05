@@ -3,6 +3,7 @@
   ...
 }: {
   home.packages = with pkgs.llm-agents; [
+    chainlink
     claude-code
     claude-code-acp
   ];

@@ -113,7 +113,38 @@
         kanata = unstable;
       }))
       # For more up-to-date claude-code{-acp} &c than from nixpkgs.
-      {nixpkgs.overlays = [llm-agents.overlays.default];}
+      # Overlays for llm-agents stuff.
+      {
+        nixpkgs.overlays = [
+          llm-agents.overlays.default
+          # Custom overlay thingy to get an unreleased version of chainlink.
+          (final: prev: let
+            chainlinkVersion = "1.6.0-dev";
+            chainlinkSrc = final.fetchFromGitHub {
+              owner = "dollspace-gay";
+              repo = "chainlink";
+              rev = "48884f9b1c98dc70282d11ad953a0a7a48a1b6cc";
+              hash = "sha256-6505p3j1cZxGhwaXGvALJxcX0QwCHYDxra86asW4IRM=";
+            };
+          in {
+            llm-agents = prev.llm-agents // {
+              chainlink = prev.llm-agents.chainlink.overrideAttrs (old: {
+                version = chainlinkVersion;
+                src = chainlinkSrc;
+                nativeBuildInputs = old.nativeBuildInputs ++ [final.dasel];
+                postPatch = ''
+                  dasel put -f chainlink/Cargo.toml -t string '.package.version' -v '${chainlinkVersion}'
+                '';
+                cargoDeps = final.rustPlatform.fetchCargoVendor {
+                  src = chainlinkSrc;
+                  sourceRoot = "source/chainlink";
+                  hash = "sha256-DAvRNsGzYz1mm+uLQrKYDAhTZ+51tJLjLvcRpEbNcpw=";
+                };
+              });
+            };
+          })
+        ];
+      }
     ];
 
     # Common modules used by both darwin and standalone home-manager configs
