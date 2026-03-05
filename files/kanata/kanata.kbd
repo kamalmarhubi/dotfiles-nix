@@ -29,6 +29,10 @@
 (defcfg
   process-unmapped-keys true
   log-layer-changes false
+  macos-dev-names-include (
+    "Apple Internal Keyboard / Trackpad"
+    "Glove80 Left"
+  )
 )
 
 (defvirtualkeys
