@@ -85,23 +85,19 @@
   lctl lmet lalt           spc            ralt rmet rctl
 )
 
-;; CAGS Home Row Mods for macOS with fast typing detection + bilateral combinations
-;; Left hand:  a=Ctrl, s=Option, d=Command, f=Shift
-;; Right hand: j=Shift, k=Command, l=Option, ;=Ctrl
-;; Using uniform 160ms hold timeout for all keys
-;; Non-shift mods use bilateral (same-hand prevention), shift keys use regular tap-hold
+;; CAGS Home Row Mods: a=Ctrl, s=Option, d=Command, f=Shift (mirror on right)
 (defalias
-  ;; Left hand home row mods (a/s/d use bilateral to prevent same-hand mods like "at")
-  a-ctrl (t! homerowmod-bilateral $tot $toh a lctl $left-hand-keys)
-  s-opt  (t! homerowmod-bilateral $tot $toh s lalt $left-hand-keys)
-  d-cmd  (t! homerowmod-bilateral $tot $toh d lmet $left-hand-keys)
+  ;; Left hand
+  a-ctrl (t! homerowmod $tot $toh a lctl)
+  s-opt  (t! homerowmod $tot $toh s lalt)
+  d-cmd  (t! homerowmod $tot $toh d lmet)
   f-sft  (t! homerowmod $tot $toh f lsft)
 
-  ;; Right hand home row mods (k/l/; use bilateral to prevent same-hand mods like "know")
+  ;; Right hand
   j-sft  (t! homerowmod $tot $toh j rsft)
-  k-cmd  (t! homerowmod-bilateral $tot $toh k rmet $right-hand-keys)
-  l-opt  (t! homerowmod-bilateral $tot $toh l ralt $right-hand-keys)
-  ;-ctrl (t! homerowmod-bilateral $tot $toh ; rctl $right-hand-keys)
+  k-cmd  (t! homerowmod $tot $toh k rmet)
+  l-opt  (t! homerowmod $tot $toh l ralt)
+  ;-ctrl (t! homerowmod $tot $toh ; rctl)
 )
 
 (deflayer base
