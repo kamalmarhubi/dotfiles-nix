@@ -4,13 +4,12 @@
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-25.11-darwin";
 
-    # Temporarily use unmerged PR upgrading claude-code past 1.0.111 for token
-    # count output while processing.
     unstable.url = "github:nixos/nixpkgs/nixpkgs-unstable";
     master.url = "github:nixos/nixpkgs/master";
     llm-agents = {
       url = "github:numtide/llm-agents.nix";
-      inputs.nixpkgs.follows = "nixpkgs";
+      # Temporarily using unstable because go 1.26 isn't in 25.11.
+      inputs.nixpkgs.follows = "unstable";
     };
 
     nur = {
