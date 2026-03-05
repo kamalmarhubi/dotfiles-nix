@@ -87,6 +87,10 @@
 # Override email address as kamal@marhubi.com for my github repos.
 [includeIf "hasconfig:remote.*.url:https://github.com/kamalmarhubi/**"]
 	path = config.mine
+
+# Enable fsmonitor and maintenance for wave monorepo.
+[includeIf "hasconfig:remote.*.url:https://github.com/wavemm/monorepo**"]
+	path = config.wave-monorepo
 [filter "lfs"]
 	clean = git-lfs clean -- %f
 	smudge = git-lfs smudge -- %f
