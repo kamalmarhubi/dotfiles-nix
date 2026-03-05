@@ -17,6 +17,18 @@ in
   - User-specific daemons that start/stop on login/logout
   - Conditional service enabling based on active user
   - Using kanata's TCP server mode for per-user configs
+
+  TODO: Restrict network access to loopback only using SandboxProfile
+  To prevent kanata from accessing the internet while still allowing its TCP
+  server feature to work on localhost:
+  - Add SandboxProfile key to launchd serviceConfig
+  - Use sandbox profile to allow loopback network (127.0.0.1, ::1)
+  - Explicitly deny external network access (network-outbound to remote IPs)
+  - Ensure IOKit access remains allowed for keyboard/input device operations
+  - Test that input monitoring and keyboard remapping still work correctly
+  Note: The sandbox might interfere with IOKit operations; if so, use PF
+  (packet filter) rules instead to restrict network without sandboxing other
+  system access.
   */
   
   options.services.kanata = {
