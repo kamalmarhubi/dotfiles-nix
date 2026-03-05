@@ -342,6 +342,10 @@ startup."
   :hook
   (embark-collect-mode . consult-preview-at-point-mode))
 
+(use-package wgrep
+  :ensure t
+  :commands wgrep)
+
 (use-package corfu
   :ensure t
   :custom

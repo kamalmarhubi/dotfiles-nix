@@ -410,6 +410,12 @@
 		    github :source "elpaca-menu-lock-file" :protocol
 		    https :inherit t :depth treeless :ref
 		    "5b6b8af7c8149f8ff1e4ce6956395739d9a6ad0a"))
+ (wgrep :source "elpaca-menu-lock-file" :recipe
+	(:package "wgrep" :fetcher github :repo
+		  "mhayashi1120/Emacs-wgrep" :files ("wgrep.el")
+		  :source "elpaca-menu-lock-file" :protocol https
+		  :inherit t :depth treeless :ref
+		  "49f09ab9b706d2312cab1199e1eeb1bcd3f27f6f"))
  (with-editor :source "elpaca-menu-lock-file"
    :recipe
    (:package "with-editor" :fetcher github :repo "magit/with-editor"
