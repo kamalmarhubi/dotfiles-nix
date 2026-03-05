@@ -323,7 +323,9 @@ startup."
 ;; Consider adding bindings:
 ;;   https://github.com/minad/consult/blob/main/README.org#use-package-example
 (use-package consult
-  :ensure t)
+  :ensure t
+  :custom
+  (consult-narrow-key "<"))
 
 (use-package embark
   :ensure t
