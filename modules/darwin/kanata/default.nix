@@ -82,6 +82,8 @@ in
         ProcessType = "Interactive";
         KeepAlive = cfg.keepAlive;
         RunAtLoad = true;
+        StandardOutPath = "/var/log/kanata.log";
+        StandardErrorPath = "/var/log/kanata.log";
       };
     };
   };
