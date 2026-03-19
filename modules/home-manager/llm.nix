@@ -14,6 +14,7 @@
       # zig and e2fsprogs for https://github.com/earendil-works/gondolin
       e2fsprogs
       zig
+      brewCasks.voiceink
     ]);
 
   nixpkgs.allowUnfreePackages = with pkgs.llm-agents; [

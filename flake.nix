@@ -12,6 +12,12 @@
       inputs.nixpkgs.follows = "unstable";
     };
 
+    brew-nix = {
+      url = "github:BatteredBunny/brew-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+      inputs.nix-darwin.follows = "nix-darwin";
+    };
+
     nur = {
       url = "github:nix-community/NUR";
       inputs.nixpkgs.follows = "unstable";
@@ -42,6 +48,7 @@
     nix-darwin,
     nur,
     llm-agents,
+    brew-nix,
     ...
   } @ inputs: let
     mkOverlayModule = overlay: {
@@ -108,6 +115,7 @@
       unstableOverlayModule
       masterOverlayModule
       myPackagesOverlayModule
+      (mkOverlayModule brew-nix.overlays.default)
       (mkPackageReplacementOverlayModule (with inputs; {
         kanata = unstable;
       }))
