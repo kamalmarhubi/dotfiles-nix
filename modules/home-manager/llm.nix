@@ -8,6 +8,7 @@
       claude-code
       claude-code-acp
       mcporter
+      opencode
     ])
     ++ (with pkgs; [
       # zig and e2fsprogs for https://github.com/earendil-works/gondolin
