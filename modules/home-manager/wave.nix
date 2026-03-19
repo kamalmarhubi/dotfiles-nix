@@ -13,7 +13,6 @@ in {
     circleci-cli
     cmake
     cmctl
-    colima
     colordiff
     crane
     git-lfs
