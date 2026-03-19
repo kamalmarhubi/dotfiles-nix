@@ -12,10 +12,15 @@
       inputs.nixpkgs.follows = "unstable";
     };
 
+    brew-api = {
+      url = "github:BatteredBunny/brew-api";
+      flake = false;
+    };
     brew-nix = {
       url = "github:BatteredBunny/brew-nix";
       inputs.nixpkgs.follows = "nixpkgs";
       inputs.nix-darwin.follows = "nix-darwin";
+      inputs.brew-api.follows = "brew-api";
     };
 
     nur = {

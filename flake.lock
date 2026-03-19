@@ -28,11 +28,11 @@
     "brew-api": {
       "flake": false,
       "locked": {
-        "lastModified": 1773421960,
-        "narHash": "sha256-515XVFhbaPA8onu9/sgXy2KycEQSjoB94L0rtczpKFs=",
+        "lastModified": 1773951060,
+        "narHash": "sha256-pbFuCOTk1JYEofEiU8AlKDzwF1mTcAugoyle1yDWV5A=",
         "owner": "BatteredBunny",
         "repo": "brew-api",
-        "rev": "68a17c0754cb41fe17aa1009e6431c3b6b75989c",
+        "rev": "e6d7cc5bfd3ae36d71074ace600f31941a079e42",
         "type": "github"
       },
       "original": {
@@ -43,7 +43,9 @@
     },
     "brew-nix": {
       "inputs": {
-        "brew-api": "brew-api",
+        "brew-api": [
+          "brew-api"
+        ],
         "nix-darwin": [
           "nix-darwin"
         ],
@@ -372,6 +374,7 @@
     },
     "root": {
       "inputs": {
+        "brew-api": "brew-api",
         "brew-nix": "brew-nix",
         "home-manager": "home-manager",
         "llm-agents": "llm-agents",
