@@ -4,3 +4,9 @@ email = "kamal@marhubi.com"
 
 [ui]
 default-command = "log"
+pager = "delta --side-by-side"
+diff-formatter = ":git"
+
+[merge-tools.delta]
+diff-expected-exit-codes = [0, 1]
+diff-args = ["--side-by-side", "$left", "$right", "--width=$width"]
