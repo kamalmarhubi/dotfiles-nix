@@ -25,6 +25,19 @@ in {
     pgformatter
     steampipe
     vault
+    (unstable.gws.overrideAttrs (old: rec {
+      version = "0.19.0";
+      src = pkgs.fetchFromGitHub {
+        owner = "googleworkspace";
+        repo = "cli";
+        rev = "v${version}";
+        hash = "sha256-r1BrDoZ3EzSW/CGLjuOsCeMRnZTzpcaIP+snQfsuXxc=";
+      };
+      cargoDeps = pkgs.rustPlatform.fetchCargoVendor {
+        inherit src;
+        hash = "sha256-3/gK5Y2VD5azxIhjzvqYT88eYwh+zmgjGIKJrXdu6jw=";
+      };
+    }))
     yaml2json
   ];
 
