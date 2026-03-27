@@ -1,0 +1,3 @@
+# Ignore default nix output symlinks
+result
+result-*
