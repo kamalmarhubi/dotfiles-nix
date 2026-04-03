@@ -63,10 +63,26 @@ in
     # macOS TCC permissions are path-specific, so we need a stable path
     # that doesn't change when nix store paths change
     system.activationScripts.postActivation.text = ''
-      echo "copying kanata to /Library/Application Support/org.nixos.kanata/ for stable TCC permissions..." >&2
-      mkdir -p "/Library/Application Support/org.nixos.kanata"
-      cp -f "${lib.getExe cfg.package}" "/Library/Application Support/org.nixos.kanata/kanata"
-      chmod +x "/Library/Application Support/org.nixos.kanata/kanata"
+      kanata_dir="/Library/Application Support/org.nixos.kanata"
+      kanata_bin="$kanata_dir/kanata"
+      mkdir -p "$kanata_dir"
+
+      old_hash=""
+      if [ -f "$kanata_bin" ]; then
+        old_hash=$(shasum -a 256 "$kanata_bin" | cut -d' ' -f1)
+      fi
+
+      cp -f "${lib.getExe cfg.package}" "$kanata_bin"
+      chmod +x "$kanata_bin"
+
+      new_hash=$(shasum -a 256 "$kanata_bin" | cut -d' ' -f1)
+      if [ "$old_hash" != "$new_hash" ]; then
+        printf >&2 '\n\e[1;33m*** kanata binary changed! ***\e[0m\n'
+        printf >&2 'You may need to remove and re-add kanata in:\n'
+        printf >&2 '  System Settings > Privacy & Security > Input Monitoring\n'
+        printf >&2 'Binary path: %s\n' "$kanata_bin"
+        printf >&2 'Then restart: sudo launchctl kickstart -k system/org.nixos.kanata\n\n'
+      fi
     '';
 
     # Run as system daemon to access HID devices (requires root permissions)
