@@ -7,9 +7,7 @@
     unstable.url = "github:nixos/nixpkgs/nixpkgs-unstable";
     master.url = "github:nixos/nixpkgs/master";
     llm-agents = {
-      # TODO: switch back to numtide/llm-agents.nix once
-      # https://github.com/numtide/llm-agents.nix/pull/3680 is merged
-      url = "github:numtide/llm-agents.nix/refs/pull/3680/head";
+      url = "github:numtide/llm-agents.nix";
       # Temporarily using unstable because go 1.26 isn't in 25.11.
       inputs.nixpkgs.follows = "unstable";
     };
