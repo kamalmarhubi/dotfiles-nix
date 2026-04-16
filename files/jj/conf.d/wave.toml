@@ -1,0 +1,5 @@
+[[--scope]]
+--when.repositories = ["~/wave"]
+
+[--scope.user]
+email = "kamal@wave.com"
