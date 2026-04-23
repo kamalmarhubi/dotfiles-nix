@@ -12,6 +12,11 @@
       inputs.nixpkgs.follows = "unstable";
     };
 
+    fenix = {
+      url = "github:nix-community/fenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+
     brew-api = {
       url = "github:BatteredBunny/brew-api";
       flake = false;
@@ -54,6 +59,7 @@
     nur,
     llm-agents,
     brew-nix,
+    fenix,
     ...
   } @ inputs: let
     mkOverlayModule = overlay: {
@@ -124,6 +130,7 @@
       (mkPackageReplacementOverlayModule (with inputs; {
         kanata = unstable;
       }))
+      (mkOverlayModule fenix.overlays.default)
       # For more up-to-date claude-code{-acp} &c than from nixpkgs.
       # Overlays for llm-agents stuff.
       {

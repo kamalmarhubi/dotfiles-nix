@@ -9,7 +9,6 @@
     _1password-cli
     atool
     bun
-    cargo
     entr
     fd
     ffmpeg

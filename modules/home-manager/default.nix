@@ -9,6 +9,7 @@
       ./fonts.nix
       ./llm.nix
       ./nvim.nix
+      ./rust.nix
       ./terminal.nix
       ./vcs.nix
     ]
