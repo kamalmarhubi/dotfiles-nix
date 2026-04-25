@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# jj-gh-fork: configure a jj+git clone for a fork-PR workflow.
+#
+#   upstream  https://github.com/<owner>/<repo>.git   (source; jj fetches here)
+#   origin    https://github.com/<me>/<repo>.git      (your fork; jj pushes here)
+#
+# Idempotent. Pass -n / --dry-run to print would-be commands instead of
+# running them. Requires gh, jj.
+
+set -euo pipefail
+
+prog=$(basename "$0")
+err() { printf '%s: %s\n' "$prog" "$*" >&2; }
+
+usage() {
+  cat <<EOF
+Usage: $prog [-n|--dry-run] [-h|--help]
+
+Configure a jj+git clone for a fork-PR workflow:
+  upstream  https://github.com/<owner>/<repo>.git  (source; jj fetches here)
+  origin    https://github.com/<me>/<repo>.git     (your fork; jj pushes here)
+
+Options:
+  -n, --dry-run  Print would-be commands instead of running them.
+  -h, --help     Show this help and exit.
+
+Idempotent. Requires gh, jj.
+EOF
+}
+
+DRY_RUN_CMD=
+dry_run=0
+if [[ $# -gt 1 ]]; then
+  err "too many arguments"
+  exit 2
+fi
+case ${1:-} in
+  -n|--dry-run) dry_run=1; DRY_RUN_CMD="echo" ;;
+  -h|--help) usage; exit 0 ;;
+  '') ;;
+  *) err "unknown arg: $1"; exit 2 ;;
+esac
+
+# `jj git remote list` prints "name fetch-url" or, for split URLs,
+# "name fetch-url (push: push-url)". Captured once so a jj failure aborts the
+# script visibly, instead of silently surfacing as "remote not found".
+remote_url() {
+  local name url _rest
+  while read -r name url _rest; do
+    [[ $name == "$1" ]] && { echo "$url"; return 0; }
+  done <<<"$remote_list"
+  return 1
+}
+
+remote_exists() { remote_url "$1" >/dev/null; }
+
+# True when the remote has a split fetch/push URL.
+remote_is_split() {
+  local target=$1 name _url rest
+  while read -r name _url rest; do
+    [[ $name == "$target" && $rest == "(push:"* ]] && return 0
+  done <<<"$remote_list"
+  return 1
+}
+
+# owner/repo from an HTTPS or SSH GitHub URL.
+parse_slug() {
+  local url=$1
+  url=${url%.git}
+  url=${url%/}
+  local repo=${url##*/}
+  local rest=${url%/"$repo"}
+  local owner=${rest##*[/:]}
+  echo "$owner/$repo"
+}
+
+remote_list=$(jj git remote list)
+
+# Prefer "upstream" if it already exists (re-run case). Otherwise, origin
+# usually points at upstream (fresh clone) but might already point at the fork
+# (early-abort recovery), so check .parent and prefer it when set.
+if remote_exists upstream; then
+  upstream_slug=$(parse_slug "$(remote_url upstream)")
+elif remote_exists origin; then
+  origin_slug=$(parse_slug "$(remote_url origin)")
+  # ":" can't appear in GitHub usernames or repo names.
+  origin_info=$(gh api "repos/$origin_slug" --jq '"\(.parent.nameWithOwner // ""):\(.owner.login)"')
+  parent=${origin_info%%:*}
+  origin_owner=${origin_info#*:}
+  if [[ -z $parent && $origin_owner == $(gh api user --jq .login) ]]; then
+    err "$origin_slug is yours and not a fork; nothing to set up"
+    exit 0
+  fi
+  upstream_slug=${parent:-$origin_slug}
+else
+  err "no 'upstream' or 'origin' remote found"
+  exit 1
+fi
+
+upstream_owner=${upstream_slug%/*}
+upstream_name=${upstream_slug#*/}
+upstream_https="https://github.com/${upstream_slug}.git"
+
+$DRY_RUN_CMD gh repo fork "$upstream_slug" --remote=false --clone=false
+
+# forks(affiliations: OWNER) is server-side filtered; handles renamed forks.
+# shellcheck disable=SC2016  # $owner/$name are GraphQL variables, not shell.
+fork_slug=$(gh api graphql \
+  -f query='
+    query($owner: String!, $name: String!) {
+      repository(owner: $owner, name: $name) {
+        forks(first: 1, affiliations: OWNER) {
+          nodes { nameWithOwner }
+        }
+      }
+    }' \
+  -F owner="$upstream_owner" -F name="$upstream_name" \
+  --jq '.data.repository.forks.nodes[0].nameWithOwner // empty')
+
+if [[ -z $fork_slug ]]; then
+  if (( dry_run )); then
+    # Fork doesn't exist yet; assume default name (no --fork-name).
+    me=$(gh api user --jq .login)
+    fork_slug="$me/$upstream_name"
+  else
+    err "could not resolve viewer's fork of $upstream_slug"
+    exit 1
+  fi
+fi
+
+fork_https="https://github.com/${fork_slug}.git"
+
+# Precompute post-rename state so conditions match what a real run does,
+# not what the live (unmutated) state suggests in dry-run.
+if remote_exists upstream; then
+  source_remote=upstream
+  will_rename=0
+else
+  source_remote=origin
+  will_rename=1
+fi
+upstream_url_now=$(remote_url "$source_remote")
+upstream_split_now=0
+remote_is_split "$source_remote" && upstream_split_now=1
+
+if (( ! will_rename )) && remote_exists origin; then
+  will_have_origin=1
+  origin_url_now=$(remote_url origin)
+else
+  will_have_origin=0
+fi
+
+if (( will_rename )); then
+  $DRY_RUN_CMD jj git remote rename origin upstream
+fi
+
+if [[ $upstream_url_now != "$upstream_https" ]] || (( upstream_split_now )); then
+  $DRY_RUN_CMD jj git remote set-url upstream "$upstream_https" --push "$upstream_https"
+fi
+
+if (( will_have_origin )); then
+  if [[ $origin_url_now != "$fork_https" ]]; then
+    $DRY_RUN_CMD jj git remote set-url origin "$fork_https"
+  fi
+else
+  $DRY_RUN_CMD jj git remote add origin "$fork_https"
+fi
+
+$DRY_RUN_CMD jj config set --repo git.fetch upstream
+
+if (( ! dry_run )); then
+  printf 'origin    = %s\n' "$fork_https"
+  printf 'upstream  = %s\n' "$upstream_https"
+  printf 'git.fetch = upstream\n'
+fi
