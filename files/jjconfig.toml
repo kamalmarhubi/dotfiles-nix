@@ -7,6 +7,9 @@ default-command = "log"
 pager = "delta --side-by-side"
 diff-formatter = ":git"
 
+[revsets]
+bookmark-advance-to = '''heads(::@ ~ empty() ~ description(exact:'') ~ description(regex-i:'^(wip|tktk)\b'))'''
+
 [merge-tools.delta]
 diff-expected-exit-codes = [0, 1]
 diff-args = ["--side-by-side", "$left", "$right", "--width=$width"]
