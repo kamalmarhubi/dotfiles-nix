@@ -80,6 +80,7 @@ in
         printf >&2 '\n\e[1;33m*** kanata binary changed! ***\e[0m\n'
         printf >&2 'You may need to remove and re-add kanata in:\n'
         printf >&2 '  System Settings > Privacy & Security > Input Monitoring\n'
+        printf >&2 '  open "x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"\n'
         printf >&2 'Binary path: %s\n' "$kanata_bin"
         printf >&2 'Then restart: sudo launchctl kickstart -k system/org.nixos.kanata\n\n'
       fi
