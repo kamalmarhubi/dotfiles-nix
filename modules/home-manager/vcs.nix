@@ -12,6 +12,7 @@
 
     packages = with pkgs; [
       delta
+      gh
       git
       git-absorb
       git-lfs
@@ -40,5 +41,13 @@
   in ''
     [credential]
     	helper = ${credentialHelper}
+  '';
+  xdg.configFile."git/config.gh".text = ''
+    [credential "https://github.com"]
+    	helper =
+    	helper = !${pkgs.gh}/bin/gh auth git-credential
+    [credential "https://gist.github.com"]
+    	helper =
+    	helper = !${pkgs.gh}/bin/gh auth git-credential
   '';
 }
