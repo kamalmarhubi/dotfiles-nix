@@ -8,7 +8,9 @@
     master.url = "github:nixos/nixpkgs/master";
     llm-agents = {
       url = "github:numtide/llm-agents.nix";
-      # Temporarily using unstable because go 1.26 isn't in 25.11.
+      # llm-agents packages use buildPythonApplication's finalAttrs form
+      # which isn't in 25.11; follow unstable instead.
+      # TODO(26.05): follow nixpkgs.
       inputs.nixpkgs.follows = "unstable";
     };
 
