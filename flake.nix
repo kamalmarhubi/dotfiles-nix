@@ -7,9 +7,7 @@
     unstable.url = "github:nixos/nixpkgs/nixpkgs-unstable";
     master.url = "github:nixos/nixpkgs/master";
     llm-agents = {
-      # claude-code 2.1.120 broke session resumption (--resume / --continue).
-      # TODO(anthropics/claude-code#53086): unpin after fix.
-      url = "github:numtide/llm-agents.nix/3066de9018973a4c7164621ebcf13b9872a2bfb0";
+      url = "github:numtide/llm-agents.nix";
       # Temporarily using unstable because go 1.26 isn't in 25.11.
       inputs.nixpkgs.follows = "unstable";
     };

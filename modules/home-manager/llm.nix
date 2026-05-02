@@ -6,7 +6,7 @@
     (with pkgs.llm-agents; [
       chainlink
       claude-code
-      claude-code-acp
+      claude-agent-acp
       mcporter
       opencode
     ])
