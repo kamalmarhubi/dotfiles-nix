@@ -10,7 +10,8 @@
 set -euo pipefail
 
 prog=$(basename "$0")
-err() { printf '%s: %s\n' "$prog" "$*" >&2; }
+err()  { printf '%s: %s\n' "$prog" "$*" >&2; }
+warn() { printf '%s: warning: %s\n' "$prog" "$*" >&2; }
 
 usage() {
   cat <<EOF
@@ -150,8 +151,27 @@ else
   will_have_origin=0
 fi
 
+# Renaming origin -> upstream breaks trunk() if it points at `<branch>@origin`
+# (and immutable_heads() with it). Temporarily unset around the rename.
+trunk_now=$(jj config get 'revset-aliases."trunk()"' 2>/dev/null || true)
+trunk_target=
+if [[ $trunk_now =~ ^[A-Za-z0-9_./-]+@origin$ ]]; then
+  trunk_target=${trunk_now%@origin}@upstream
+elif [[ $trunk_now == *@origin* ]]; then
+  warn "trunk() alias references @origin in a non-trivial form: $trunk_now"
+  warn "leaving it alone; run \`jj config edit --repo\` to update if needed"
+fi
+
+if [[ -n $trunk_target ]]; then
+  $DRY_RUN_CMD jj config unset --repo 'revset-aliases."trunk()"'
+fi
+
 if (( will_rename )); then
   $DRY_RUN_CMD jj git remote rename origin upstream
+fi
+
+if [[ -n $trunk_target ]]; then
+  $DRY_RUN_CMD jj config set --repo 'revset-aliases."trunk()"' "$trunk_target"
 fi
 
 if [[ $upstream_url_now != "$upstream_https" ]] || (( upstream_split_now )); then
@@ -172,4 +192,7 @@ if (( ! dry_run )); then
   printf 'origin    = %s\n' "$fork_https"
   printf 'upstream  = %s\n' "$upstream_https"
   printf 'git.fetch = upstream\n'
+  if [[ -n $trunk_target ]]; then
+    printf 'trunk()   = %s\n' "$trunk_target"
+  fi
 fi
