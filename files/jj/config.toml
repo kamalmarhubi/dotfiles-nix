@@ -7,8 +7,14 @@ default-command = "log"
 pager = "delta --side-by-side"
 diff-formatter = ":git"
 
+[revset-aliases]
+'incomplete()' = '''empty() | description(exact:'') | description(regex-i:'^(wip|tktk)\b')'''
+
 [revsets]
-bookmark-advance-to = '''heads(::@ ~ empty() ~ description(exact:'') ~ description(regex-i:'^(wip|tktk)\b'))'''
+bookmark-advance-to = "heads(::@ ~ incomplete())"
+
+[git]
+private-commits = "incomplete() & mine()"
 
 [merge-tools.delta]
 diff-expected-exit-codes = [0, 1]
