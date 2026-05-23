@@ -3,3 +3,6 @@
 
 [--scope.user]
 email = "kamal@wave.com"
+
+[--scope.templates]
+git_push_bookmark = '"kamal/" ++ author.timestamp().local().format("%Y-%m-%d") ++ "-" ++ change_id.short()'
