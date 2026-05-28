@@ -1,4 +1,5 @@
 {
+  config,
   pkgs,
   ...
 }: {
@@ -21,4 +22,6 @@
   nixpkgs.allowUnfreePackages = with pkgs.llm-agents; [
     claude-code
   ];
+
+  xdg.configFile."amp/settings.json".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/amp/settings.json";
 }
