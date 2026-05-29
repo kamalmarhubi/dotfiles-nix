@@ -11,10 +11,13 @@ diff-formatter = ":git"
 hunk = ["util", "exec", "--", "jj-hunk"]
 
 [revset-aliases]
-'incomplete()' = '''empty() | description(exact:'') | description(regex-i:'^(wip|tktk)\b')'''
+# Empty non-merge commits, blank descriptions, and WIP markers are scratch work.
+'incomplete()' = '''((empty() & ~merges()) | description("") | description(regex-i:'^(wip|tktk)\b')) ~ root()'''
 
 [revsets]
-bookmark-advance-to = "heads(::@ ~ incomplete())"
+# For bare `jj bookmark advance`, move through complete commits above the
+# nearest ancestor bookmark, but stop before scratch work instead of skipping it.
+bookmark-advance-to = "heads(::@ ~ (incomplete() & (bookmarks()..@))::)"
 
 [git]
 private-commits = "incomplete() & mine()"
