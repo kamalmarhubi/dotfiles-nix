@@ -7,6 +7,9 @@ default-command = "log"
 pager = "delta --side-by-side"
 diff-formatter = ":git"
 
+[aliases]
+hunk = ["util", "exec", "--", "jj-hunk"]
+
 [revset-aliases]
 'incomplete()' = '''empty() | description(exact:'') | description(regex-i:'^(wip|tktk)\b')'''
 

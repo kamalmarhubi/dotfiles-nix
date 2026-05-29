@@ -19,6 +19,7 @@
       git-branchless
       # jj moves too fast for the semi-annual nixpkgs releases.
       unstable.jujutsu
+      mine.jj-hunk
       # git-filter-repo
       lazygit
     ];

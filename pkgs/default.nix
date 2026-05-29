@@ -5,6 +5,7 @@
       final: prev: let
         # List of package directories to include
         packageNames = [
+          "jj-hunk"
         ];
 
         # Generate packages from the list
