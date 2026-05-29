@@ -37,14 +37,13 @@
 
     # Predicate for home-manager user packages collected from
     #   home-manager.users.<user>.nixpkgs.allowUnfreePackages
-    collectedUserPackagesPredicate = pkg:
-      let
-        homeManagerUnfree = lib.flatten (lib.mapAttrsToList
-          (_: userConfig: userConfig.nixpkgs.allowUnfreePackages or [])
-          homeManagerConfig.users);
-        allowed = lib.map lib.getName homeManagerUnfree;
-      in
-        builtins.elem (lib.getName pkg) allowed;
+    collectedUserPackagesPredicate = pkg: let
+      homeManagerUnfree = lib.flatten (lib.mapAttrsToList
+        (_: userConfig: userConfig.nixpkgs.allowUnfreePackages or [])
+        homeManagerConfig.users);
+      allowed = lib.map lib.getName homeManagerUnfree;
+    in
+      builtins.elem (lib.getName pkg) allowed;
   in
     # Avoid setting the predicate in both nixos / nix-darwin and home-manager
     # when using useGlobalPkgs.

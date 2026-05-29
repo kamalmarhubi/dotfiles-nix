@@ -1,13 +1,13 @@
-{ config, lib, pkgs, ... }:
-
-with lib;
-
-let
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
+with lib; let
   cfg = config.services.karabiner-driverkit-virtualhiddevice;
   karabinerDriverPackage = pkgs.karabiner-elements;
-in
-
-{
+in {
   options = {
     services.karabiner-driverkit-virtualhiddevice = {
       enable = mkEnableOption "Karabiner DriverKit VirtualHIDDevice driver";

@@ -92,18 +92,18 @@
       mkOverlayModule (
         final: prev:
           builtins.foldl'
-            (acc: packageName:
-              let
-                nixpkgsInput = packageInputMap.${packageName};
-                pkgs = import nixpkgsInput {
-                  system = prev.stdenv.hostPlatform.system;
-                  config = prev.config;
-                };
-              in
-                acc // { ${packageName} = pkgs.${packageName}; }
-            )
-            {}
-            (builtins.attrNames packageInputMap)
+          (
+            acc: packageName: let
+              nixpkgsInput = packageInputMap.${packageName};
+              pkgs = import nixpkgsInput {
+                system = prev.stdenv.hostPlatform.system;
+                config = prev.config;
+              };
+            in
+              acc // {${packageName} = pkgs.${packageName};}
+          )
+          {}
+          (builtins.attrNames packageInputMap)
       );
     # A module to use lix instead of CppNix. Adapated from
     #   https://lix.systems/add-to-config/#advanced-change
@@ -111,17 +111,19 @@
     lixModule = {pkgs, ...}: {
       nixpkgs.overlays = [
         (final: prev: {
-          inherit (final.lixPackageSets.stable)
+          inherit
+            (final.lixPackageSets.stable)
             nixpkgs-review
             nix-direnv
             nix-eval-jobs
             nix-fast-build
-            colmena;
+            colmena
+            ;
         })
       ];
       nix.package = pkgs.lixPackageSets.stable.lix;
     };
-    myPackagesOverlayModule = import ./pkgs { lib = nixpkgs.lib; };
+    myPackagesOverlayModule = import ./pkgs {lib = nixpkgs.lib;};
 
     # Common overlays used by both darwin and standalone home-manager configs
     commonOverlayModules = [
@@ -143,9 +145,11 @@
     ];
 
     # Common modules used by both darwin and standalone home-manager configs
-    commonModules = commonOverlayModules ++ [
-      registryConfig
-    ];
+    commonModules =
+      commonOverlayModules
+      ++ [
+        registryConfig
+      ];
 
     systems = [
       "aarch64-darwin"

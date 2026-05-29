@@ -1,21 +1,21 @@
-{ config, lib, pkgs, ... }:
-
-with lib;
-
-let
+{
+  config,
+  lib,
+  pkgs,
+  ...
+}:
+with lib; let
   cfg = config.services.karabiner-driverkit-virtualhiddevice;
 
   parentAppDir = "/Applications/.Nix-Karabiner-DriverKit";
-in
-
-{
+in {
   options.services.karabiner-driverkit-virtualhiddevice = {
     enable = mkEnableOption "Karabiner DriverKit Virtual HID Device";
-    package = mkPackageOption pkgs "karabiner-dk" { };
+    package = mkPackageOption pkgs "karabiner-dk" {};
   };
 
   config = mkIf cfg.enable {
-    environment.systemPackages = [ cfg.package ];
+    environment.systemPackages = [cfg.package];
 
     system.activationScripts.preActivation.text = ''
       rm -rf ${parentAppDir}

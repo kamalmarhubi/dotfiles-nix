@@ -21,7 +21,7 @@
   services.kanata = {
     enable = true;
     configFile = "${config.system.primaryUserHome}/.config/kanata/kanata.kbd";
-    keepAlive = false;  # Easier for development - no auto-restart
+    keepAlive = false; # Easier for development - no auto-restart
   };
 
   # Set up touch id authentication for sudo.

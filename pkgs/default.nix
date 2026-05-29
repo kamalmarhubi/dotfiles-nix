@@ -1,17 +1,15 @@
 # Custom packages overlay module
-{ lib }:
-{
+{lib}: {
   nixpkgs.overlays = [
-    (final: prev: 
-      let
+    (
+      final: prev: let
         # List of package directories to include
         packageNames = [
         ];
 
         # Generate packages from the list
         packages = lib.genAttrs packageNames (name: final.callPackage ./${name} {});
-      in
-      {
+      in {
         mine = packages;
       }
     )
