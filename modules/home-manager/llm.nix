@@ -4,19 +4,21 @@
   ...
 }: {
   home.packages =
-    (with pkgs.llm-agents; [
+    (with pkgs; [
+      unstable.codex
+      # zig and e2fsprogs for https://github.com/earendil-works/gondolin
+      e2fsprogs
+      zig
+      brewCasks.voiceink
+    ])
+    ++ (with pkgs.llm-agents; [
       amp
       chainlink
       claude-code
       claude-agent-acp
       mcporter
       opencode
-    ])
-    ++ (with pkgs; [
-      # zig and e2fsprogs for https://github.com/earendil-works/gondolin
-      e2fsprogs
-      zig
-      brewCasks.voiceink
+      pi
     ]);
 
   nixpkgs.allowUnfreePackages = with pkgs.llm-agents; [
