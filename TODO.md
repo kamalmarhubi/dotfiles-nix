@@ -12,8 +12,6 @@ Idea: add nix-darwin to manage
 - mac app store applications
 - homebrew stuff as needed
 - variety of defaults
-- launchd agent or daemon to ensure that pam_tid.so is in /etc/pam.d/sudo
-  Note: this would be made unnecessary by https://github.com/LnL7/nix-darwin/pull/787
 
 Things to read about managing home-manager + nix-darwin:
 - https://github.com/kclejeune/system
@@ -171,7 +169,6 @@ on home-manager switch invocation:
 
 
 ## system
-- add a thing that checks /etc/pam.d/sudo for auth sufficient pam_tid.so and suggests adding it if absent
 - similar check for yubikey?
 
 ## firefox
