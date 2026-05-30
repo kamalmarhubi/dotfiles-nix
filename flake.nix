@@ -2,16 +2,12 @@
   description = "Kamal pretends to use nix?";
 
   inputs = {
-    nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-25.11-darwin";
-
+    nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-26.05-darwin";
     unstable.url = "github:nixos/nixpkgs/nixpkgs-unstable";
     master.url = "github:nixos/nixpkgs/master";
     llm-agents = {
       url = "github:numtide/llm-agents.nix";
-      # llm-agents packages use buildPythonApplication's finalAttrs form
-      # which isn't in 25.11; follow unstable instead.
-      # TODO(26.05): follow nixpkgs.
-      inputs.nixpkgs.follows = "unstable";
+      inputs.nixpkgs.follows = "nixpkgs";
     };
 
     fenix = {
@@ -35,11 +31,11 @@
       inputs.nixpkgs.follows = "unstable";
     };
     home-manager = {
-      url = "github:nix-community/home-manager/release-25.11";
+      url = "github:nix-community/home-manager/release-26.05";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     nix-darwin = {
-      url = "github:nix-darwin/nix-darwin/nix-darwin-25.11";
+      url = "github:nix-darwin/nix-darwin/nix-darwin-26.05";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     # Hack because I just need neovim to work.
@@ -131,9 +127,6 @@
       masterOverlayModule
       myPackagesOverlayModule
       (mkOverlayModule brew-nix.overlays.default)
-      (mkPackageReplacementOverlayModule (with inputs; {
-        kanata = unstable;
-      }))
       (mkOverlayModule fenix.overlays.default)
       # For more up-to-date claude-code{-acp} &c than from nixpkgs.
       # Overlays for llm-agents stuff.

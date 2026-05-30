@@ -1,8 +1,6 @@
 {
   config,
   pkgs,
-  inputs,
-  system,
   ...
 }: {
   home = {
@@ -17,8 +15,7 @@
       git-absorb
       git-lfs
       git-branchless
-      # jj moves too fast for the semi-annual nixpkgs releases.
-      unstable.jujutsu
+      jujutsu
       mine.jj-hunk
       # git-filter-repo
       lazygit
