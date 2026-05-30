@@ -88,7 +88,7 @@ elif remote_exists origin; then
   origin_info=$(gh api "repos/$origin_slug" --jq '"\(.parent.nameWithOwner // ""):\(.owner.login)"')
   parent=${origin_info%%:*}
   origin_owner=${origin_info#*:}
-  if [[ -z $parent && $origin_owner == $(gh api user --jq .login) ]]; then
+  if [[ -z $parent && $origin_owner == "$(gh api user --jq .login)" ]]; then
     err "$origin_slug is yours and not a fork; nothing to set up"
     exit 0
   fi
@@ -152,7 +152,9 @@ else
 fi
 
 # Renaming origin -> upstream breaks trunk() if it points at `<branch>@origin`
-# (and immutable_heads() with it). Temporarily unset around the rename.
+# (and immutable_heads() with it). Detect that here, then rewrite it to
+# `@upstream` after the rename. If the rename dies first, trunk() still reads
+# `@origin`, so a re-run re-detects and recovers.
 trunk_now=$(jj config get 'revset-aliases."trunk()"' 2>/dev/null || true)
 trunk_target=
 if [[ $trunk_now =~ ^[A-Za-z0-9_./-]+@origin$ ]]; then
@@ -160,10 +162,6 @@ if [[ $trunk_now =~ ^[A-Za-z0-9_./-]+@origin$ ]]; then
 elif [[ $trunk_now == *@origin* ]]; then
   warn "trunk() alias references @origin in a non-trivial form: $trunk_now"
   warn "leaving it alone; run \`jj config edit --repo\` to update if needed"
-fi
-
-if [[ -n $trunk_target ]]; then
-  $DRY_RUN_CMD jj config unset --repo 'revset-aliases."trunk()"'
 fi
 
 if (( will_rename )); then
