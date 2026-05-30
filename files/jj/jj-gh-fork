@@ -167,6 +167,13 @@ if [[ -n $trunk_target ]]; then
 fi
 
 if (( will_rename )); then
+  # `gh fork --remote` (and similar) leaves origin with a separate pushurl
+  # pointing at the fork. jj refuses to rename a remote whose git config has
+  # any key beyond url/fetch/tagOpt, so clear the pushurl via git directly.
+  if (( upstream_split_now )); then
+    $DRY_RUN_CMD git config --local --unset remote.origin.pushurl
+    upstream_split_now=0
+  fi
   $DRY_RUN_CMD jj git remote rename origin upstream
 fi
 
