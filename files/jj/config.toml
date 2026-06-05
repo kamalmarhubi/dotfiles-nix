@@ -26,13 +26,72 @@ hunk = ["util", "exec", "--", "jj-hunk"]
 # Empty non-merge commits, blank descriptions, and WIP markers are scratch work.
 'incomplete()' = '''((empty() & ~merges()) | description("") | description(regex-i:'^(wip|tktk)\b')) ~ root()'''
 
+# Workstream-based log flow; a "workstream" is rooted by an empty commit
+# bookmarked `kamal/jj/base/<workstream_slug>`. Everything else should "just
+# work".
+
+# Workspaces specify a workstream by overriding `workstream_base()` with the
+# bookmark for an empty base commit:
+#
+#   [revset-aliases]
+#   'workstream_base()' = 'kamal/jj/base/<workstream_slug>'
+#
+# TODO(jj-vcs/jj#5895): Replace this with a slug-based `workstream()`.
+'workstream()' = '""'
+'workstream_base_prefix()' = '"kamal/jj/base/"'
+# TODO(jj-vcs/jj#5895): Replace inlined workstream_base_prefix().
+'workstream_bases()' = '''bookmarks(glob:"kamal/jj/base/*")'''
+
+# TODO(jj-vcs/jj#5895): Factor out workstream_base(name).
+# 'workstream_base(name)' = '''bookmarks(glob:concat(workstream_base_prefix(), name))'''
+'workstream_base()' = '''none()'''
+'workstream_log_context(base)' = '''base | ancestors(heads(reachable(base, mutable())), 2)'''
+'workstream_log_context()' = '''workstream_log_context(workstream_base())'''
+'global_log_context()' = 'ancestors(immutable_heads().., 2)'
+
+# "default_blah" are so that repos can be customised without repeating the basics.
+'default_private_commits()' = "(incomplete() & mine()) | descendants(workstream_bases())"
+'default_log()' = '''present(@) | trunk() | coalesce(workstream_log_context(), global_log_context())'''
+
+[git]
+private-commits = 'default_private_commits()'
+
+[template-aliases]
+'format_commit_labels(commit)' = '''
+  separate(" ",
+    coalesce(
+      if(commit.hidden(), label("hidden", "(hidden)")),
+      if(commit.divergent(), label("divergent", "(divergent)")),
+    ),
+    if(commit.conflict(), label("conflict", "(conflict)")),
+    if(commit.contained_in("workstream_bases()") && !commit.empty(),
+      label("jj_base_nonempty", "NONEMPTY-BASE"),
+    ),
+  )
+'''
+[colors]
+"node jj_base_nonempty" = { reverse = true }
+jj_base_nonempty = { fg = "ansi-color-202", bold = true }
+
+[templates]
+log_node = '''
+label(
+  if(
+    self && self.contained_in("workstream_bases()") && !self.empty(),
+    "jj_base_nonempty"
+  ),
+  if(config("ui.graph.style").as_string().starts_with("ascii"),
+    builtin_log_node_ascii,
+    builtin_log_node
+  )
+)
+'''
+
 [revsets]
 # For bare `jj bookmark advance`, move through complete commits above the
 # nearest ancestor bookmark, but stop before scratch work instead of skipping it.
 bookmark-advance-to = "heads(::@ ~ (incomplete() & (bookmarks()..@))::)"
-
-[git]
-private-commits = "incomplete() & mine()"
+log = "default_log()"
 
 [merge-tools.delta]
 diff-expected-exit-codes = [0, 1]
