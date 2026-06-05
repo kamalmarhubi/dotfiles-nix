@@ -4,7 +4,19 @@ email = "kamal@marhubi.com"
 
 [ui]
 default-command = "log"
-pager = "delta --side-by-side"
+diff-formatter = "delta"
+[[--scope]]
+# Use `:git` under coding agents for more machine-legible diffs. Each marker
+# was checked against the tool's source or observed empirically.
+--when.environments = [
+    "AGENT",  # Proposed standard at agentsmd/agents.md#136; used by amp, goose
+    "CLAUDECODE",
+    "CODEX_THREAD_ID",
+    "OPENCODE",
+    "PI_CODING_AGENT",
+    "GEMINI_CLI",
+]
+[--scope.ui]
 diff-formatter = ":git"
 
 [aliases]
