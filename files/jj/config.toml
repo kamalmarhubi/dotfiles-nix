@@ -95,4 +95,15 @@ log = "default_log()"
 
 [merge-tools.delta]
 diff-expected-exit-codes = [0, 1]
-diff-args = ["--side-by-side", "$left", "$right", "--width=$width"]
+diff-args = [
+  "--side-by-side",
+  # HACK: Work around what is probably an upstream bug in delta.
+  # Force delta to use a/b prefixes on its `git diff --no-index` call, so that
+  # it is able to get the name for the header on added / deleted files...
+  "--diff-args=--src-prefix=a/ --dst-prefix=b/",
+  # ... then clean up the left/right names that jj uses.
+  "--file-transformation=s#^(left|right)/##",
+  "$left",
+  "$right",
+  "--width=$width",
+]
