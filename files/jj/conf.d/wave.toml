@@ -4,5 +4,14 @@
 [--scope.user]
 email = "kamal@wave.com"
 
+[--scope.template-aliases]
+# Push-bookmark prefix for this workspace's workstream: `kamal/<slug>/` derived
+# from `workstream_base()` (`kamal/<slug>/base`), or plain `kamal/` when unset.
+'workstream_push_prefix()' = '''
+  if(is_workstream_base(config('revset-aliases."workstream_base()"').as_string()),
+    config('revset-aliases."workstream_base()"').as_string().remove_suffix("base"),
+    "kamal/")
+'''
+
 [--scope.templates]
-git_push_bookmark = '"kamal/" ++ author.timestamp().local().format("%Y-%m-%d") ++ "-" ++ change_id.short()'
+git_push_bookmark = 'workstream_push_prefix() ++ author.timestamp().local().format("%Y-%m-%d") ++ "-" ++ change_id.short()'

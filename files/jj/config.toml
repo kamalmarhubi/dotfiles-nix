@@ -26,26 +26,42 @@ hunk = ["util", "exec", "--", "jj-hunk"]
 # Empty non-merge commits, blank descriptions, and WIP markers are scratch work.
 'incomplete()' = '''((empty() & ~merges()) | description("") | description(regex-i:'^(wip|tktk)\b')) ~ root()'''
 
-# Workstream-based log flow; a "workstream" is rooted by an empty commit
-# bookmarked `kamal/jj/base/<workstream_slug>`. Everything else should "just
-# work".
+# Workstream-based log flow. A "workstream" lives entirely under `kamal/<slug>/`:
+# it is rooted by an empty commit bookmarked `kamal/<slug>/base`, and commits
+# pushed out of it (rebased onto trunk) are bookmarked
+# `kamal/<slug>/<date>-<change_id>` by `git_push_bookmark`. Everything else
+# should "just work".
 
-# Workspaces specify a workstream by overriding `workstream_base()` with the
-# bookmark for an empty base commit:
+# Workspaces specify a workstream by overriding `workstream_base()` (the base
+# bookmark) and `workstream_pushed()` (its pushed bookmarks, via the glob helper):
 #
 #   [revset-aliases]
-#   'workstream_base()' = 'kamal/jj/base/<workstream_slug>'
+#   'workstream_base()'   = 'kamal/<slug>/base'
+#   'workstream_pushed()' = 'workstream_pushed("kamal/<slug>/*")'
 #
-# TODO(jj-vcs/jj#5895): Replace this with a slug-based `workstream()`.
+# TODO(jj-vcs/jj#5895): Replace this with a slug-based `workstream()`. Once `glob:`
+# accepts `concat()`, base and pushed both derive from one slug instead of being
+# restated per workspace (see the factored-out aliases below).
 'workstream()' = '""'
-'workstream_base_prefix()' = '"kamal/jj/base/"'
-# TODO(jj-vcs/jj#5895): Replace inlined workstream_base_prefix().
-'workstream_bases()' = '''bookmarks(glob:"kamal/jj/base/*")'''
+'workstream_prefix()' = '"kamal/"'
+# TODO(jj-vcs/jj#5895): Replace inlined workstream_prefix().
+'workstream_bases()' = '''bookmarks(regex:"^kamal/[^/]+/base$")'''
 
-# TODO(jj-vcs/jj#5895): Factor out workstream_base(name).
-# 'workstream_base(name)' = '''bookmarks(glob:concat(workstream_base_prefix(), name))'''
+# `workstream_pushed(pat)`: bookmarks under glob `pat`, minus the base. Callers
+# always pass a glob; once jj#5895 lands, that glob can be built from a slug via
+# concat() upstream (a `workstream()` returning "<slug>") and fed to this same
+# helper, e.g.:
+# 'workstream_base(name)' = '''bookmarks(glob:concat(workstream_prefix(), name, "/base"))'''
+# 'workstream_pushed()'   = '''workstream_pushed(concat(workstream_prefix(), workstream(), "/*"))'''
 'workstream_base()' = '''none()'''
-'workstream_log_context(base)' = '''base | ancestors(heads(reachable(base, mutable())), 2)'''
+'workstream_pushed()' = '''none()'''
+'workstream_pushed(pat)' = '''bookmarks(glob:pat) ~ workstream_base()'''
+
+# The live workstream (full mutable stacks reachable from the base), plus commits
+# already pushed out onto trunk and their local descendants, minus whatever has
+# since merged. `~ ::trunk()` both drops merged work and stops `descendants()`
+# from walking down all of trunk once a pushed commit lands there.
+'workstream_log_context(base)' = '''reachable(base, mutable()) | (descendants(workstream_pushed()) ~ ::trunk())'''
 'workstream_log_context()' = '''workstream_log_context(workstream_base())'''
 'global_log_context()' = 'ancestors(immutable_heads().., 2)'
 
@@ -57,6 +73,16 @@ hunk = ["util", "exec", "--", "jj-hunk"]
 private-commits = 'default_private_commits()'
 
 [template-aliases]
+# `is_workstream_base(name)`: does `name` match a workstream base bookmark,
+# i.e. `^kamal/[^/]+/base$`? The template DSL has no regex, hence the
+# prefix/suffix dance. Used by `workstream_push_prefix()` in conf.d/wave.toml.
+'is_workstream_base(name)' = '''
+  name.starts_with("kamal/")
+  && name.remove_prefix("kamal/").ends_with("/base")
+  && (name.remove_prefix("kamal/").remove_suffix("/base") != "")
+  && !name.remove_prefix("kamal/").remove_suffix("/base").contains("/")
+'''
+
 'format_commit_labels(commit)' = '''
   separate(" ",
     coalesce(
