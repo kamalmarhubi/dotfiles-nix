@@ -26,57 +26,57 @@ hunk = ["util", "exec", "--", "jj-hunk"]
 # Empty non-merge commits, blank descriptions, and WIP markers are scratch work.
 'incomplete()' = '''((empty() & ~merges()) | description("") | description(regex-i:'^(wip|tktk)\b')) ~ root()'''
 
-# Workstream-based log flow. A "workstream" lives entirely under `kamal/<slug>/`:
-# it is rooted by an empty commit bookmarked `kamal/<slug>/base`, and commits
-# pushed out of it (rebased onto trunk) are bookmarked
-# `kamal/<slug>/<date>-<change_id>` by `git_push_bookmark`. Everything else
-# should "just work".
+# A "grove" is a cluster of related work growing from one base. It's the unit
+# the default log is organised around, and lives entirely under `kamal/<slug>/`:
+# rooted by an empty commit bookmarked `kamal/<slug>/base`, with commits pushed
+# out of it (rebased onto trunk) bookmarked `kamal/<slug>/<date>-<change_id>` by
+# `git_push_bookmark`. Everything else should "just work".
 
-# Workspaces specify a workstream by overriding `workstream_base()` (the base
-# bookmark) and `workstream_pushed()` (its pushed bookmarks, via the glob helper):
+# Workspaces specify a grove by overriding `grove_base()` (the base
+# bookmark) and `grove_pushed()` (its pushed bookmarks, via the glob helper):
 #
 #   [revset-aliases]
-#   'workstream_base()'   = 'kamal/<slug>/base'
-#   'workstream_pushed()' = 'workstream_pushed("kamal/<slug>/*")'
+#   'grove_base()'   = 'kamal/<slug>/base'
+#   'grove_pushed()' = 'grove_pushed("kamal/<slug>/*")'
 #
-# TODO(jj-vcs/jj#5895): Replace this with a slug-based `workstream()`. Once `glob:`
+# TODO(jj-vcs/jj#5895): Replace this with a slug-based `grove()`. Once `glob:`
 # accepts `concat()`, base and pushed both derive from one slug instead of being
 # restated per workspace (see the factored-out aliases below).
-'workstream()' = '""'
-'workstream_prefix()' = '"kamal/"'
-# TODO(jj-vcs/jj#5895): Replace inlined workstream_prefix().
-'workstream_bases()' = '''bookmarks(regex:"^kamal/[^/]+/base$")'''
+'grove()' = '""'
+'grove_prefix()' = '"kamal/"'
+# TODO(jj-vcs/jj#5895): Replace inlined grove_prefix().
+'grove_bases()' = '''bookmarks(regex:"^kamal/[^/]+/base$")'''
 
-# `workstream_pushed(pat)`: bookmarks under glob `pat`, minus the base. Callers
+# `grove_pushed(pat)`: bookmarks under glob `pat`, minus the base. Callers
 # always pass a glob; once jj#5895 lands, that glob can be built from a slug via
-# concat() upstream (a `workstream()` returning "<slug>") and fed to this same
+# concat() upstream (a `grove()` returning "<slug>") and fed to this same
 # helper, e.g.:
-# 'workstream_base(name)' = '''bookmarks(glob:concat(workstream_prefix(), name, "/base"))'''
-# 'workstream_pushed()'   = '''workstream_pushed(concat(workstream_prefix(), workstream(), "/*"))'''
-'workstream_base()' = '''none()'''
-'workstream_pushed()' = '''none()'''
-'workstream_pushed(pat)' = '''bookmarks(glob:pat) ~ workstream_base()'''
+# 'grove_base(name)' = '''bookmarks(glob:concat(grove_prefix(), name, "/base"))'''
+# 'grove_pushed()'   = '''grove_pushed(concat(grove_prefix(), grove(), "/*"))'''
+'grove_base()' = '''none()'''
+'grove_pushed()' = '''none()'''
+'grove_pushed(pat)' = '''bookmarks(glob:pat) ~ grove_base()'''
 
-# The live workstream (full mutable stacks reachable from the base), plus commits
+# The live grove (full mutable stacks reachable from the base), plus commits
 # already pushed out onto trunk and their local descendants, minus whatever has
 # since merged. `~ ::trunk()` both drops merged work and stops `descendants()`
 # from walking down all of trunk once a pushed commit lands there.
-'workstream_log_context(base)' = '''reachable(base, mutable()) | (descendants(workstream_pushed()) ~ ::trunk())'''
-'workstream_log_context()' = '''workstream_log_context(workstream_base())'''
+'grove_log_context(base)' = '''reachable(base, mutable()) | (descendants(grove_pushed()) ~ ::trunk())'''
+'grove_log_context()' = '''grove_log_context(grove_base())'''
 'global_log_context()' = 'ancestors(immutable_heads().., 2)'
 
 # "default_blah" are so that repos can be customised without repeating the basics.
-'default_private_commits()' = "(incomplete() & mine()) | descendants(workstream_bases())"
-'default_log()' = '''present(@) | trunk() | coalesce(workstream_log_context(), global_log_context())'''
+'default_private_commits()' = "(incomplete() & mine()) | descendants(grove_bases())"
+'default_log()' = '''present(@) | trunk() | coalesce(grove_log_context(), global_log_context())'''
 
 [git]
 private-commits = 'default_private_commits()'
 
 [template-aliases]
-# `is_workstream_base(name)`: does `name` match a workstream base bookmark,
+# `is_grove_base(name)`: does `name` match a grove base bookmark,
 # i.e. `^kamal/[^/]+/base$`? The template DSL has no regex, hence the
-# prefix/suffix dance. Used by `workstream_push_prefix()` in conf.d/wave.toml.
-'is_workstream_base(name)' = '''
+# prefix/suffix dance. Used by `grove_push_prefix()` in conf.d/wave.toml.
+'is_grove_base(name)' = '''
   name.starts_with("kamal/")
   && name.remove_prefix("kamal/").ends_with("/base")
   && (name.remove_prefix("kamal/").remove_suffix("/base") != "")
@@ -90,21 +90,21 @@ private-commits = 'default_private_commits()'
       if(commit.divergent(), label("divergent", "(divergent)")),
     ),
     if(commit.conflict(), label("conflict", "(conflict)")),
-    if(commit.contained_in("workstream_bases()") && !commit.empty(),
-      label("jj_base_nonempty", "NONEMPTY-BASE"),
+    if(commit.contained_in("grove_bases()") && !commit.empty(),
+      label("grove_base_nonempty", "NONEMPTY-BASE"),
     ),
   )
 '''
 [colors]
-"node jj_base_nonempty" = { reverse = true }
-jj_base_nonempty = { fg = "ansi-color-202", bold = true }
+"node grove_base_nonempty" = { reverse = true }
+grove_base_nonempty = { fg = "ansi-color-202", bold = true }
 
 [templates]
 log_node = '''
 label(
   if(
-    self && self.contained_in("workstream_bases()") && !self.empty(),
-    "jj_base_nonempty"
+    self && self.contained_in("grove_bases()") && !self.empty(),
+    "grove_base_nonempty"
   ),
   if(config("ui.graph.style").as_string().starts_with("ascii"),
     builtin_log_node_ascii,
