@@ -1,3 +1,4 @@
 # Ignore default nix output symlinks
 result
 result-*
+__pycache__
