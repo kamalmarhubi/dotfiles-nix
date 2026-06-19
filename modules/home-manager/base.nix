@@ -45,6 +45,8 @@
     wget
   ];
 
+  home.sessionPath = ["${config.home.homeDirectory}/.local/bin"];
+
   nixpkgs.allowUnfreePackages = with pkgs; [
     _1password-cli
   ];

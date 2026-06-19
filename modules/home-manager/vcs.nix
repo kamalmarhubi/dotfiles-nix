@@ -20,13 +20,11 @@
       # git-filter-repo
       lazygit
     ];
+    file.".local/bin/jj-gh-fork".source =
+      config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/jj/jj-gh-fork";
   };
 
   xdg.configFile."jj/config.toml".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/jj/config.toml";
-  xdg.configFile."jj/conf.d/gh-fork.toml".text = ''
-    [aliases]
-    gh-fork = ["util", "exec", "--", "${config.xdg.configHome}/home-manager/files/jj/jj-gh-fork"]
-  '';
   xdg.configFile."git/config".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/git/config";
   xdg.configFile."git/config.mine".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/git/config.mine";
   xdg.configFile."git/config.system".text = let

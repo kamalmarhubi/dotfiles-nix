@@ -21,6 +21,7 @@ diff-formatter = ":git"
 
 [aliases]
 hunk = ["util", "exec", "--", "jj-hunk"]
+gh-fork = ["util", "exec", "--", "jj-gh-fork"]
 
 [revset-aliases]
 # Empty non-merge commits, blank descriptions, and WIP markers are scratch work.
