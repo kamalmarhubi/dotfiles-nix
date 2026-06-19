@@ -21,6 +21,7 @@ diff-formatter = ":git"
 
 [aliases]
 hunk = ["util", "exec", "--", "jj-hunk"]
+grove = ["util", "exec", "--", "jj-grove"]
 gh-fork = ["util", "exec", "--", "jj-gh-fork"]
 
 [revset-aliases]

@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""jj-grove: manage groves and their workspaces.
+
+A "grove" is a long-lived line of work rooted at an empty base commit on
+trunk(), bookmarked `kamal/<slug>/base`, with one or more jj workspaces bound to
+it via per-workspace config (`grove_base()` / `grove_bookmarks()`). The revset
+machinery (grove_base/grove_bases/grove_bookmarks/grove/is_grove_base)
+lives in jj's config.toml; this script is the front door for creating and
+managing groves.
+
+Subcommands:
+  new <slug> [--bare] [--root DIR]   create a grove (+ a workspace unless --bare)
+  work <slug> <name> [--root DIR]    add another workspace to an existing grove
+  use <slug>                         bind the current workspace to an existing grove
+  list                               list groves and their workspaces
+  rm <slug> [--force]                remove a grove (its workspaces + base bookmark)
+
+Output contract: the new workspace's absolute path goes to stdout (new/work);
+all human narration goes to stderr; -q/--quiet drops the narration. -n/--dry-run
+prints the plan without touching anything.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+PREFIX = "kamal/"  # bookmark namespace (kept literal; see config.toml)
+
+
+def base_bookmark(slug: str) -> str:
+    return f"{PREFIX}{slug}/base"
+
+
+def bookmarks_value(slug: str) -> str:
+    # value stored in a workspace's grove_bookmarks() override
+    return f'grove_bookmarks("{PREFIX}{slug}/*")'
+
+
+# --------------------------------------------------------------------------- #
+# output
+# --------------------------------------------------------------------------- #
+
+QUIET = False
+DRY = False
+
+
+def info(msg: str = "") -> None:
+    if not QUIET:
+        print(msg, file=sys.stderr)
+
+
+def plan(msg: str) -> None:
+    # dry-run plan line (always shown, even with --quiet, since it IS the output)
+    print(f"  {msg}", file=sys.stderr)
+
+
+def die(msg: str, code: int = 1) -> "None":
+    print(f"jj grove: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+# --------------------------------------------------------------------------- #
+# jj helpers
+# --------------------------------------------------------------------------- #
+
+
+def jj(*args: str, cwd: str | None = None) -> str:
+    """Run a read-only jj query; return stripped stdout. Always executes."""
+    r = subprocess.run(
+        ["jj", *args], cwd=cwd, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if r.returncode != 0:
+        die(f"`jj {' '.join(args)}` failed:\n{r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def do(*args: str, cwd: str | None = None, why: str = "") -> None:
+    """Run a mutating jj command. Honors --dry-run."""
+    if DRY:
+        plan("jj " + " ".join(args) + (f"   # {why}" if why else ""))
+        return
+    r = subprocess.run(["jj", "--quiet", *args], cwd=cwd, text=True,
+                       stderr=subprocess.PIPE)
+    if r.returncode != 0:
+        die(f"`jj {' '.join(args)}` failed:\n{r.stderr.strip()}")
+
+
+def do_fs(desc: str, fn) -> None:
+    """Run a filesystem mutation. Honors --dry-run."""
+    if DRY:
+        plan(desc)
+        return
+    fn()
+
+
+# --------------------------------------------------------------------------- #
+# grove / workspace queries
+# --------------------------------------------------------------------------- #
+
+
+def current_ws_root() -> str:
+    return jj("workspace", "root")
+
+
+def siblings_parent() -> str:
+    # where new workspace dirs go: sibling of the current workspace root
+    return os.path.dirname(current_ws_root())
+
+
+def grove_exists(slug: str) -> bool:
+    out = jj("log", "--no-graph", "-r", f"present({base_bookmark(slug)})",
+             "-T", '"x"')
+    return bool(out)
+
+
+def at_on_base(slug: str, cwd: str | None = None) -> bool:
+    # is @ a descendant of (or equal to) the grove base?
+    out = jj("log", "--no-graph", "-r",
+             f"@ & descendants(present({base_bookmark(slug)}))",
+             "-T", '"x"', cwd=cwd)
+    return bool(out)
+
+
+def binding_slug(cwd: str | None = None) -> str | None:
+    """The grove a workspace is bound to (its grove_base() override), or None."""
+    val = jj("config", "get", 'revset-aliases."grove_base()"', cwd=cwd)
+    return slug_of(val)
+
+
+def slug_of(base_value: str) -> str | None:
+    """kamal/<slug>/base -> <slug>; anything else (e.g. none()) -> None."""
+    if base_value.startswith(PREFIX) and base_value.endswith("/base"):
+        mid = base_value[len(PREFIX):-len("/base")]
+        if mid and "/" not in mid:
+            return mid
+    return None
+
+
+def workspaces() -> list[tuple[str, str]]:
+    out = jj("workspace", "list", "-T", 'name ++ "\t" ++ root ++ "\n"')
+    pairs = []
+    for line in out.splitlines():
+        if "\t" in line:
+            name, root = line.split("\t", 1)
+            pairs.append((name, root))
+    return pairs
+
+
+def validate_slug(slug: str, what: str = "grove name") -> None:
+    if not slug or "/" in slug:
+        die(f"invalid {what}: {slug!r} (must be non-empty and contain no '/')")
+
+
+# --------------------------------------------------------------------------- #
+# bind
+# --------------------------------------------------------------------------- #
+
+
+def bind(slug: str, cwd: str | None = None) -> None:
+    do("config", "set", "--workspace", 'revset-aliases."grove_base()"',
+       base_bookmark(slug), cwd=cwd, why="bind grove_base()")
+    do("config", "set", "--workspace", 'revset-aliases."grove_bookmarks()"',
+       bookmarks_value(slug), cwd=cwd, why="bind grove_bookmarks()")
+
+
+# --------------------------------------------------------------------------- #
+# subcommands
+# --------------------------------------------------------------------------- #
+
+
+def cmd_new(args) -> None:
+    slug = args.slug
+    validate_slug(slug)
+    if grove_exists(slug):
+        die(f"grove '{slug}' already exists. "
+            f"Use `jj grove work {slug} <name>` to add a workspace.")
+
+    if args.bare:
+        info(f"creating grove '{slug}' (base only) at {base_bookmark(slug)}")
+        if DRY:
+            plan(f"jj new --no-edit trunk() -m {slug + ' base'!r}   # create base commit")
+            plan(f"jj bookmark create {base_bookmark(slug)} -r <new commit>")
+            return
+        r = subprocess.run(
+            ["jj", "new", "--no-edit", "trunk()", "-m", f"{slug} base"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        if r.returncode != 0:
+            die(f"creating base commit failed:\n{r.stderr.strip()}")
+        m = re.search(r"Created new commit (\S+)", r.stderr)
+        if not m:
+            die(f"couldn't find new commit id in:\n{r.stderr.strip()}")
+        do("bookmark", "create", base_bookmark(slug), "-r", m.group(1),
+           why="bookmark base")
+        info(f"created grove '{slug}' (no workspace)")
+        return
+
+    dest = os.path.abspath(args.root or os.path.join(siblings_parent(), slug))
+    name = os.path.basename(dest)
+    info(f"creating grove '{slug}' + workspace '{name}' at {dest}")
+    parent = os.path.dirname(dest)
+    do_fs(f"mkdir -p {parent}", lambda: os.makedirs(parent, exist_ok=True))
+    do("workspace", "add", "-r", "trunk()", dest, "--name", name,
+       why="new workspace on trunk")
+    do("describe", "-m", f"{slug} base", cwd=dest, why="describe base")
+    do("bookmark", "create", base_bookmark(slug), "-r", "@", cwd=dest,
+       why="bookmark base")
+    do("new", cwd=dest, why="working commit on base")
+    bind(slug, cwd=dest)
+    info(f"created grove '{slug}'; workspace at {dest}")
+    if not DRY:
+        print(dest)
+
+
+def cmd_work(args) -> None:
+    slug, name = args.slug, args.name
+    validate_slug(slug)
+    validate_slug(name, "workspace name")
+    if not grove_exists(slug):
+        die(f"no grove '{slug}'. Use `jj grove new {slug}` to create it.")
+
+    dest = os.path.abspath(args.root or os.path.join(siblings_parent(), f"{slug}-{name}"))
+    wsname = os.path.basename(dest)
+    info(f"adding workspace '{wsname}' on grove '{slug}' at {dest}")
+    parent = os.path.dirname(dest)
+    do_fs(f"mkdir -p {parent}", lambda: os.makedirs(parent, exist_ok=True))
+    do("workspace", "add", "-r", base_bookmark(slug), dest, "--name", wsname,
+       why="new workspace on grove base")
+    bind(slug, cwd=dest)
+    info(f"added workspace '{wsname}' on grove '{slug}'")
+    if not DRY:
+        print(dest)
+
+
+def cmd_use(args) -> None:
+    slug = args.slug
+    validate_slug(slug)
+    if not grove_exists(slug):
+        die(f"no grove '{slug}'. Use `jj grove new {slug}` to create it.")
+
+    current = binding_slug()
+    if current == slug:
+        info(f"already on grove '{slug}'")
+        return
+    if not at_on_base(slug):
+        die(f"@ isn't on {base_bookmark(slug)} -- the grove log won't include "
+            f"your work.\n"
+            f"       move it there:  jj rebase -b @ -d {base_bookmark(slug)}\n"
+            f"       then re-run:    jj grove use {slug}")
+    bind(slug)
+    if current:
+        info(f"rebound grove '{current}' -> '{slug}'")
+    else:
+        info(f"bound current workspace to grove '{slug}'")
+
+
+def cmd_list(args) -> None:
+    bases = jj("log", "--no-graph", "-r", "grove_bases()", "-T",
+               'bookmarks ++ "\n"')
+    slugs = sorted(filter(None, (slug_of(b.strip()) for b in bases.splitlines())))
+
+    cur_slug = binding_slug()
+    cur_root = os.path.realpath(current_ws_root())
+
+    # map slug -> [workspace names]
+    by_slug: dict[str, list[str]] = {s: [] for s in slugs}
+    for name, root in workspaces():
+        s = binding_slug(cwd=root)
+        if s in by_slug:
+            mark = " (here)" if os.path.realpath(root) == cur_root else ""
+            by_slug[s].append(name + mark)
+
+    if not slugs:
+        info("no groves")
+        return
+
+    for s in slugs:
+        base = base_bookmark(s)
+        # stale: no live mutable work and no unmerged pushed bookmarks
+        live = jj("log", "--no-graph", "-r",
+                  f"(descendants({base}) & mutable()) ~ {base}", "-T", '"x"')
+        unmerged = jj("log", "--no-graph", "-r",
+                      f'(bookmarks(glob:"{PREFIX}{s}/*") ~ {base}) ~ ::trunk()',
+                      "-T", '"x"')
+        flags = []
+        if s == cur_slug:
+            flags.append("current")
+        if not live and not unmerged:
+            flags.append("stale")
+        tag = f"  [{', '.join(flags)}]" if flags else ""
+        ws = ", ".join(by_slug[s]) or "-"
+        print(f"{s:<20} {base:<26} ws: {ws}{tag}")
+
+
+def cmd_rm(args) -> None:
+    slug = args.slug
+    validate_slug(slug)
+    if not grove_exists(slug):
+        die(f"no grove '{slug}'.")
+
+    base = base_bookmark(slug)
+    cur_root = os.path.realpath(current_ws_root())
+    bound = [(name, root) for name, root in workspaces()
+             if binding_slug(cwd=root) == slug]
+
+    # guard: don't pull the rug out from under the current workspace
+    for name, root in bound:
+        if os.path.realpath(root) == cur_root:
+            die(f"you're inside grove '{slug}' (workspace '{name}'). "
+                f"cd to a workspace outside it and re-run.")
+
+    # guard: refuse if any bound workspace has non-empty (would-be-lost) work
+    if not args.force:
+        risky = jj("log", "--no-graph", "-r",
+                   f"(descendants({base}) & mutable()) ~ empty()", "-T", '"x"')
+        if risky:
+            die(f"grove '{slug}' has non-empty local commits that would be lost. "
+                f"Re-run with --force to remove anyway.")
+
+    # plan
+    info(f"removing grove '{slug}':")
+    info(f"  bookmark  {base}")
+    for name, root in bound:
+        info(f"  workspace {name}  ({root})")
+    if not bound:
+        info("  (no bound workspaces)")
+
+    if DRY:
+        plan(f"jj workspace forget {' '.join(n for n, _ in bound)}" if bound else "(nothing to forget)")
+        for _, root in bound:
+            plan(f"rm -rf {root}")
+        plan(f"jj bookmark delete {base}")
+        return
+
+    # confirm
+    if not args.force:
+        if not sys.stdin.isatty():
+            die("refusing to remove without confirmation (not a TTY); use --force")
+        try:
+            ans = input("delete these workspaces and the base? [y/N] ")
+        except EOFError:
+            ans = ""
+        if ans.strip().lower() not in ("y", "yes"):
+            die("aborted", code=1)
+
+    if bound:
+        do("workspace", "forget", *[n for n, _ in bound], why="forget workspaces")
+    for _, root in bound:
+        do_fs(f"rm -rf {root}", lambda root=root: shutil.rmtree(root, ignore_errors=True))
+    do("bookmark", "delete", base, why="delete base bookmark")
+    info(f"removed grove '{slug}'")
+
+
+# --------------------------------------------------------------------------- #
+# cli
+# --------------------------------------------------------------------------- #
+
+
+def main() -> None:
+    global QUIET, DRY
+
+    p = argparse.ArgumentParser(prog="jj grove", description="manage groves and their workspaces")
+    p.add_argument("-q", "--quiet", action="store_true", help="suppress narration (stderr)")
+    p.add_argument("-n", "--dry-run", action="store_true", help="print the plan; change nothing")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sp = sub.add_parser("new", help="create a grove (+ a workspace unless --bare)")
+    sp.add_argument("slug")
+    sp.add_argument("--bare", action="store_true", help="create the base only, no workspace")
+    sp.add_argument("--root", metavar="DIR", help="workspace directory (default: ../<slug>)")
+    sp.set_defaults(fn=cmd_new)
+
+    sp = sub.add_parser("work", help="add a workspace to an existing grove")
+    sp.add_argument("slug")
+    sp.add_argument("name")
+    sp.add_argument("--root", metavar="DIR", help="workspace directory (default: ../<slug>-<name>)")
+    sp.set_defaults(fn=cmd_work)
+
+    sp = sub.add_parser("use", help="bind the current workspace to an existing grove")
+    sp.add_argument("slug")
+    sp.set_defaults(fn=cmd_use)
+
+    sp = sub.add_parser("list", help="list groves and their workspaces")
+    sp.set_defaults(fn=cmd_list)
+
+    sp = sub.add_parser("rm", help="remove a grove (workspaces + base bookmark)")
+    sp.add_argument("slug")
+    sp.add_argument("--force", action="store_true", help="skip guards and confirmation")
+    sp.set_defaults(fn=cmd_rm)
+
+    args = p.parse_args()
+    QUIET = args.quiet
+    DRY = args.dry_run
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()
