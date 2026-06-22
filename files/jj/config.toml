@@ -34,11 +34,11 @@ gh-fork = ["util", "exec", "--", "jj-gh-fork"]
 # `git_push_bookmark`. Everything else should "just work".
 
 # Workspaces specify a grove by overriding `grove_base()` (the base
-# bookmark) and `grove_pushed()` (its pushed bookmarks, via the glob helper):
+# bookmark) and `grove_bookmarks()` (its pushed bookmarks, via the glob helper):
 #
 #   [revset-aliases]
 #   'grove_base()'   = 'kamal/<slug>/base'
-#   'grove_pushed()' = 'grove_pushed("kamal/<slug>/*")'
+#   'grove_bookmarks()' = 'grove_bookmarks("kamal/<slug>/*")'
 #
 # TODO(jj-vcs/jj#5895): Replace this with a slug-based `grove()`. Once `glob:`
 # accepts `concat()`, base and pushed both derive from one slug instead of being
@@ -48,21 +48,21 @@ gh-fork = ["util", "exec", "--", "jj-gh-fork"]
 # TODO(jj-vcs/jj#5895): Replace inlined grove_prefix().
 'grove_bases()' = '''bookmarks(regex:"^kamal/[^/]+/base$")'''
 
-# `grove_pushed(pat)`: bookmarks under glob `pat`, minus the base. Callers
+# `grove_bookmarks(pat)`: bookmarks under glob `pat`, minus the base. Callers
 # always pass a glob; once jj#5895 lands, that glob can be built from a slug via
 # concat() upstream (a `grove()` returning "<slug>") and fed to this same
 # helper, e.g.:
 # 'grove_base(name)' = '''bookmarks(glob:concat(grove_prefix(), name, "/base"))'''
-# 'grove_pushed()'   = '''grove_pushed(concat(grove_prefix(), grove(), "/*"))'''
+# 'grove_bookmarks()'   = '''grove_bookmarks(concat(grove_prefix(), grove(), "/*"))'''
 'grove_base()' = '''none()'''
-'grove_pushed()' = '''none()'''
-'grove_pushed(pat)' = '''bookmarks(glob:pat) ~ grove_base()'''
+'grove_bookmarks()' = '''none()'''
+'grove_bookmarks(pat)' = '''bookmarks(glob:pat) ~ grove_base()'''
 
 # The live grove (full mutable stacks reachable from the base), plus commits
 # already pushed out onto trunk and their local descendants, minus whatever has
 # since merged. `~ ::trunk()` both drops merged work and stops `descendants()`
 # from walking down all of trunk once a pushed commit lands there.
-'grove_log_context(base)' = '''reachable(base, mutable()) | (descendants(grove_pushed()) ~ ::trunk())'''
+'grove_log_context(base)' = '''reachable(base, mutable()) | (descendants(grove_bookmarks()) ~ ::trunk())'''
 'grove_log_context()' = '''grove_log_context(grove_base())'''
 'global_log_context()' = 'ancestors(immutable_heads().., 2)'
 
