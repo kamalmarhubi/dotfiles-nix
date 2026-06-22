@@ -40,35 +40,29 @@ gh-fork = ["util", "exec", "--", "jj-gh-fork"]
 #   'grove_base()'   = 'kamal/<slug>/base'
 #   'grove_bookmarks()' = 'grove_bookmarks("kamal/<slug>/*")'
 #
-# TODO(jj-vcs/jj#5895): Replace this with a slug-based `grove()`. Once `glob:`
-# accepts `concat()`, base and pushed both derive from one slug instead of being
-# restated per workspace (see the factored-out aliases below).
-'grove()' = '""'
 'grove_prefix()' = '"kamal/"'
 # TODO(jj-vcs/jj#5895): Replace inlined grove_prefix().
 'grove_bases()' = '''bookmarks(regex:"^kamal/[^/]+/base$")'''
 
-# `grove_bookmarks(pat)`: bookmarks under glob `pat`, minus the base. Callers
-# always pass a glob; once jj#5895 lands, that glob can be built from a slug via
-# concat() upstream (a `grove()` returning "<slug>") and fed to this same
-# helper, e.g.:
-# 'grove_base(name)' = '''bookmarks(glob:concat(grove_prefix(), name, "/base"))'''
-# 'grove_bookmarks()'   = '''grove_bookmarks(concat(grove_prefix(), grove(), "/*"))'''
+# `grove_bookmarks(pat)`: bookmarks under glob `pat`, minus the base. If / when
+# jj#5895 gives a way to interpolate values into revsets, base and pushed can
+# derive from one per-workspace slug instead of being restated, eg:
+#   'grove_base()'   = '''bookmarks(glob:concat(grove_prefix(), <slug>, "/base"))'''
+#   'grove_bookmarks()' = '''grove_bookmarks(concat(grove_prefix(), <slug>, "/*"))'''
 'grove_base()' = '''none()'''
 'grove_bookmarks()' = '''none()'''
 'grove_bookmarks(pat)' = '''bookmarks(glob:pat) ~ grove_base()'''
 
-# The live grove (full mutable stacks reachable from the base), plus commits
-# already pushed out onto trunk and their local descendants, minus whatever has
-# since merged. `~ ::trunk()` both drops merged work and stops `descendants()`
-# from walking down all of trunk once a pushed commit lands there.
-'grove_log_context(base)' = '''reachable(base, mutable()) | (descendants(grove_bookmarks()) ~ ::trunk())'''
-'grove_log_context()' = '''grove_log_context(grove_base())'''
+# `grove(r)`: live mutable stacks on base `r`, plus pushed-but-unmerged commits.
+# `~ ::trunk()` drops merged commits and keeps `descendants()` off the rest of trunk.
+# `grove()` is the current workspace's grove, usable as `jj log -r grove()`.
+'grove(r)' = '''reachable(r, mutable()) | (descendants(grove_bookmarks()) ~ ::trunk())'''
+'grove()' = '''grove(grove_base())'''
 'global_log_context()' = 'ancestors(immutable_heads().., 2)'
 
 # "default_blah" are so that repos can be customised without repeating the basics.
 'default_private_commits()' = "(incomplete() & mine()) | descendants(grove_bases())"
-'default_log()' = '''present(@) | trunk() | coalesce(grove_log_context(), global_log_context())'''
+'default_log()' = '''present(@) | trunk() | coalesce(grove(), global_log_context())'''
 
 [git]
 private-commits = 'default_private_commits()'
