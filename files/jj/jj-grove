@@ -14,6 +14,7 @@ Subcommands:
   use <slug>                         bind the current workspace to an existing grove
   list                               list groves and their workspaces
   rm <slug> [--force]                remove a grove (its workspaces + base bookmark)
+  graft <revset> [--push]            graduate a rooted prefix onto trunk as PR bookmarks
 
 Output contract: the new workspace's absolute path goes to stdout (new/work);
 all human narration goes to stderr; -q/--quiet drops the narration. -n/--dry-run
@@ -358,6 +359,92 @@ def cmd_rm(args) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# graft
+# --------------------------------------------------------------------------- #
+
+
+def _ids(revset: str) -> list[str]:
+    """Unambiguous short change-ids for a revset (stable across rebase)."""
+    out = jj("log", "--no-graph", "-r", revset, "-T", 'change_id.shortest(8) ++ "\n"')
+    return [c for c in out.splitlines() if c]
+
+
+def cmd_graft(args) -> None:
+    revset = args.revset
+    slug = binding_slug()
+    if slug is None:
+        die("not bound to a grove (grove_base() is none()); cd into a grove workspace.")
+
+    S = f"(({revset}) & (grove_base()..))"            # commits to bookmark (PR heads)
+    heads_S = f"heads({S})"
+    newwork = f"((grove_base()..{heads_S}) ~ ::grove_bookmarks())"
+    fork = "fork_point(grove_base() | trunk())"
+
+    # guards -- all before mutating
+    if jj("log", "--no-graph", "-r", "grove_base() & ~empty()", "-T", '"x"'):
+        die("grove base is not empty (NONEMPTY-BASE); graft would drop its changes.")
+    stray = _ids(f"(({revset}) & mutable()) ~ grove()")
+    if stray:
+        die(f"revset reaches outside the grove: {', '.join(stray)}")
+    if not _ids(S):
+        die("nothing to graft (revset matches no grove work above the base).")
+    bad = _ids(f"({newwork}) & (incomplete() | conflicts())")
+    if bad:
+        die(f"range has WIP/conflicted commits; finish them first: {', '.join(bad)}")
+
+    info(f"grafting grove '{slug}' onto trunk:")
+    start_op = jj("op", "log", "-n1", "--no-graph", "-T", "self.id()")
+    names: list[str] = []
+    try:
+        # lift: re-root not-yet-grafted work onto its non-base parent, else the fork point
+        for r in _ids(f"roots({newwork})"):
+            onto = _ids(f"parents({r}) ~ grove_base()")
+            dest = " | ".join(onto) if onto else fork
+            do("rebase", "-s", r, "--onto", dest, why=f"lift {r}")
+        # reconnect: survivors above the cut gain grove_base() as an extra parent
+        for c in _ids(f"children({heads_S}) ~ (grove_base()..{heads_S})"):
+            do("rebase", "-r", c, "--onto", f"(parents({c})) | grove_base()",
+               why=f"reconnect {c} to base")
+        # bookmark each grafted commit, named like git_push_bookmark
+        rows = jj("log", "--no-graph", "--reversed", "-r", S, "-T",
+                  'change_id.shortest(8) ++ "\t"'
+                  ' ++ author.timestamp().local().format("%Y-%m-%d") ++ "-" ++ change_id.short()'
+                  ' ++ "\n"')
+        for line in rows.splitlines():
+            if "\t" not in line:
+                continue
+            cid, suffix = line.split("\t", 1)
+            name = f"{PREFIX}{slug}/{suffix}"
+            do("bookmark", "create", name, "-r", cid, why="bookmark")
+            names.append(name)
+    except SystemExit:
+        if not DRY:
+            rb = subprocess.run(["jj", "--quiet", "op", "restore", start_op],
+                                text=True, stderr=subprocess.PIPE)
+            if rb.returncode == 0:
+                info("rolled back; nothing changed.")
+            else:
+                info(f"rollback FAILED -- restore by hand:  jj op restore {start_op}")
+        raise
+
+    info(f"grafted {len(names)} bookmark(s)" + ("" if args.push else " (local; not pushed)"))
+
+    if args.push:
+        if DRY:
+            plan(f"jj git push -r {S}")
+        else:
+            r = subprocess.run(["jj", "git", "push", "-r", S], text=True,
+                               stderr=subprocess.PIPE)
+            if r.returncode != 0:
+                die(f"grafted locally, but push failed:\n{r.stderr.strip()}\n"
+                    f"       the bookmarks exist -- retry:  jj git push -r {S!r}")
+
+    if not DRY:
+        for name in names:
+            print(name)
+
+
+# --------------------------------------------------------------------------- #
 # cli
 # --------------------------------------------------------------------------- #
 
@@ -393,6 +480,11 @@ def main() -> None:
     sp.add_argument("slug")
     sp.add_argument("--force", action="store_true", help="skip guards and confirmation")
     sp.set_defaults(fn=cmd_rm)
+
+    sp = sub.add_parser("graft", help="graduate a rooted prefix onto trunk as PR bookmarks")
+    sp.add_argument("--push", action="store_true", help="also push the bookmarks to the remote")
+    sp.add_argument("revset", help="commits to bookmark (PR heads); the prefix below them is grafted")
+    sp.set_defaults(fn=cmd_graft)
 
     args = p.parse_args()
     QUIET = args.quiet
