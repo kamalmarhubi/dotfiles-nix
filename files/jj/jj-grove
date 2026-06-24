@@ -15,6 +15,7 @@ Subcommands:
   list                               list groves and their workspaces
   rm <slug> [--force]                remove a grove (its workspaces + base bookmark)
   graft <revset> [--push]            graduate a rooted prefix onto trunk as bookmarks to push
+  sync [--no-fetch] [--keep-merged]  advance the base onto trunk; prune merged bookmarks
 
 Output contract: the new workspace's absolute path goes to stdout (new/work);
 all human narration goes to stderr; -q/--quiet drops the narration. -n/--dry-run
@@ -440,6 +441,69 @@ def cmd_graft(args) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# sync
+# --------------------------------------------------------------------------- #
+
+
+def cmd_sync(args) -> None:
+    slug = binding_slug()
+    if slug is None:
+        die("not bound to a grove (grove_base() is none()); cd into a grove workspace.")
+
+    # refuse if a grove bookmark sits on a base-descendant: advancing the base
+    # would rebase a live pushed bookmark
+    onbase = _ids("grove_bookmarks() & descendants(grove_base())")
+    if onbase:
+        die(f"grove bookmark(s) sit on base-descendants; sync would rebase them: "
+            f"{', '.join(onbase)}")
+
+    if not args.no_fetch:
+        if DRY:
+            plan("jj git fetch")
+        else:
+            info("fetching...")
+            r = subprocess.run(["jj", "git", "fetch"], text=True, stderr=subprocess.PIPE)
+            if r.returncode != 0:
+                die(f"fetch failed:\n{r.stderr.strip()}\n"
+                    f"       use --no-fetch to advance onto the local trunk.")
+
+    info(f"syncing grove '{slug}' onto trunk:")
+    start_op = jj("op", "log", "-n1", "--no-graph", "-T", "self.id()")
+    merged: list[str] = []
+    try:
+        # advance the base (+ on-base survivors) onto current trunk; --simplify-parents
+        # drops now-redundant parent edges to merged grafts. -s grove_base() scopes the
+        # rebase to base + descendants, so off-base bookmarks are left untouched.
+        do("rebase", "-s", "grove_base()", "--onto", "trunk()", "--simplify-parents",
+           why="advance base onto trunk")
+        # prune merged grove bookmarks; `delete` removes their remote branches on
+        # the next push (--keep-merged skips)
+        if not args.keep_merged:
+            merged_revset = (
+                f'bookmarks(glob:"{grove_prefix()}{slug}/*") '
+                '& (::trunk() ~ grove_bases())'
+            )
+            merged = jj(
+                "bookmark", "list", "-r", merged_revset,
+                "-T", 'if(!remote && present && !conflict, name ++ "\n")'
+            ).splitlines()
+            if merged:
+                do("bookmark", "delete", *merged, why="prune merged")
+    except SystemExit:
+        if not DRY:
+            rb = subprocess.run(["jj", "--quiet", "op", "restore", start_op],
+                                text=True, stderr=subprocess.PIPE)
+            if rb.returncode == 0:
+                info("rolled back; nothing changed.")
+            else:
+                info(f"rollback FAILED -- restore by hand:  jj op restore {start_op}")
+        raise
+
+    info(f"synced onto trunk; pruned {len(merged)} merged bookmark(s)"
+         + (" (remote branches deleted on next push)" if merged else ""))
+
+
+# --------------------------------------------------------------------------- #
 # cli
 # --------------------------------------------------------------------------- #
 
@@ -483,6 +547,13 @@ def main() -> None:
     sp.add_argument("--push", action="store_true", help="also push the bookmarks to the remote")
     sp.add_argument("revset", help="commits to bookmark; the prefix below them is grafted")
     sp.set_defaults(fn=cmd_graft)
+
+    sp = sub.add_parser("sync", parents=[common], help="advance the grove base onto trunk; prune merged bookmarks")
+    sp.add_argument("--no-fetch", action="store_true",
+                    help="skip the git fetch; advance onto the local trunk")
+    sp.add_argument("--keep-merged", action="store_true",
+                    help="don't prune merged bookmarks (default deletes them; remote branch removed on next push)")
+    sp.set_defaults(fn=cmd_sync)
 
     args = p.parse_args()
     QUIET = args.quiet
