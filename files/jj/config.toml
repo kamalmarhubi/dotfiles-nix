@@ -89,11 +89,18 @@ private-commits = 'default_private_commits()'
     if(commit.contained_in("grove_bases()") && !commit.empty(),
       label("grove_base_nonempty", "NONEMPTY-BASE"),
     ),
+    if(commit.current_working_copy()
+       && is_grove_base(config('revset-aliases."grove_base()"').as_string())
+       && !commit.contained_in("grove()"),
+      label("grove_off_base", "off-grove:" ++
+        config('revset-aliases."grove_base()"').as_string().remove_prefix("kamal/").remove_suffix("/base")),
+    ),
   )
 '''
 [colors]
 "node grove_base_nonempty" = { reverse = true }
 grove_base_nonempty = { fg = "ansi-color-202", bold = true }
+grove_off_base = { fg = "red", bold = true }
 
 [templates]
 log_node = '''
