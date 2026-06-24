@@ -63,7 +63,7 @@ gh-fork = ["util", "exec", "--", "jj-gh-fork"]
 
 # "default_blah" are so that repos can be customised without repeating the basics.
 'default_private_commits()' = "(incomplete() & mine()) | descendants(grove_bases())"
-'default_log()' = '''present(@) | trunk() | coalesce(grove(), global_log_context())'''
+'default_log()' = '''ancestors(@, 3) | descendants(@, 3) | trunk() | trunk()..@ | coalesce(grove(), global_log_context())'''
 
 [git]
 private-commits = 'default_private_commits()'
