@@ -16,6 +16,7 @@ Subcommands:
   rm <slug> [--force]                remove a grove (its workspaces + base bookmark)
   graft <revset> [--push]            graduate a rooted prefix onto trunk as bookmarks to push
   sync [--no-fetch] [--keep-merged]  advance the base onto trunk; prune merged bookmarks
+  push                               push the grove's bookmarks to the remote
 
 Output contract: the new workspace's absolute path goes to stdout (new/work);
 all human narration goes to stderr; -q/--quiet drops the narration. -n/--dry-run
@@ -101,6 +102,21 @@ def do_fs(desc: str, fn) -> None:
         plan(desc)
         return
     fn()
+
+
+@functools.cache
+def push_remote() -> str:
+    """The remote `jj git push` targets: git.push, else the sole remote, else origin."""
+    r = subprocess.run(["jj", "config", "get", "git.push"], text=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+    remotes = [ln.split()[0] for ln in jj("git", "remote", "list").splitlines() if ln.strip()]
+    return remotes[0] if len(remotes) == 1 else "origin"
+
+
+def has_remote() -> bool:
+    return bool(jj("git", "remote", "list").strip())
 
 
 # --------------------------------------------------------------------------- #
@@ -388,7 +404,7 @@ def cmd_graft(args) -> None:
     if bad:
         die(f"range has WIP/conflicted commits; finish them first: {', '.join(bad)}")
 
-    info(f"grafting grove '{slug}' onto trunk:")
+    info(f"grafting '{revset}' onto trunk")
     start_op = jj("op", "log", "-n1", "--no-graph", "-T", "self.id()")
     names: list[str] = []
     try:
@@ -425,15 +441,13 @@ def cmd_graft(args) -> None:
 
     info(f"grafted {len(names)} bookmark(s)" + ("" if args.push else " (local; not pushed)"))
 
+    # track to the push remote so a hand `jj git push -r <rev>` works later;
+    # best-effort and offline-safe -- graft itself needs no remote
+    if names and has_remote():
+        _track(names)
+
     if args.push:
-        if DRY:
-            plan(f"jj git push -r {S}")
-        else:
-            r = subprocess.run(["jj", "git", "push", "-r", S], text=True,
-                               stderr=subprocess.PIPE)
-            if r.returncode != 0:
-                die(f"grafted locally, but push failed:\n{r.stderr.strip()}\n"
-                    f"       the bookmarks exist -- retry:  jj git push -r {S!r}")
+        _push(names, why="push grafted bookmarks")
 
     if not DRY:
         for name in names:
@@ -467,7 +481,7 @@ def cmd_sync(args) -> None:
                 die(f"fetch failed:\n{r.stderr.strip()}\n"
                     f"       use --no-fetch to advance onto the local trunk.")
 
-    info(f"syncing grove '{slug}' onto trunk:")
+    info(f"syncing grove '{slug}' onto trunk")
     start_op = jj("op", "log", "-n1", "--no-graph", "-T", "self.id()")
     merged: list[str] = []
     try:
@@ -499,8 +513,78 @@ def cmd_sync(args) -> None:
                 info(f"rollback FAILED -- restore by hand:  jj op restore {start_op}")
         raise
 
-    info(f"synced onto trunk; pruned {len(merged)} merged bookmark(s)"
-         + (" (remote branches deleted on next push)" if merged else ""))
+    info(f"synced onto trunk{f'; pruned {len(merged)} merged bookmark(s) '
+         f'(remote branches deleted on next push)' if merged else ''}")
+
+
+# --------------------------------------------------------------------------- #
+# push
+# --------------------------------------------------------------------------- #
+
+
+def _track(names: list[str]) -> None:
+    """Best-effort: track bookmarks to the push remote so a hand `jj git push -r
+    <rev>` works later. Failures are ignored (e.g. no remote)."""
+    remote = push_remote()
+    if DRY:
+        plan(f"jj bookmark track {' '.join(names)} --remote {remote}")
+        return
+    subprocess.run(["jj", "--quiet", "bookmark", "track", *names, "--remote", remote],
+                   text=True, stderr=subprocess.DEVNULL)
+
+
+def _push(names: list[str], why: str = "") -> None:
+    """Push bookmarks by name to the push remote. `-b <name>` auto-tracks/creates
+    new bookmarks and force-with-lease updates moved ones. jj's output (progress,
+    remote branch URLs) flows to the terminal. Honors --dry-run / --quiet."""
+    remote = push_remote()
+    flags = [a for name in names for a in ("-b", name)]
+    if DRY:
+        plan(f"jj git push --remote {remote} {' '.join(flags)}"
+             + (f"   # {why}" if why else ""))
+        return
+    cmd = ["jj", "git", "push", "--remote", remote, *flags]
+    if QUIET:
+        cmd.insert(1, "--quiet")
+    if subprocess.run(cmd, text=True).returncode != 0:
+        die("push failed (see above); bookmarks remain tracked locally -- "
+            "fix the cause and re-run.")
+
+
+def cmd_push(args) -> None:
+    slug = binding_slug()
+    if slug is None:
+        die("not bound to a grove (grove_base() is none()); cd into a grove workspace.")
+
+    base = base_bookmark(slug)
+    glob = f"glob:{grove_prefix()}{slug}/*"
+    remote = push_remote()
+
+    # live bookmarks: present locally under the grove glob.
+    live = jj("bookmark", "list", glob,
+              "-T", 'if(!remote && present, name ++ "\n")').splitlines()
+    # merged-bookmark deletions: locally deleted, still on the push remote
+    # (sync deletes them locally; this flushes the removal to the remote).
+    # --remote scopes to the push remote (and excludes any colocated `git`
+    # remote); `tracked` drops the local-only entry --remote also surfaces.
+    gone = jj("bookmark", "list", "--remote", remote, glob,
+              "-T", 'if(tracked && present && !tracking_present, name ++ "\n")').splitlines()
+    live = {n for n in live if n and n != base}
+    gone = {n for n in gone if n and n != base}
+    names = sorted(live | gone)
+    if not names:
+        info(f"nothing to push for grove '{slug}'")
+        return
+
+    info(f"pushing grove '{slug}'")
+    _push(names, why="push grove bookmarks; flush merged deletions")
+    if not DRY:
+        summary = []
+        if live:
+            summary.append(f"pushed {len(live)} bookmark(s)")
+        if gone:
+            summary.append(f"deleted {len(gone)} remote branch(es)")
+        info("; ".join(summary))
 
 
 # --------------------------------------------------------------------------- #
@@ -554,6 +638,9 @@ def main() -> None:
     sp.add_argument("--keep-merged", action="store_true",
                     help="don't prune merged bookmarks (default deletes them; remote branch removed on next push)")
     sp.set_defaults(fn=cmd_sync)
+
+    sp = sub.add_parser("push", parents=[common], help="push the grove's bookmarks to the remote")
+    sp.set_defaults(fn=cmd_push)
 
     args = p.parse_args()
     QUIET = args.quiet
