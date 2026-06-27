@@ -16,6 +16,7 @@ Subcommands:
   rm <slug> [--force]                remove a grove (its workspaces + base bookmark)
   graft <revset> [--push]            graduate a rooted prefix onto trunk as bookmarks to push
   sync [--no-fetch] [--keep-merged]  advance the base onto trunk; prune merged bookmarks
+  restack [revset] [--push]          rebase grove bookmarks onto trunk (default: all)
   push                               push the grove's bookmarks to the remote
 
 Output contract: the new workspace's absolute path goes to stdout (new/work);
@@ -588,6 +589,67 @@ def cmd_push(args) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# restack
+# --------------------------------------------------------------------------- #
+
+
+def cmd_restack(args) -> None:
+    slug = binding_slug()
+    if slug is None:
+        die("not bound to a grove (grove_base() is none()); cd into a grove workspace.")
+
+    # the revset (default all()) scopes which bookmarks to rebase, intersected
+    # with grove_bookmarks() so it can never reach non-grove work.
+    sel = f"grove_bookmarks() & ({args.revset})"
+    selected = _ids(sel)
+    if not selected:
+        info(f"nothing to restack for grove '{slug}'")
+        return
+    # `-b` rebases whole branches, so a selected bookmark pulls the rest of its
+    # stack along. capture both sets as change-ids (stable across the rebase) so
+    # the post-rebase reasoning holds even for a commit-hash revset.
+    moved = _ids(f"grove_bookmarks() & reachable(({sel}), mutable())")
+
+    # rebase the selected branches onto current trunk. jj records any conflicts
+    # rather than failing, so this won't abort mid-way.
+    info(f"restacking grove '{slug}' onto trunk")
+    do("rebase", "-b", sel, "-d", "trunk()", why="rebase bookmarks onto trunk")
+
+    movedset, selectedset = " | ".join(moved), " | ".join(selected)
+    conflicted = _ids(f"({movedset}) & conflicts()")
+    if conflicted:
+        info(f"WARNING: {len(conflicted)} bookmark(s) now conflict with trunk: "
+             f"{', '.join(conflicted)}")
+
+    if not args.push:
+        if not DRY:
+            info("restacked locally; run `jj grove push` to update the remotes")
+        return
+
+    # push only the selected bookmarks, even though the whole stack moved;
+    # `_push`'s `-b <name>` force-with-lease updates them. conflicted ones
+    # can't push.
+    pushed = sorted(
+        n for n in jj("bookmark", "list", "-r", f"({selectedset}) ~ conflicts()",
+                      "-T", 'if(!remote, name ++ "\n")').splitlines()
+        if n
+    )
+    if pushed:
+        _push(pushed, why="push restacked bookmarks")
+
+    # the rest of the stack moved locally but wasn't pushed (not named); flag it
+    # so the remote drift isn't silent.
+    extra = sorted(
+        n for n in jj("bookmark", "list", "-r", f"({movedset}) ~ conflicts()",
+                      "-T", 'if(!remote, name ++ "\n")').splitlines()
+        if n and n not in set(pushed)
+    )
+    if extra:
+        info(f"note: {len(extra)} restacked bookmark(s) changed but not pushed: "
+             f"{', '.join(extra)} (run `jj grove push` to update them)")
+
+
+# --------------------------------------------------------------------------- #
 # cli
 # --------------------------------------------------------------------------- #
 
@@ -638,6 +700,11 @@ def main() -> None:
     sp.add_argument("--keep-merged", action="store_true",
                     help="don't prune merged bookmarks (default deletes them; remote branch removed on next push)")
     sp.set_defaults(fn=cmd_sync)
+
+    sp = sub.add_parser("restack", parents=[common], help="rebase grove bookmarks onto trunk")
+    sp.add_argument("--push", action="store_true", help="also push the rebased bookmarks")
+    sp.add_argument("revset", nargs="?", default="all()", help="bookmarks to rebase (default: all grove bookmarks)")
+    sp.set_defaults(fn=cmd_restack)
 
     sp = sub.add_parser("push", parents=[common], help="push the grove's bookmarks to the remote")
     sp.set_defaults(fn=cmd_push)
