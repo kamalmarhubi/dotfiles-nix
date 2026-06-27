@@ -1,6 +1,8 @@
 {
   config,
   pkgs,
+  inputs,
+  system,
   ...
 }: {
   home = {
@@ -8,24 +10,29 @@
       git = "git-branchless wrap --";
     };
 
-    packages = with pkgs; [
-      delta
-      gh
-      git
-      git-absorb
-      git-lfs
-      git-branchless
-      jujutsu
-      mine.jj-hunk
-      # git-filter-repo
-      lazygit
-    ];
+    packages =
+      (with pkgs; [
+        delta
+        gh
+        git
+        git-absorb
+        git-lfs
+        git-branchless
+        jujutsu
+        mine.jj-hunk
+        # git-filter-repo
+        lazygit
+      ])
+      ++ [
+        inputs.hunk.packages.${system}.hunk
+      ];
     file.".local/bin/jj-gh-fork".source =
       config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/jj/jj-gh-fork";
   };
 
   xdg.configFile."jj/config.toml".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/jj/config.toml";
   xdg.configFile."git/config".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/git/config";
+  xdg.configFile."hunk/config.toml".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/hunk/config.toml";
   xdg.configFile."git/config.mine".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/git/config.mine";
   xdg.configFile."git/config.system".text = let
     credentialHelper =
