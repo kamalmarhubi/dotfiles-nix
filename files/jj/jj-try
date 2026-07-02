@@ -1,0 +1,193 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  status=${1:-2}
+  cat >&2 <<'EOF'
+usage: jj try [--remote REMOTE] NAME_OR_REF [-- JJ_NEW_ARGS...]
+       jj try [--remote REMOTE] --pr PR [-- JJ_NEW_ARGS...]
+
+Fetch NAME_OR_REF from REMOTE, create a new working-copy commit on top of it,
+then forget the temporary scratch bookmark.
+
+If --remote is omitted, REMOTE is inferred from the single remote bookmark
+pointing at trunk(). If trunk() has zero or multiple remotes, pass --remote.
+
+If NAME_OR_REF starts with refs/, it is fetched exactly as given.
+Otherwise, it is treated as a branch name under refs/heads/.
+
+With --pr PR, NAME_OR_REF is replaced by refs/pull/PR/head.
+Everything after -- is passed to jj new before the fetched ref.
+
+Examples:
+  jj try alice/topic
+  jj try --remote upstream alice/topic
+  jj try refs/pull/123/head
+  jj try --pr 123
+  jj try --remote upstream --pr 123
+  jj try --remote origin refs/pull/123/head -- -m 'try PR 123'
+  jj try --pr 123 -- -m 'combine with current work' @
+EOF
+  exit "$status"
+}
+
+die() {
+  printf 'jj try: %s\n' "$*" >&2
+  exit 1
+}
+
+jj_cmd=(jj)
+if [[ -n ${JJ_WORKSPACE_ROOT:-} ]]; then
+  jj_cmd+=(--repository "$JJ_WORKSPACE_ROOT")
+fi
+
+pre=()
+new_args=()
+pr=
+remote=
+while (($#)); do
+  if [[ $1 == -- ]]; then
+    shift
+    new_args=("$@")
+    break
+  fi
+  case $1 in
+    -h|--help)
+      usage 0
+      ;;
+    --remote)
+      shift
+      (($#)) || die "--remote requires a remote name"
+      remote=$1
+      shift
+      ;;
+    --remote=*)
+      remote=${1#--remote=}
+      [[ -n $remote ]] || die "--remote requires a remote name"
+      shift
+      ;;
+    --pr)
+      shift
+      (($#)) || die "--pr requires a PR number"
+      pr=$1
+      shift
+      ;;
+    --pr=*)
+      pr=${1#--pr=}
+      shift
+      ;;
+    -*)
+      die "unknown option before --: $1"
+      ;;
+    *)
+      pre+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ -n $pr ]]; then
+  [[ $pr =~ ^[0-9]+$ ]] || die "invalid PR number: $pr"
+  ((${#pre[@]} == 0)) || die "cannot combine NAME_OR_REF with --pr"
+  source_ref="refs/pull/$pr/head"
+  name_or_ref="pr-$pr"
+else
+  case ${#pre[@]} in
+    1)
+      name_or_ref=${pre[0]}
+      ;;
+    *)
+      usage
+      ;;
+  esac
+  [[ -n $name_or_ref && $name_or_ref != -* ]] || die "invalid ref: $name_or_ref"
+  [[ $name_or_ref != *:* ]] || die "ref must not contain ':'"
+  if [[ $name_or_ref == refs/* ]]; then
+    source_ref=$name_or_ref
+  else
+    source_ref="refs/heads/$name_or_ref"
+  fi
+fi
+
+git_dir=$("${jj_cmd[@]}" git root 2>/dev/null) ||
+  die "requires a jj repository with a Git backend"
+[[ -n $git_dir ]] || die "could not find jj Git backend"
+
+infer_remote_from_trunk() {
+  local remotes
+  remotes=$("${jj_cmd[@]}" log --color=never -r 'trunk()' --no-graph \
+    -T 'remote_bookmarks.filter(|b| b.remote() != "git").map(|b| b.remote()).join("\n") ++ "\n"' |
+    sed '/^$/d' |
+    LC_ALL=C sort -u) ||
+    die "could not infer remote from trunk()"
+  case $remotes in
+    '')
+      die "trunk() has no remote bookmark; pass --remote REMOTE"
+      ;;
+    *$'\n'*)
+      die "trunk() has multiple remotes; pass --remote REMOTE"
+      ;;
+  esac
+  printf '%s\n' "$remotes"
+}
+
+if [[ -z $remote ]]; then
+  remote=$(infer_remote_from_trunk)
+fi
+[[ -n $remote && $remote != -* ]] || die "invalid remote: $remote"
+git --git-dir "$git_dir" remote get-url "$remote" >/dev/null 2>&1 ||
+  die "unknown remote: $remote"
+
+cleanup_old() {
+  cutoff=$(($(date -u +%s) - 86400))
+  "${jj_cmd[@]}" bookmark list --all-remotes 'glob:jj-scratch/try/*' \
+    -T 'if(remote, remote ++ "\t" ++ name ++ "\n")' |
+    while IFS=$'\t' read -r bookmark_remote name; do
+      [[ -n $bookmark_remote && -n $name ]] || continue
+      run_id=${name#jj-scratch/try/}
+      run_id=${run_id%%/*}
+      epoch=${run_id%%-*}
+      case $epoch in
+        ''|*[!0-9]*)
+          continue
+          ;;
+      esac
+      if ((epoch < cutoff)); then
+        "${jj_cmd[@]}" --quiet bookmark forget --include-remotes "$name" >/dev/null 2>&1 || true
+        git --git-dir "$git_dir" update-ref -d "refs/remotes/$bookmark_remote/$name" >/dev/null 2>&1 || true
+      fi
+    done
+}
+
+base_name=${name_or_ref#refs/}
+safe=$(printf '%s' "$base_name" |
+  LC_ALL=C tr -c 'A-Za-z0-9._-' '-' |
+  sed -E 's/-+/-/g; s/^-|-$//g')
+[[ -n $safe ]] || safe=ref
+epoch=$(date -u +%s)
+rand=$(od -An -N4 -tx1 /dev/urandom | tr -d ' \n')
+run_id="$epoch-$$-$rand"
+scratch_root="jj-scratch/try/$run_id"
+scratch_name="$scratch_root/$safe"
+scratch_ref="refs/remotes/$remote/$scratch_name"
+imported=0
+
+cleanup() {
+  status=$?
+  trap - EXIT INT TERM
+  if ((imported)); then
+    "${jj_cmd[@]}" --quiet bookmark forget --include-remotes "$scratch_root/*" >/dev/null 2>&1 || true
+  fi
+  git --git-dir "$git_dir" update-ref -d "$scratch_ref" >/dev/null 2>&1 || true
+  exit "$status"
+}
+trap cleanup EXIT INT TERM
+
+cleanup_old
+git --git-dir "$git_dir" fetch --no-tags --refmap= "$remote" "$source_ref:$scratch_ref"
+"${jj_cmd[@]}" --quiet git import
+imported=1
+"${jj_cmd[@]}" new ${new_args[@]+"${new_args[@]}"} "$scratch_name@$remote"
+"${jj_cmd[@]}" --quiet bookmark forget --include-remotes "$scratch_root/*"
+git --git-dir "$git_dir" update-ref -d "$scratch_ref"
+trap - EXIT INT TERM

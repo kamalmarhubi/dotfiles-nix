@@ -28,6 +28,8 @@
       ];
     file.".local/bin/jj-gh-fork".source =
       config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/jj/jj-gh-fork";
+    file.".local/bin/jj-try".source =
+      config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/jj/jj-try";
     file.".local/bin/jj-grove".source =
       config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/jj/jj-grove";
   };
