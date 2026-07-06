@@ -10,7 +10,8 @@ managing groves.
 
 Subcommands:
   new <slug> [--bare] [--root DIR]   create a grove (+ a workspace unless --bare)
-  work <slug> <name> [--root DIR]    add another workspace to an existing grove
+  workspace add <slug> <name> [--root DIR]
+                                      add another workspace to an existing grove
   use <slug>                         bind the current workspace to an existing grove
   list                               list groves and their workspaces
   rm <slug> [--force]                remove a grove (its workspaces + base bookmark)
@@ -19,9 +20,9 @@ Subcommands:
   restack [revset] [--push]          rebase grove bookmarks onto trunk (default: all)
   push                               push the grove's bookmarks to the remote
 
-Output contract: the new workspace's absolute path goes to stdout (new/work);
-all human narration goes to stderr; -q/--quiet drops the narration. -n/--dry-run
-prints the plan without touching anything.
+Output contract: the new workspace's absolute path goes to stdout
+(new/workspace add); all human narration goes to stderr; -q/--quiet drops the
+narration. -n/--dry-run prints the plan without touching anything.
 """
 
 from __future__ import annotations
@@ -196,7 +197,7 @@ def cmd_new(args) -> None:
     validate_slug(slug)
     if grove_exists(slug):
         die(f"grove '{slug}' already exists. "
-            f"Use `jj grove work {slug} <name>` to add a workspace.")
+            f"Use `jj grove workspace add {slug} <name>` to add a workspace.")
 
     if args.bare:
         info(f"creating grove '{slug}' (base only) at {base_bookmark(slug)}")
@@ -235,7 +236,7 @@ def cmd_new(args) -> None:
         print(dest)
 
 
-def cmd_work(args) -> None:
+def cmd_workspace_add(args) -> None:
     slug, name = args.slug, args.name
     validate_slug(slug)
     validate_slug(name, "workspace name")
@@ -671,11 +672,14 @@ def main() -> None:
     sp.add_argument("--root", metavar="DIR", help="workspace directory (default: ../<slug>)")
     sp.set_defaults(fn=cmd_new)
 
-    sp = sub.add_parser("work", parents=[common], help="add a workspace to an existing grove")
+    sp = sub.add_parser("workspace", help="manage grove workspaces")
+    workspace_sub = sp.add_subparsers(dest="workspace_cmd", required=True)
+
+    sp = workspace_sub.add_parser("add", parents=[common], help="add a workspace to an existing grove")
     sp.add_argument("slug")
     sp.add_argument("name")
     sp.add_argument("--root", metavar="DIR", help="workspace directory (default: ../<slug>-<name>)")
-    sp.set_defaults(fn=cmd_work)
+    sp.set_defaults(fn=cmd_workspace_add)
 
     sp = sub.add_parser("use", parents=[common], help="bind the current workspace to an existing grove")
     sp.add_argument("slug")
