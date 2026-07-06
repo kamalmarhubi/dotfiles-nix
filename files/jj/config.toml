@@ -22,6 +22,7 @@ diff-formatter = ":git"
 [aliases]
 hunk = ["util", "exec", "--", "jj-hunk"]
 try = ["util", "exec", "--", "jj-try"]
+sprout = ["new", "coalesce(grove_base(), trunk())"]
 grove = ["util", "exec", "--", "jj-grove"]
 gh-fork = ["util", "exec", "--", "jj-gh-fork"]
 
