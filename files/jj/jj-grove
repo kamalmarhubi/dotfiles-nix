@@ -267,10 +267,17 @@ def cmd_use(args) -> None:
         info(f"already on grove '{slug}'")
         return
     if not at_on_base(slug):
-        die(f"@ isn't on {base_bookmark(slug)} -- the grove log won't include "
-            f"your work.\n"
-            f"       move it there:  jj rebase -b @ -d {base_bookmark(slug)}\n"
-            f"       then re-run:    jj grove use {slug}")
+        if current is not None:
+            die(f"@ isn't on {base_bookmark(slug)}, and this workspace is bound to "
+                f"grove '{current}'; use won't rebase across groves.\n"
+                f"       move @ yourself:  jj rebase -b @ -d {base_bookmark(slug)}\n"
+                f"       then re-run:      jj grove use {slug}")
+        if not args.rebase:
+            die(f"@ isn't on {base_bookmark(slug)} -- the grove log won't include "
+                f"your work.\n"
+                f"       move it there:  jj rebase -b @ -d {base_bookmark(slug)}\n"
+                f"       or re-run with: jj grove use {slug} --rebase")
+        do("rebase", "-b", "@", "-d", base_bookmark(slug), why="rebase @ onto base")
     bind(slug)
     if current:
         info(f"rebound grove '{current}' -> '{slug}'")
@@ -683,6 +690,8 @@ def main() -> None:
 
     sp = sub.add_parser("use", parents=[common], help="bind the current workspace to an existing grove")
     sp.add_argument("slug")
+    sp.add_argument("--rebase", action="store_true",
+                    help="if unbound and @ is off-base, rebase @ onto the base first")
     sp.set_defaults(fn=cmd_use)
 
     sp = sub.add_parser("list", help="list groves and their workspaces")
