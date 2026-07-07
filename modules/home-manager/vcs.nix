@@ -34,6 +34,8 @@
       config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/jj/jj-grove";
   };
 
+  xdg.configFile."fish/completions/jj.fish".source =
+    config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/fish/completions/jj.fish";
   xdg.configFile."jj/config.toml".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/jj/config.toml";
   xdg.configFile."git/config".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/git/config";
   xdg.configFile."git/ignore".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/git/ignore";
