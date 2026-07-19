@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """jj-grove: manage groves and their workspaces.
 
-A "grove" is a long-lived line of work rooted at an empty base commit on
-trunk(), bookmarked `kamal/<slug>/base`, with one or more jj workspaces bound to
-it via per-workspace config (`grove_base()` / `grove_bookmarks()`). The revset
-machinery (grove_base/grove_bases/grove_bookmarks/grove/is_grove_base)
-lives in jj's config.toml; this script is the front door for creating and
-managing groves.
+A "grove" is a long-lived line of work marked by an empty orphan commit
+bookmarked `kamal/<slug>/__marker__`. Private work is attached to that marker as an
+extra parent, with one or more jj workspaces bound to it via per-workspace
+config (`grove_marker()` / `grove_bookmarks()`). The revset machinery
+(grove_marker/grove_markers/grove_bookmarks/grove/is_grove_marker) lives in jj's
+config.toml; this script is the front door for creating and managing groves.
 
 Subcommands:
   new <slug> [--bare] [--root DIR]   create a grove (+ a workspace unless --bare)
@@ -14,9 +14,9 @@ Subcommands:
                                       add another workspace to an existing grove
   use <slug>                         bind the current workspace to an existing grove
   list                               list groves and their workspaces
-  rm <slug> [--force]                remove a grove (its workspaces + base bookmark)
+  rm <slug> [--force]                remove a grove and its workspaces
   graft <revset> [--push]            graduate a rooted prefix onto trunk as bookmarks to push
-  sync [--no-fetch] [--keep-merged]  advance the base onto trunk; prune merged bookmarks
+  sync [--no-fetch] [--keep-merged]  rebase grove roots onto trunk; prune merged bookmarks
   restack [revset] [--push]          rebase grove bookmarks onto trunk (default: all)
   push                               push the grove's bookmarks to the remote
 
@@ -31,16 +31,23 @@ import argparse
 import functools
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 
-GROVE_BASE_SUFFIX = "base"
-GROVE_BASE_ALIAS = 'revset-aliases."grove_base()"'
+GROVE_MARKER_SUFFIX = "__marker__"
+GROVE_MARKER_ALIAS = 'revset-aliases."grove_marker()"'
 GROVE_BOOKMARKS_ALIAS = 'revset-aliases."grove_bookmarks()"'
-GROVE_BASE_REVSET = "grove_base()"
-GROVE_BASES_REVSET = "grove_bases()"
+GROVE_MARKER_REVSET = "grove_marker()"
+GROVE_MARKERS_REVSET = "grove_markers()"
 GROVE_BOOKMARKS_REVSET = "grove_bookmarks()"
+MARKER_NAME = "jj-grove"
+MARKER_EMAIL = "jj-grove@example.invalid"
+MARKER_DATE = "1970-01-01T00:00:00 +0000"
+MARKER_MESSAGE_PREFIX = "jj-grove marker: "
+GIT_CONFIG_ARGS = ("-c", "i18n.commitEncoding=UTF-8")
+GIT_ROOT_PLACEHOLDER = "<jj git root>"
 
 
 @functools.cache
@@ -48,8 +55,12 @@ def grove_prefix() -> str:
     return jj("config", "get", 'revset-aliases."grove_prefix()"').strip('"')
 
 
-def grove_base_bookmark(slug: str) -> str:
-    return f"{grove_prefix()}{slug}/{GROVE_BASE_SUFFIX}"
+def grove_marker_bookmark(slug: str) -> str:
+    return f"{grove_prefix()}{slug}/{GROVE_MARKER_SUFFIX}"
+
+
+def marker_message(slug: str) -> str:
+    return f"{MARKER_MESSAGE_PREFIX}{slug}"
 
 
 def grove_bookmark_glob(slug: str) -> str:
@@ -110,6 +121,84 @@ def do(*args: str, cwd: str | None = None, why: str = "") -> None:
         die(f"`jj {' '.join(args)}` failed:\n{r.stderr.strip()}")
 
 
+@functools.cache
+def git_root(cwd: str | None = None) -> str:
+    return jj("git", "root", cwd=cwd)
+
+
+def git_command(git_dir: str, *args: str) -> list[str]:
+    return ["git", *GIT_CONFIG_ARGS, "--git-dir", git_dir, *args]
+
+
+def display_arg(arg: str) -> str:
+    if arg.startswith("<") and arg.endswith(">"):
+        return arg
+    return shlex.quote(arg)
+
+
+def display_command(args: list[str]) -> str:
+    return " ".join(display_arg(arg) for arg in args)
+
+
+def plan_git(
+    *args: str,
+    stdin_from: str | None = None,
+    why: str = "",
+) -> None:
+    cmd = display_command(git_command(GIT_ROOT_PLACEHOLDER, *args))
+    if stdin_from is not None:
+        cmd += f" < {stdin_from}"
+    if why:
+        cmd += f"   # {why}"
+    plan(cmd)
+
+
+def git(
+    *args: str,
+    cwd: str | None = None,
+    stdin: str | None = None,
+    env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run Git plumbing against jj's Git store."""
+    return subprocess.run(
+        git_command(git_root(cwd), *args),
+        cwd=cwd,
+        input=stdin,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def git_stdout(
+    *args: str,
+    cwd: str | None = None,
+    stdin: str | None = None,
+    env: dict[str, str] | None = None,
+) -> str:
+    """Run Git plumbing against jj's Git store; return stripped stdout."""
+    r = git(*args, cwd=cwd, stdin=stdin, env=env)
+    if r.returncode != 0:
+        die(f"`git {' '.join(args)}` failed:\n{r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def marker_commit_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_AUTHOR_NAME": MARKER_NAME,
+            "GIT_AUTHOR_EMAIL": MARKER_EMAIL,
+            "GIT_AUTHOR_DATE": MARKER_DATE,
+            "GIT_COMMITTER_NAME": MARKER_NAME,
+            "GIT_COMMITTER_EMAIL": MARKER_EMAIL,
+            "GIT_COMMITTER_DATE": MARKER_DATE,
+        }
+    )
+    return env
+
+
 def do_fs(desc: str, fn) -> None:
     """Run a filesystem mutation. Honors --dry-run."""
     if DRY:
@@ -152,20 +241,20 @@ def grove_exists(slug: str) -> bool:
         "log",
         "--no-graph",
         "-r",
-        f"present({grove_base_bookmark(slug)})",
+        f"present({grove_marker_bookmark(slug)})",
         "-T",
         '"x"',
     )
     return bool(out)
 
 
-def at_on_base(slug: str, cwd: str | None = None) -> bool:
-    # is @ a descendant of (or equal to) the grove base?
+def at_on_marker(slug: str, cwd: str | None = None) -> bool:
+    # is @ inside the grove's private work (descended from the marker)?
     out = jj(
         "log",
         "--no-graph",
         "-r",
-        f"@ & descendants(present({grove_base_bookmark(slug)}))",
+        f"@ & descendants(present({grove_marker_bookmark(slug)}))",
         "-T",
         '"x"',
         cwd=cwd,
@@ -174,8 +263,8 @@ def at_on_base(slug: str, cwd: str | None = None) -> bool:
 
 
 def binding_slug(cwd: str | None = None) -> str | None:
-    """The grove a workspace is bound to (its grove_base() override), or None."""
-    val = jj("config", "get", GROVE_BASE_ALIAS, cwd=cwd)
+    """The grove a workspace is bound to (its grove_marker() override), or None."""
+    val = jj("config", "get", GROVE_MARKER_ALIAS, cwd=cwd)
     return slug_of(val)
 
 
@@ -183,16 +272,16 @@ def bound_slug() -> str:
     slug = binding_slug()
     if slug is None:
         die(
-            f"not bound to a grove ({GROVE_BASE_REVSET} is none()); "
+            f"not bound to a grove ({GROVE_MARKER_REVSET} is none()); "
             "cd into a grove workspace."
         )
     return slug
 
 
-def slug_of(base_value: str) -> str | None:
+def slug_of(marker_value: str) -> str | None:
     m = re.fullmatch(
-        rf"{re.escape(grove_prefix())}(?P<slug>[^/]+)/{re.escape(GROVE_BASE_SUFFIX)}",
-        base_value,
+        rf"{re.escape(grove_prefix())}(?P<slug>[^/]+)/{re.escape(GROVE_MARKER_SUFFIX)}",
+        marker_value,
     )
     return m["slug"] if m else None
 
@@ -222,10 +311,10 @@ def bind(slug: str, cwd: str | None = None) -> None:
         "config",
         "set",
         "--workspace",
-        GROVE_BASE_ALIAS,
-        grove_base_bookmark(slug),
+        GROVE_MARKER_ALIAS,
+        grove_marker_bookmark(slug),
         cwd=cwd,
-        why=f"bind {GROVE_BASE_REVSET}",
+        why=f"bind {GROVE_MARKER_REVSET}",
     )
     do(
         "config",
@@ -236,6 +325,54 @@ def bind(slug: str, cwd: str | None = None) -> None:
         cwd=cwd,
         why="bind grove_bookmarks()",
     )
+
+
+def create_marker(slug: str, cwd: str | None = None) -> None:
+    # Build the marker using git plumbing so that it can be deterministic based
+    # on the slug. That determinism allows us to treat an existing matching ref
+    # as success in the update-ref below.
+    marker = grove_marker_bookmark(slug)
+    marker_ref = f"refs/heads/{marker}"
+    if DRY:
+        plan_git("mktree", stdin_from="/dev/null", why="empty marker tree")
+        plan_git(
+            "commit-tree",
+            "<empty tree>",
+            "-m",
+            marker_message(slug),
+            why="create marker commit",
+        )
+        plan_git(
+            "update-ref",
+            marker_ref,
+            "<marker commit>",
+            "",
+            why="create marker ref if absent or already correct",
+        )
+        plan("jj git import   # import marker ref into jj")
+        return
+
+    empty_tree = git_stdout("mktree", cwd=cwd, stdin="")
+    commit = git_stdout(
+        "commit-tree",
+        empty_tree,
+        "-m",
+        marker_message(slug),
+        cwd=cwd,
+        env=marker_commit_env(),
+    )
+    update = git("update-ref", marker_ref, commit, "", cwd=cwd)
+    if update.returncode != 0:
+        current = git("rev-parse", "--verify", marker_ref, cwd=cwd)
+        if current.returncode != 0:
+            die(f"`git update-ref {marker_ref}` failed:\n{update.stderr.strip()}")
+        current_commit = current.stdout.strip()
+        if current_commit != commit:
+            die(
+                f"marker ref already exists in Git and points at a different "
+                f"commit: {marker_ref}"
+            )
+    do("git", "import", cwd=cwd, why="import marker ref into jj")
 
 
 # --------------------------------------------------------------------------- #
@@ -250,27 +387,11 @@ def cmd_new(args) -> None:
         die(f"grove '{slug}' already exists. "
             f"Use `jj grove workspace add {slug} <name>` to add a workspace.")
 
-    base = grove_base_bookmark(slug)
+    marker = grove_marker_bookmark(slug)
     if args.bare:
-        info(f"creating grove '{slug}' (base only) at {base}")
-        if DRY:
-            plan(
-                f"jj new --no-edit trunk() -m {slug + ' base'!r}"
-                "   # create base commit"
-            )
-            plan(f"jj bookmark create {base} -r <new commit>")
-            return
-        r = subprocess.run(
-            ["jj", "new", "--no-edit", "trunk()", "-m", f"{slug} base"],
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        )
-        if r.returncode != 0:
-            die(f"creating base commit failed:\n{r.stderr.strip()}")
-        m = re.search(r"Created new commit (\S+)", r.stderr)
-        if not m:
-            die(f"couldn't find new commit id in:\n{r.stderr.strip()}")
-        do("bookmark", "create", base, "-r", m.group(1), why="bookmark base")
-        info(f"created grove '{slug}' (no workspace)")
+        info(f"creating grove '{slug}' without a workspace at {marker}")
+        create_marker(slug)
+        info(f"created grove '{slug}' without a workspace")
         return
 
     dest = os.path.abspath(args.root or os.path.join(siblings_parent(), slug))
@@ -278,19 +399,17 @@ def cmd_new(args) -> None:
     info(f"creating grove '{slug}' + workspace '{name}' at {dest}")
     parent = os.path.dirname(dest)
     do_fs(f"mkdir -p {parent}", lambda: os.makedirs(parent, exist_ok=True))
+    create_marker(slug)
     do(
         "workspace",
         "add",
         "-r",
-        "trunk()",
+        f"trunk() | {marker}",
         dest,
         "--name",
         name,
-        why="new workspace on trunk",
+        why="new workspace on trunk + marker",
     )
-    do("describe", "-m", f"{slug} base", cwd=dest, why="describe base")
-    do("bookmark", "create", base, "-r", "@", cwd=dest, why="bookmark base")
-    do("new", cwd=dest, why="working commit on base")
     bind(slug, cwd=dest)
     info(f"created grove '{slug}'; workspace at {dest}")
     if not DRY:
@@ -311,16 +430,15 @@ def cmd_workspace_add(args) -> None:
     info(f"adding workspace '{wsname}' on grove '{slug}' at {dest}")
     parent = os.path.dirname(dest)
     do_fs(f"mkdir -p {parent}", lambda: os.makedirs(parent, exist_ok=True))
-    base = grove_base_bookmark(slug)
     do(
         "workspace",
         "add",
         "-r",
-        base,
+        f"trunk() | {grove_marker_bookmark(slug)}",
         dest,
         "--name",
         wsname,
-        why="new workspace on grove base",
+        why="new workspace on trunk + marker",
     )
     bind(slug, cwd=dest)
     info(f"added workspace '{wsname}' on grove '{slug}'")
@@ -335,34 +453,35 @@ def cmd_use(args) -> None:
         die(f"no grove '{slug}'. Use `jj grove new {slug}` to create it.")
 
     current = binding_slug()
-    if current == slug:
+    if current == slug and at_on_marker(slug):
         info(f"already on grove '{slug}'")
         return
-    base = grove_base_bookmark(slug)
-    if not at_on_base(slug):
-        if current is not None:
-            die(f"@ isn't on {base}, and this workspace is bound to "
-                f"grove '{current}'; use won't rebase across groves.\n"
-                f"       move @ yourself:  jj rebase -b @ -d {base}\n"
-                f"       then re-run:      jj grove use {slug}")
-        if not args.rebase:
-            die(f"@ isn't on {base} -- the grove log won't include "
-                f"your work.\n"
-                f"       move it there:  jj rebase -b @ -d {base}\n"
-                f"       or re-run with: jj grove use {slug} --rebase")
-        do("rebase", "-b", "@", "-d", base, why="rebase @ onto base")
+    if current is not None and current != slug:
+        die(
+            f"this workspace is bound to grove '{current}'; "
+            f"use won't rebind across groves."
+        )
+    marker = grove_marker_bookmark(slug)
+    if not at_on_marker(slug):
+        roots = _ids("roots(::@ & mutable())")
+        for root in roots:
+            do(
+                "rebase",
+                "-s",
+                root,
+                "--onto",
+                f"parents({root}) | {marker}",
+                why=f"mark private root {root}",
+            )
     bind(slug)
-    if current:
-        info(f"rebound grove '{current}' -> '{slug}'")
-    else:
-        info(f"bound current workspace to grove '{slug}'")
+    info(f"bound current workspace to grove '{slug}'")
 
 
 def cmd_list(args) -> None:
-    bases = jj(
-        "log", "--no-graph", "-r", GROVE_BASES_REVSET, "-T", 'bookmarks ++ "\n"'
+    markers = jj(
+        "log", "--no-graph", "-r", GROVE_MARKERS_REVSET, "-T", 'bookmarks ++ "\n"'
     )
-    slugs = sorted(filter(None, (slug_of(b.strip()) for b in bases.splitlines())))
+    slugs = sorted(filter(None, (slug_of(b.strip()) for b in markers.splitlines())))
 
     cur_slug = binding_slug()
     cur_root = os.path.realpath(current_ws_root())
@@ -379,13 +498,13 @@ def cmd_list(args) -> None:
         return
 
     for s in slugs:
-        base = grove_base_bookmark(s)
+        marker = grove_marker_bookmark(s)
         # stale: no live mutable work and no unmerged pushed bookmarks
         live = jj(
             "log",
             "--no-graph",
             "-r",
-            f"(descendants({base}) & mutable()) ~ {base}",
+            f"(descendants({marker}) & mutable()) ~ {marker}",
             "-T",
             '"x"',
         )
@@ -393,7 +512,7 @@ def cmd_list(args) -> None:
             "log",
             "--no-graph",
             "-r",
-            f'(bookmarks(glob:"{grove_bookmark_glob(s)}") ~ {base}) ~ ::trunk()',
+            f'(bookmarks(glob:"{grove_bookmark_glob(s)}") ~ {GROVE_MARKERS_REVSET}) ~ ::trunk()',
             "-T",
             '"x"',
         )
@@ -404,7 +523,7 @@ def cmd_list(args) -> None:
             flags.append("stale")
         tag = f"  [{', '.join(flags)}]" if flags else ""
         ws = ", ".join(by_slug[s]) or "-"
-        print(f"{s:<20} {base:<26} ws: {ws}{tag}")
+        print(f"{s:<20} {marker:<28} ws: {ws}{tag}")
 
 
 def cmd_rm(args) -> None:
@@ -413,7 +532,7 @@ def cmd_rm(args) -> None:
     if not grove_exists(slug):
         die(f"no grove '{slug}'.")
 
-    base = grove_base_bookmark(slug)
+    marker = grove_marker_bookmark(slug)
     cur_root = os.path.realpath(current_ws_root())
     bound = [
         (name, root) for name, root in workspaces() if binding_slug(cwd=root) == slug
@@ -431,7 +550,7 @@ def cmd_rm(args) -> None:
             "log",
             "--no-graph",
             "-r",
-            f"(descendants({base}) & mutable()) ~ empty()",
+            f"(descendants({marker}) & mutable()) ~ empty()",
             "-T",
             '"x"',
         )
@@ -440,7 +559,7 @@ def cmd_rm(args) -> None:
                 f"Re-run with --force to remove anyway.")
 
     info(f"removing grove '{slug}':")
-    info(f"  bookmark  {base}")
+    info(f"  bookmark  {marker}")
     for name, root in bound:
         info(f"  workspace {name}  ({root})")
     if not bound:
@@ -454,14 +573,14 @@ def cmd_rm(args) -> None:
         )
         for _, root in bound:
             plan(f"rm -rf {root}")
-        plan(f"jj bookmark delete {base}")
+        plan(f"jj bookmark delete {marker}")
         return
 
     if not args.force:
         if not sys.stdin.isatty():
             die("refusing to remove without confirmation (not a TTY); use --force")
         try:
-            ans = input("delete these workspaces and the base? [y/N] ")
+            ans = input("delete these workspaces and the marker? [y/N] ")
         except EOFError:
             ans = ""
         if ans.strip().lower() not in ("y", "yes"):
@@ -471,7 +590,7 @@ def cmd_rm(args) -> None:
         do("workspace", "forget", *[n for n, _ in bound], why="forget workspaces")
     for _, root in bound:
         do_fs(f"rm -rf {root}", lambda root=root: shutil.rmtree(root, ignore_errors=True))
-    do("bookmark", "delete", base, why="delete base bookmark")
+    do("bookmark", "delete", marker, why="remove grove marker")
     info(f"removed grove '{slug}'")
 
 
@@ -487,22 +606,28 @@ def _ids(revset: str) -> list[str]:
 
 
 def graft_selection_revset(user_revset: str) -> str:
-    return f"(({user_revset}) & ({GROVE_BASE_REVSET}..))"
+    return (
+        f"(({user_revset}) & "
+        f"(descendants({GROVE_MARKER_REVSET}) ~ {GROVE_MARKER_REVSET}))"
+    )
 
 
 def graft_prefix_revset(selection_heads: str) -> str:
-    return f"(({GROVE_BASE_REVSET}..{selection_heads}) ~ ::{GROVE_BOOKMARKS_REVSET})"
-
-
-def graft_survivors_revset(selection_heads: str) -> str:
-    return f"children({selection_heads}) ~ ({GROVE_BASE_REVSET}..{selection_heads})"
-
-
-def merged_grove_bookmarks_revset(slug: str) -> str:
     return (
-        f'bookmarks(glob:"{grove_bookmark_glob(slug)}") '
-        f"& (::trunk() ~ {GROVE_BASES_REVSET})"
+        f"((ancestors({selection_heads}) & descendants({GROVE_MARKER_REVSET})) "
+        f"~ {GROVE_MARKER_REVSET})"
     )
+
+
+def graft_survivors_revset(prefix: str) -> str:
+    return (
+        f"((children(heads({prefix})) & descendants({GROVE_MARKER_REVSET})) "
+        f"~ ({prefix}))"
+    )
+
+
+def merged_grove_bookmarks_revset() -> str:
+    return f"{GROVE_BOOKMARKS_REVSET} & ::trunk()"
 
 
 def cmd_graft(args) -> None:
@@ -512,38 +637,66 @@ def cmd_graft(args) -> None:
     S = graft_selection_revset(revset)            # commits to bookmark
     heads_S = f"heads({S})"
     newwork = graft_prefix_revset(heads_S)
-    fork = f"fork_point({GROVE_BASE_REVSET} | trunk())"
+    survivors = graft_survivors_revset(newwork)
 
     # guards: all before mutating
-    if jj("log", "--no-graph", "-r", f"{GROVE_BASE_REVSET} & ~empty()", "-T", '"x"'):
-        die("grove base is not empty (NONEMPTY-BASE); graft would drop its changes.")
+    if jj(
+        "log",
+        "--no-graph",
+        "-r",
+        f"{GROVE_MARKER_REVSET} & ~empty()",
+        "-T",
+        '"x"',
+    ):
+        die("grove marker is not empty (NONEMPTY-MARKER); markers must stay empty.")
     stray = _ids(f"(({revset}) & mutable()) ~ grove()")
     if stray:
         die(f"revset reaches outside the grove: {', '.join(stray)}")
     if not _ids(S):
-        die("nothing to graft (revset matches no grove work above the base).")
+        die("nothing to graft (revset matches no private grove work).")
     bad = _ids(f"({newwork}) & (incomplete() | conflicts())")
     if bad:
         die(f"range has WIP/conflicted commits; finish them first: {', '.join(bad)}")
+    roots = _ids(f"roots({newwork})")
+    survivor_ids = _ids(survivors)
+    rows = jj(
+        "log",
+        "--no-graph",
+        "--reversed",
+        "-r",
+        S,
+        "-T",
+        'change_id.shortest(8) ++ "\t"'
+        ' ++ author.timestamp().local().format("%Y-%m-%d") ++ "-" ++ change_id.short()'
+        ' ++ "\n"',
+    )
 
     info(f"grafting '{revset}' onto trunk")
     start_op = jj("op", "log", "-n1", "--no-graph", "-T", "self.id()")
     names: list[str] = []
     try:
-        # lift: re-root not-yet-grafted work onto its non-base parent, else the fork point
-        for r in _ids(f"roots({newwork})"):
-            onto = _ids(f"parents({r}) ~ {GROVE_BASE_REVSET}")
-            dest = " | ".join(onto) if onto else fork
-            do("rebase", "-s", r, "--onto", dest, why=f"lift {r}")
-        # reconnect: survivors above the cut gain the base as an extra parent
-        for c in _ids(graft_survivors_revset(heads_S)):
-            do("rebase", "-r", c, "--onto", f"(parents({c})) | {GROVE_BASE_REVSET}",
-               why=f"reconnect {c} to base")
+        # Publish the private prefix by dropping the marker parent from each root.
+        for r in roots:
+            do(
+                "rebase",
+                "-s",
+                r,
+                "--onto",
+                f"parents({r}) ~ {GROVE_MARKER_REVSET}",
+                why=f"drop marker parent from {r}",
+            )
+        # Surviving private children moved along with the published prefix; add
+        # the marker parent back so they remain private grove work.
+        for c in survivor_ids:
+            do(
+                "rebase",
+                "-r",
+                c,
+                "--onto",
+                f"(parents({c})) | {GROVE_MARKER_REVSET}",
+                why=f"keep {c} marked private",
+            )
         # bookmark each grafted commit
-        rows = jj("log", "--no-graph", "--reversed", "-r", S, "-T",
-                  'change_id.shortest(8) ++ "\t"'
-                  ' ++ author.timestamp().local().format("%Y-%m-%d") ++ "-" ++ change_id.short()'
-                  ' ++ "\n"')
         for line in rows.splitlines():
             if "\t" not in line:
                 continue
@@ -584,12 +737,15 @@ def cmd_graft(args) -> None:
 def cmd_sync(args) -> None:
     slug = bound_slug()
 
-    # refuse if a grove bookmark sits on a base-descendant: advancing the base
-    # would rebase a live pushed bookmark
-    onbase = _ids(f"{GROVE_BOOKMARKS_REVSET} & descendants({GROVE_BASE_REVSET})")
-    if onbase:
-        die(f"grove bookmark(s) sit on base-descendants; sync would rebase them: "
-            f"{', '.join(onbase)}")
+    # refuse if a grove bookmark still sits in the private marker area.
+    private_bookmarks = _ids(
+        f"{GROVE_BOOKMARKS_REVSET} & descendants({GROVE_MARKER_REVSET})"
+    )
+    if private_bookmarks:
+        die(
+            "grove bookmark(s) still descend from the private marker: "
+            f"{', '.join(private_bookmarks)}"
+        )
 
     if not args.no_fetch:
         if DRY:
@@ -605,16 +761,27 @@ def cmd_sync(args) -> None:
     start_op = jj("op", "log", "-n1", "--no-graph", "-T", "self.id()")
     merged: list[str] = []
     try:
-        # advance the base (+ on-base survivors) onto current trunk; --simplify-parents
-        # drops now-redundant parent edges to merged grafts. -s grove_base() scopes the
-        # rebase to base + descendants, so off-base bookmarks are left untouched.
-        do("rebase", "-s", GROVE_BASE_REVSET, "--onto", "trunk()", "--simplify-parents",
-           why="advance base onto trunk")
+        roots = _ids(
+            f"roots((descendants({GROVE_MARKER_REVSET}) ~ {GROVE_MARKER_REVSET}) "
+            "& mutable())"
+        )
+        # Move each private root to current trunk while preserving the marker
+        # and any other non-trunk side parents.
+        for r in roots:
+            do(
+                "rebase",
+                "-s",
+                r,
+                "--onto",
+                f"trunk() | (parents({r}) ~ ::trunk())",
+                "--simplify-parents",
+                why=f"sync private root {r}",
+            )
         # prune merged grove bookmarks; `delete` removes their remote branches on
         # the next push (--keep-merged skips)
         if not args.keep_merged:
             merged = jj(
-                "bookmark", "list", "-r", merged_grove_bookmarks_revset(slug),
+                "bookmark", "list", "-r", merged_grove_bookmarks_revset(),
                 "-T", 'if(!remote && present && !conflict, name ++ "\n")'
             ).splitlines()
             if merged:
@@ -670,7 +837,7 @@ def _push(names: list[str], why: str = "") -> None:
 def cmd_push(args) -> None:
     slug = bound_slug()
 
-    base = grove_base_bookmark(slug)
+    marker = grove_marker_bookmark(slug)
     glob = f"glob:{grove_bookmark_glob(slug)}"
     remote = push_remote()
 
@@ -683,8 +850,8 @@ def cmd_push(args) -> None:
     # remote); `tracked` drops the local-only entry --remote also surfaces.
     gone = jj("bookmark", "list", "--remote", remote, glob,
               "-T", 'if(tracked && present && !tracking_present, name ++ "\n")').splitlines()
-    live = {n for n in live if n and n != base}
-    gone = {n for n in gone if n and n != base}
+    live = {n for n in live if n and n != marker}
+    gone = {n for n in gone if n and n != marker}
     names = sorted(live | gone)
     if not names:
         info(f"nothing to push for grove '{slug}'")
@@ -716,6 +883,12 @@ def cmd_restack(args) -> None:
     if not selected:
         info(f"nothing to restack for grove '{slug}'")
         return
+    private_bookmarks = _ids(f"({sel}) & descendants({GROVE_MARKER_REVSET})")
+    if private_bookmarks:
+        die(
+            "selected grove bookmark(s) still descend from the private marker; "
+            f"graft them first: {', '.join(private_bookmarks)}"
+        )
     # `-b` rebases whole branches, so a selected bookmark pulls the rest of its
     # stack along. capture both sets as change-ids (stable across the rebase) so
     # the post-rebase reasoning holds even for a commit-hash revset.
@@ -776,9 +949,9 @@ def main() -> None:
     common.add_argument("-n", "--dry-run", action="store_true", help="print the plan; change nothing")
     p.set_defaults(quiet=False, dry_run=False)  # for verbs without common (list)
 
-    sp = sub.add_parser("new", parents=[common], help="create a grove (+ a workspace unless --bare)")
+    sp = sub.add_parser("new", parents=[common], help="create a grove, adding a workspace unless --bare")
     sp.add_argument("slug")
-    sp.add_argument("--bare", action="store_true", help="create the base only, no workspace")
+    sp.add_argument("--bare", action="store_true", help="create the grove without adding a workspace")
     sp.add_argument("--root", metavar="DIR", help="workspace directory (default: ../<slug>)")
     sp.set_defaults(fn=cmd_new)
 
@@ -793,14 +966,12 @@ def main() -> None:
 
     sp = sub.add_parser("use", parents=[common], help="bind the current workspace to an existing grove")
     sp.add_argument("slug")
-    sp.add_argument("--rebase", action="store_true",
-                    help="if unbound and @ is off-base, rebase @ onto the base first")
     sp.set_defaults(fn=cmd_use)
 
     sp = sub.add_parser("list", help="list groves and their workspaces")
     sp.set_defaults(fn=cmd_list)
 
-    sp = sub.add_parser("rm", parents=[common], help="remove a grove (workspaces + base bookmark)")
+    sp = sub.add_parser("rm", parents=[common], help="remove a grove and its workspaces")
     sp.add_argument("slug")
     sp.add_argument("--force", action="store_true", help="skip guards and confirmation")
     sp.set_defaults(fn=cmd_rm)
@@ -810,7 +981,7 @@ def main() -> None:
     sp.add_argument("revset", help="commits to bookmark; the prefix below them is grafted")
     sp.set_defaults(fn=cmd_graft)
 
-    sp = sub.add_parser("sync", parents=[common], help="advance the grove base onto trunk; prune merged bookmarks")
+    sp = sub.add_parser("sync", parents=[common], help="rebase grove roots onto trunk; prune merged bookmarks")
     sp.add_argument("--no-fetch", action="store_true",
                     help="skip the git fetch; advance onto the local trunk")
     sp.add_argument("--keep-merged", action="store_true",

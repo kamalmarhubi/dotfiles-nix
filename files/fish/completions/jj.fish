@@ -173,7 +173,7 @@ complete -c jj -n '__fish_jj_grove_needs_subcommand' -f -a rm \
 complete -c jj -n '__fish_jj_grove_needs_subcommand' -f -a graft \
     -d 'Graduate work onto trunk'
 complete -c jj -n '__fish_jj_grove_needs_subcommand' -f -a sync \
-    -d 'Advance the grove base onto trunk'
+    -d 'Rebase grove roots onto trunk'
 complete -c jj -n '__fish_jj_grove_needs_subcommand' -f -a restack \
     -d 'Rebase grove bookmarks onto trunk'
 complete -c jj -n '__fish_jj_grove_needs_subcommand' -f -a push \
@@ -188,7 +188,7 @@ complete -c jj -n '__fish_jj_grove_using_mutating_command' -s n -l dry-run \
     -d 'Print the plan; change nothing'
 
 complete -c jj -n '__fish_jj_grove_using_command new' -l bare \
-    -d 'Create the base only, no workspace'
+    -d 'Create the grove without adding a workspace'
 complete -c jj -n '__fish_jj_grove_using_command new' -l root -r -f \
     -a '(__fish_complete_directories)' -d 'Workspace directory'
 

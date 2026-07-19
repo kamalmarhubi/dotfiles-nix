@@ -6,10 +6,10 @@ email = "kamal@wave.com"
 
 [--scope.template-aliases]
 # Push-bookmark prefix for this workspace's grove: `kamal/<slug>/` derived
-# from `grove_base()` (`kamal/<slug>/base`), or plain `kamal/` when unset.
+# from `grove_marker()` (`kamal/<slug>/__marker__`), or plain `kamal/` when unset.
 'grove_push_prefix()' = '''
-  if(is_grove_base(config('revset-aliases."grove_base()"').as_string()),
-    config('revset-aliases."grove_base()"').as_string().remove_suffix("base"),
+  if(is_grove_marker(config('revset-aliases."grove_marker()"').as_string()),
+    config('revset-aliases."grove_marker()"').as_string().remove_suffix("__marker__"),
     "kamal/")
 '''
 

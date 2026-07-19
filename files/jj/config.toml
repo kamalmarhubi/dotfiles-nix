@@ -22,63 +22,65 @@ diff-formatter = ":git"
 [aliases]
 hunk = ["util", "exec", "--", "jj-hunk"]
 try = ["util", "exec", "--", "jj-try"]
-sprout = ["new", "coalesce(grove_base(), trunk())"]
+sprout = ["new", "trunk() | grove_marker()"]
 grove = ["util", "exec", "--", "jj-grove"]
 gh-fork = ["util", "exec", "--", "jj-gh-fork"]
 
 [revset-aliases]
-# Empty non-merge commits, blank descriptions, and WIP markers are scratch work.
-'incomplete()' = '''((empty() & ~merges()) | description("") | description(regex-i:'^(wip|tktk)\b')) ~ root()'''
+# Empty non-merge commits, blank descriptions, wip/tktk descriptions, and empty
+# marker-descendant merge commits are scratch work.
+'incomplete()' = '''((empty() & (~merges() | descendants(grove_markers()))) | description("") | description(regex-i:'^(wip|tktk)\b')) ~ root()'''
 
-# A "grove" is a cluster of related work growing from one base. It's the unit
-# the default log is organised around, and lives entirely under `kamal/<slug>/`:
-# rooted by an empty commit bookmarked `kamal/<slug>/base`, with commits pushed
-# out of it (rebased onto trunk) bookmarked `kamal/<slug>/<date>-<change_id>` by
+# A "grove" is a cluster of related work marked by an empty orphan commit. It's
+# the unit the default log is organised around, and lives entirely under
+# `kamal/<slug>/`: marked by `kamal/<slug>/__marker__`, with commits pushed out of it
+# (by dropping the marker parent) bookmarked `kamal/<slug>/<date>-<change_id>` by
 # `git_push_bookmark`. Everything else should "just work".
 
-# Workspaces specify a grove by overriding `grove_base()` (the base
+# Workspaces specify a grove by overriding `grove_marker()` (the marker
 # bookmark) and `grove_bookmarks()` (its pushed bookmarks, via the glob helper):
 #
 #   [revset-aliases]
-#   'grove_base()'   = 'kamal/<slug>/base'
+#   'grove_marker()' = 'kamal/<slug>/__marker__'
 #   'grove_bookmarks()' = 'grove_bookmarks("kamal/<slug>/*")'
 #
 'grove_prefix()' = '"kamal/"'
 # TODO(jj-vcs/jj#5895): Replace inlined grove_prefix().
-'grove_bases()' = '''bookmarks(regex:"^kamal/[^/]+/base$")'''
+'grove_markers()' = '''bookmarks(regex:"^kamal/[^/]+/__marker__$")'''
 
-# `grove_bookmarks(pat)`: bookmarks under glob `pat`, minus the base. If / when
-# jj#5895 gives a way to interpolate values into revsets, base and pushed can
+# `grove_bookmarks(pat)`: bookmarks under glob `pat`, minus markers. If / when
+# jj#5895 gives a way to interpolate values into revsets, marker and pushed can
 # derive from one per-workspace slug instead of being restated, eg:
-#   'grove_base()'   = '''bookmarks(glob:concat(grove_prefix(), <slug>, "/base"))'''
+#   'grove_marker()' = '''bookmarks(glob:concat(grove_prefix(), <slug>, "/__marker__"))'''
 #   'grove_bookmarks()' = '''grove_bookmarks(concat(grove_prefix(), <slug>, "/*"))'''
-'grove_base()' = '''none()'''
+'grove_marker()' = '''none()'''
 'grove_bookmarks()' = '''none()'''
-'grove_bookmarks(pat)' = '''bookmarks(glob:pat) ~ grove_base()'''
+'grove_bookmarks(pat)' = '''bookmarks(glob:pat) ~ grove_markers()'''
 
-# `grove(r)`: live mutable stacks on base `r`, plus pushed-but-unmerged commits.
-# `~ ::trunk()` drops merged commits and keeps `descendants()` off the rest of trunk.
+# `grove(r)`: live mutable stacks descending from marker `r`, plus
+# pushed-but-unmerged commits. `~ ::trunk()` drops merged commits and keeps
+# `descendants()` off the rest of trunk.
 # `grove()` is the current workspace's grove, usable as `jj log -r grove()`.
-'grove(r)' = '''reachable(r, mutable()) | (descendants(grove_bookmarks()) ~ ::trunk())'''
-'grove()' = '''grove(grove_base())'''
+'grove(r)' = '''(descendants(r) & mutable()) | (descendants(grove_bookmarks()) ~ ::trunk())'''
+'grove()' = '''grove(grove_marker())'''
 'global_log_context()' = 'ancestors(immutable_heads().., 2)'
 
 # "default_blah" are so that repos can be customised without repeating the basics.
-'default_private_commits()' = "(incomplete() & mine()) | descendants(grove_bases())"
+'default_private_commits()' = "(incomplete() & mine()) | descendants(grove_markers())"
 'default_log()' = '''ancestors(@, 3) | descendants(@, 3) | trunk() | trunk()..@ | coalesce(grove(), global_log_context())'''
 
 [git]
 private-commits = 'default_private_commits()'
 
 [template-aliases]
-# `is_grove_base(name)`: does `name` match a grove base bookmark,
-# i.e. `^kamal/[^/]+/base$`? The template DSL has no regex, hence the
+# `is_grove_marker(name)`: does `name` match a grove marker bookmark,
+# ie `^kamal/[^/]+/__marker__$`? The template DSL has no regex, hence the
 # prefix/suffix dance. Used by `grove_push_prefix()` in conf.d/wave.toml.
-'is_grove_base(name)' = '''
+'is_grove_marker(name)' = '''
   name.starts_with("kamal/")
-  && name.remove_prefix("kamal/").ends_with("/base")
-  && (name.remove_prefix("kamal/").remove_suffix("/base") != "")
-  && !name.remove_prefix("kamal/").remove_suffix("/base").contains("/")
+  && name.remove_prefix("kamal/").ends_with("/__marker__")
+  && (name.remove_prefix("kamal/").remove_suffix("/__marker__") != "")
+  && !name.remove_prefix("kamal/").remove_suffix("/__marker__").contains("/")
 '''
 
 'format_commit_labels(commit)' = '''
@@ -88,28 +90,28 @@ private-commits = 'default_private_commits()'
       if(commit.divergent(), label("divergent", "(divergent)")),
     ),
     if(commit.conflict(), label("conflict", "(conflict)")),
-    if(commit.contained_in("grove_bases()") && !commit.empty(),
-      label("grove_base_nonempty", "NONEMPTY-BASE"),
+    if(commit.contained_in("grove_markers()") && !commit.empty(),
+      label("grove_marker_nonempty", "NONEMPTY-MARKER"),
     ),
     if(commit.current_working_copy()
-       && is_grove_base(config('revset-aliases."grove_base()"').as_string())
+       && is_grove_marker(config('revset-aliases."grove_marker()"').as_string())
        && !commit.contained_in("grove()"),
-      label("grove_off_base", "off-grove:" ++
-        config('revset-aliases."grove_base()"').as_string().remove_prefix("kamal/").remove_suffix("/base")),
+      label("grove_off_marker", "off-grove:" ++
+        config('revset-aliases."grove_marker()"').as_string().remove_prefix("kamal/").remove_suffix("/__marker__")),
     ),
   )
 '''
 [colors]
-"node grove_base_nonempty" = { reverse = true }
-grove_base_nonempty = { fg = "ansi-color-202", bold = true }
-grove_off_base = { fg = "red", bold = true }
+"node grove_marker_nonempty" = { reverse = true }
+grove_marker_nonempty = { fg = "ansi-color-202", bold = true }
+grove_off_marker = { fg = "red", bold = true }
 
 [templates]
 log_node = '''
 label(
   if(
-    self && self.contained_in("grove_bases()") && !self.empty(),
-    "grove_base_nonempty"
+    self && self.contained_in("grove_markers()") && !self.empty(),
+    "grove_marker_nonempty"
   ),
   if(config("ui.graph.style").as_string().starts_with("ascii"),
     builtin_log_node_ascii,
@@ -121,7 +123,8 @@ label(
 [revsets]
 # For bare `jj bookmark advance`, move through complete commits above the
 # nearest ancestor bookmark, but stop before scratch work instead of skipping it.
-bookmark-advance-to = "heads(::@ ~ (incomplete() & (bookmarks()..@))::)"
+bookmark-advance-from = "heads((::to & bookmarks()) ~ grove_markers())"
+bookmark-advance-to = "heads(::@ ~ descendants(grove_markers()) ~ (incomplete() & (bookmarks()..@))::)"
 log = "default_log()"
 
 [merge-tools.delta]
