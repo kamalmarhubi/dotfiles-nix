@@ -35,17 +35,29 @@ import shutil
 import subprocess
 import sys
 
+GROVE_BASE_SUFFIX = "base"
+GROVE_BASE_ALIAS = 'revset-aliases."grove_base()"'
+GROVE_BOOKMARKS_ALIAS = 'revset-aliases."grove_bookmarks()"'
+GROVE_BASE_REVSET = "grove_base()"
+GROVE_BASES_REVSET = "grove_bases()"
+GROVE_BOOKMARKS_REVSET = "grove_bookmarks()"
+
+
 @functools.cache
 def grove_prefix() -> str:
     return jj("config", "get", 'revset-aliases."grove_prefix()"').strip('"')
 
 
-def base_bookmark(slug: str) -> str:
-    return f"{grove_prefix()}{slug}/base"
+def grove_base_bookmark(slug: str) -> str:
+    return f"{grove_prefix()}{slug}/{GROVE_BASE_SUFFIX}"
+
+
+def grove_bookmark_glob(slug: str) -> str:
+    return f"{grove_prefix()}{slug}/*"
 
 
 def bookmarks_value(slug: str) -> str:
-    return f'grove_bookmarks("{grove_prefix()}{slug}/*")'
+    return f'grove_bookmarks("{grove_bookmark_glob(slug)}")'
 
 
 # --------------------------------------------------------------------------- #
@@ -136,27 +148,52 @@ def siblings_parent() -> str:
 
 
 def grove_exists(slug: str) -> bool:
-    out = jj("log", "--no-graph", "-r", f"present({base_bookmark(slug)})",
-             "-T", '"x"')
+    out = jj(
+        "log",
+        "--no-graph",
+        "-r",
+        f"present({grove_base_bookmark(slug)})",
+        "-T",
+        '"x"',
+    )
     return bool(out)
 
 
 def at_on_base(slug: str, cwd: str | None = None) -> bool:
     # is @ a descendant of (or equal to) the grove base?
-    out = jj("log", "--no-graph", "-r",
-             f"@ & descendants(present({base_bookmark(slug)}))",
-             "-T", '"x"', cwd=cwd)
+    out = jj(
+        "log",
+        "--no-graph",
+        "-r",
+        f"@ & descendants(present({grove_base_bookmark(slug)}))",
+        "-T",
+        '"x"',
+        cwd=cwd,
+    )
     return bool(out)
 
 
 def binding_slug(cwd: str | None = None) -> str | None:
     """The grove a workspace is bound to (its grove_base() override), or None."""
-    val = jj("config", "get", 'revset-aliases."grove_base()"', cwd=cwd)
+    val = jj("config", "get", GROVE_BASE_ALIAS, cwd=cwd)
     return slug_of(val)
 
 
+def bound_slug() -> str:
+    slug = binding_slug()
+    if slug is None:
+        die(
+            f"not bound to a grove ({GROVE_BASE_REVSET} is none()); "
+            "cd into a grove workspace."
+        )
+    return slug
+
+
 def slug_of(base_value: str) -> str | None:
-    m = re.fullmatch(rf"{re.escape(grove_prefix())}(?P<slug>[^/]+)/base", base_value)
+    m = re.fullmatch(
+        rf"{re.escape(grove_prefix())}(?P<slug>[^/]+)/{re.escape(GROVE_BASE_SUFFIX)}",
+        base_value,
+    )
     return m["slug"] if m else None
 
 
@@ -181,10 +218,24 @@ def validate_slug(slug: str, what: str = "grove name") -> None:
 
 
 def bind(slug: str, cwd: str | None = None) -> None:
-    do("config", "set", "--workspace", 'revset-aliases."grove_base()"',
-       base_bookmark(slug), cwd=cwd, why="bind grove_base()")
-    do("config", "set", "--workspace", 'revset-aliases."grove_bookmarks()"',
-       bookmarks_value(slug), cwd=cwd, why="bind grove_bookmarks()")
+    do(
+        "config",
+        "set",
+        "--workspace",
+        GROVE_BASE_ALIAS,
+        grove_base_bookmark(slug),
+        cwd=cwd,
+        why=f"bind {GROVE_BASE_REVSET}",
+    )
+    do(
+        "config",
+        "set",
+        "--workspace",
+        GROVE_BOOKMARKS_ALIAS,
+        bookmarks_value(slug),
+        cwd=cwd,
+        why="bind grove_bookmarks()",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -199,11 +250,15 @@ def cmd_new(args) -> None:
         die(f"grove '{slug}' already exists. "
             f"Use `jj grove workspace add {slug} <name>` to add a workspace.")
 
+    base = grove_base_bookmark(slug)
     if args.bare:
-        info(f"creating grove '{slug}' (base only) at {base_bookmark(slug)}")
+        info(f"creating grove '{slug}' (base only) at {base}")
         if DRY:
-            plan(f"jj new --no-edit trunk() -m {slug + ' base'!r}   # create base commit")
-            plan(f"jj bookmark create {base_bookmark(slug)} -r <new commit>")
+            plan(
+                f"jj new --no-edit trunk() -m {slug + ' base'!r}"
+                "   # create base commit"
+            )
+            plan(f"jj bookmark create {base} -r <new commit>")
             return
         r = subprocess.run(
             ["jj", "new", "--no-edit", "trunk()", "-m", f"{slug} base"],
@@ -214,8 +269,7 @@ def cmd_new(args) -> None:
         m = re.search(r"Created new commit (\S+)", r.stderr)
         if not m:
             die(f"couldn't find new commit id in:\n{r.stderr.strip()}")
-        do("bookmark", "create", base_bookmark(slug), "-r", m.group(1),
-           why="bookmark base")
+        do("bookmark", "create", base, "-r", m.group(1), why="bookmark base")
         info(f"created grove '{slug}' (no workspace)")
         return
 
@@ -224,11 +278,18 @@ def cmd_new(args) -> None:
     info(f"creating grove '{slug}' + workspace '{name}' at {dest}")
     parent = os.path.dirname(dest)
     do_fs(f"mkdir -p {parent}", lambda: os.makedirs(parent, exist_ok=True))
-    do("workspace", "add", "-r", "trunk()", dest, "--name", name,
-       why="new workspace on trunk")
+    do(
+        "workspace",
+        "add",
+        "-r",
+        "trunk()",
+        dest,
+        "--name",
+        name,
+        why="new workspace on trunk",
+    )
     do("describe", "-m", f"{slug} base", cwd=dest, why="describe base")
-    do("bookmark", "create", base_bookmark(slug), "-r", "@", cwd=dest,
-       why="bookmark base")
+    do("bookmark", "create", base, "-r", "@", cwd=dest, why="bookmark base")
     do("new", cwd=dest, why="working commit on base")
     bind(slug, cwd=dest)
     info(f"created grove '{slug}'; workspace at {dest}")
@@ -243,13 +304,24 @@ def cmd_workspace_add(args) -> None:
     if not grove_exists(slug):
         die(f"no grove '{slug}'. Use `jj grove new {slug}` to create it.")
 
-    dest = os.path.abspath(args.root or os.path.join(siblings_parent(), f"{slug}-{name}"))
+    dest = os.path.abspath(
+        args.root or os.path.join(siblings_parent(), f"{slug}-{name}")
+    )
     wsname = os.path.basename(dest)
     info(f"adding workspace '{wsname}' on grove '{slug}' at {dest}")
     parent = os.path.dirname(dest)
     do_fs(f"mkdir -p {parent}", lambda: os.makedirs(parent, exist_ok=True))
-    do("workspace", "add", "-r", base_bookmark(slug), dest, "--name", wsname,
-       why="new workspace on grove base")
+    base = grove_base_bookmark(slug)
+    do(
+        "workspace",
+        "add",
+        "-r",
+        base,
+        dest,
+        "--name",
+        wsname,
+        why="new workspace on grove base",
+    )
     bind(slug, cwd=dest)
     info(f"added workspace '{wsname}' on grove '{slug}'")
     if not DRY:
@@ -266,18 +338,19 @@ def cmd_use(args) -> None:
     if current == slug:
         info(f"already on grove '{slug}'")
         return
+    base = grove_base_bookmark(slug)
     if not at_on_base(slug):
         if current is not None:
-            die(f"@ isn't on {base_bookmark(slug)}, and this workspace is bound to "
+            die(f"@ isn't on {base}, and this workspace is bound to "
                 f"grove '{current}'; use won't rebase across groves.\n"
-                f"       move @ yourself:  jj rebase -b @ -d {base_bookmark(slug)}\n"
+                f"       move @ yourself:  jj rebase -b @ -d {base}\n"
                 f"       then re-run:      jj grove use {slug}")
         if not args.rebase:
-            die(f"@ isn't on {base_bookmark(slug)} -- the grove log won't include "
+            die(f"@ isn't on {base} -- the grove log won't include "
                 f"your work.\n"
-                f"       move it there:  jj rebase -b @ -d {base_bookmark(slug)}\n"
+                f"       move it there:  jj rebase -b @ -d {base}\n"
                 f"       or re-run with: jj grove use {slug} --rebase")
-        do("rebase", "-b", "@", "-d", base_bookmark(slug), why="rebase @ onto base")
+        do("rebase", "-b", "@", "-d", base, why="rebase @ onto base")
     bind(slug)
     if current:
         info(f"rebound grove '{current}' -> '{slug}'")
@@ -286,8 +359,9 @@ def cmd_use(args) -> None:
 
 
 def cmd_list(args) -> None:
-    bases = jj("log", "--no-graph", "-r", "grove_bases()", "-T",
-               'bookmarks ++ "\n"')
+    bases = jj(
+        "log", "--no-graph", "-r", GROVE_BASES_REVSET, "-T", 'bookmarks ++ "\n"'
+    )
     slugs = sorted(filter(None, (slug_of(b.strip()) for b in bases.splitlines())))
 
     cur_slug = binding_slug()
@@ -305,13 +379,24 @@ def cmd_list(args) -> None:
         return
 
     for s in slugs:
-        base = base_bookmark(s)
+        base = grove_base_bookmark(s)
         # stale: no live mutable work and no unmerged pushed bookmarks
-        live = jj("log", "--no-graph", "-r",
-                  f"(descendants({base}) & mutable()) ~ {base}", "-T", '"x"')
-        unmerged = jj("log", "--no-graph", "-r",
-                      f'(bookmarks(glob:"{grove_prefix()}{s}/*") ~ {base}) ~ ::trunk()',
-                      "-T", '"x"')
+        live = jj(
+            "log",
+            "--no-graph",
+            "-r",
+            f"(descendants({base}) & mutable()) ~ {base}",
+            "-T",
+            '"x"',
+        )
+        unmerged = jj(
+            "log",
+            "--no-graph",
+            "-r",
+            f'(bookmarks(glob:"{grove_bookmark_glob(s)}") ~ {base}) ~ ::trunk()',
+            "-T",
+            '"x"',
+        )
         flags = []
         if s == cur_slug:
             flags.append("current")
@@ -328,10 +413,11 @@ def cmd_rm(args) -> None:
     if not grove_exists(slug):
         die(f"no grove '{slug}'.")
 
-    base = base_bookmark(slug)
+    base = grove_base_bookmark(slug)
     cur_root = os.path.realpath(current_ws_root())
-    bound = [(name, root) for name, root in workspaces()
-             if binding_slug(cwd=root) == slug]
+    bound = [
+        (name, root) for name, root in workspaces() if binding_slug(cwd=root) == slug
+    ]
 
     # guard: don't pull the rug out from under the current workspace
     for name, root in bound:
@@ -341,8 +427,14 @@ def cmd_rm(args) -> None:
 
     # guard: refuse if any bound workspace has non-empty (would-be-lost) work
     if not args.force:
-        risky = jj("log", "--no-graph", "-r",
-                   f"(descendants({base}) & mutable()) ~ empty()", "-T", '"x"')
+        risky = jj(
+            "log",
+            "--no-graph",
+            "-r",
+            f"(descendants({base}) & mutable()) ~ empty()",
+            "-T",
+            '"x"',
+        )
         if risky:
             die(f"grove '{slug}' has non-empty local commits that would be lost. "
                 f"Re-run with --force to remove anyway.")
@@ -355,7 +447,11 @@ def cmd_rm(args) -> None:
         info("  (no bound workspaces)")
 
     if DRY:
-        plan(f"jj workspace forget {' '.join(n for n, _ in bound)}" if bound else "(nothing to forget)")
+        plan(
+            f"jj workspace forget {' '.join(n for n, _ in bound)}"
+            if bound
+            else "(nothing to forget)"
+        )
         for _, root in bound:
             plan(f"rm -rf {root}")
         plan(f"jj bookmark delete {base}")
@@ -390,19 +486,36 @@ def _ids(revset: str) -> list[str]:
     return [c for c in out.splitlines() if c]
 
 
+def graft_selection_revset(user_revset: str) -> str:
+    return f"(({user_revset}) & ({GROVE_BASE_REVSET}..))"
+
+
+def graft_prefix_revset(selection_heads: str) -> str:
+    return f"(({GROVE_BASE_REVSET}..{selection_heads}) ~ ::{GROVE_BOOKMARKS_REVSET})"
+
+
+def graft_survivors_revset(selection_heads: str) -> str:
+    return f"children({selection_heads}) ~ ({GROVE_BASE_REVSET}..{selection_heads})"
+
+
+def merged_grove_bookmarks_revset(slug: str) -> str:
+    return (
+        f'bookmarks(glob:"{grove_bookmark_glob(slug)}") '
+        f"& (::trunk() ~ {GROVE_BASES_REVSET})"
+    )
+
+
 def cmd_graft(args) -> None:
     revset = args.revset
-    slug = binding_slug()
-    if slug is None:
-        die("not bound to a grove (grove_base() is none()); cd into a grove workspace.")
+    slug = bound_slug()
 
-    S = f"(({revset}) & (grove_base()..))"            # commits to bookmark
+    S = graft_selection_revset(revset)            # commits to bookmark
     heads_S = f"heads({S})"
-    newwork = f"((grove_base()..{heads_S}) ~ ::grove_bookmarks())"
-    fork = "fork_point(grove_base() | trunk())"
+    newwork = graft_prefix_revset(heads_S)
+    fork = f"fork_point({GROVE_BASE_REVSET} | trunk())"
 
     # guards: all before mutating
-    if jj("log", "--no-graph", "-r", "grove_base() & ~empty()", "-T", '"x"'):
+    if jj("log", "--no-graph", "-r", f"{GROVE_BASE_REVSET} & ~empty()", "-T", '"x"'):
         die("grove base is not empty (NONEMPTY-BASE); graft would drop its changes.")
     stray = _ids(f"(({revset}) & mutable()) ~ grove()")
     if stray:
@@ -419,12 +532,12 @@ def cmd_graft(args) -> None:
     try:
         # lift: re-root not-yet-grafted work onto its non-base parent, else the fork point
         for r in _ids(f"roots({newwork})"):
-            onto = _ids(f"parents({r}) ~ grove_base()")
+            onto = _ids(f"parents({r}) ~ {GROVE_BASE_REVSET}")
             dest = " | ".join(onto) if onto else fork
             do("rebase", "-s", r, "--onto", dest, why=f"lift {r}")
-        # reconnect: survivors above the cut gain grove_base() as an extra parent
-        for c in _ids(f"children({heads_S}) ~ (grove_base()..{heads_S})"):
-            do("rebase", "-r", c, "--onto", f"(parents({c})) | grove_base()",
+        # reconnect: survivors above the cut gain the base as an extra parent
+        for c in _ids(graft_survivors_revset(heads_S)):
+            do("rebase", "-r", c, "--onto", f"(parents({c})) | {GROVE_BASE_REVSET}",
                why=f"reconnect {c} to base")
         # bookmark each grafted commit
         rows = jj("log", "--no-graph", "--reversed", "-r", S, "-T",
@@ -469,13 +582,11 @@ def cmd_graft(args) -> None:
 
 
 def cmd_sync(args) -> None:
-    slug = binding_slug()
-    if slug is None:
-        die("not bound to a grove (grove_base() is none()); cd into a grove workspace.")
+    slug = bound_slug()
 
     # refuse if a grove bookmark sits on a base-descendant: advancing the base
     # would rebase a live pushed bookmark
-    onbase = _ids("grove_bookmarks() & descendants(grove_base())")
+    onbase = _ids(f"{GROVE_BOOKMARKS_REVSET} & descendants({GROVE_BASE_REVSET})")
     if onbase:
         die(f"grove bookmark(s) sit on base-descendants; sync would rebase them: "
             f"{', '.join(onbase)}")
@@ -497,17 +608,13 @@ def cmd_sync(args) -> None:
         # advance the base (+ on-base survivors) onto current trunk; --simplify-parents
         # drops now-redundant parent edges to merged grafts. -s grove_base() scopes the
         # rebase to base + descendants, so off-base bookmarks are left untouched.
-        do("rebase", "-s", "grove_base()", "--onto", "trunk()", "--simplify-parents",
+        do("rebase", "-s", GROVE_BASE_REVSET, "--onto", "trunk()", "--simplify-parents",
            why="advance base onto trunk")
         # prune merged grove bookmarks; `delete` removes their remote branches on
         # the next push (--keep-merged skips)
         if not args.keep_merged:
-            merged_revset = (
-                f'bookmarks(glob:"{grove_prefix()}{slug}/*") '
-                '& (::trunk() ~ grove_bases())'
-            )
             merged = jj(
-                "bookmark", "list", "-r", merged_revset,
+                "bookmark", "list", "-r", merged_grove_bookmarks_revset(slug),
                 "-T", 'if(!remote && present && !conflict, name ++ "\n")'
             ).splitlines()
             if merged:
@@ -561,12 +668,10 @@ def _push(names: list[str], why: str = "") -> None:
 
 
 def cmd_push(args) -> None:
-    slug = binding_slug()
-    if slug is None:
-        die("not bound to a grove (grove_base() is none()); cd into a grove workspace.")
+    slug = bound_slug()
 
-    base = base_bookmark(slug)
-    glob = f"glob:{grove_prefix()}{slug}/*"
+    base = grove_base_bookmark(slug)
+    glob = f"glob:{grove_bookmark_glob(slug)}"
     remote = push_remote()
 
     # live bookmarks: present locally under the grove glob.
@@ -602,13 +707,11 @@ def cmd_push(args) -> None:
 
 
 def cmd_restack(args) -> None:
-    slug = binding_slug()
-    if slug is None:
-        die("not bound to a grove (grove_base() is none()); cd into a grove workspace.")
+    slug = bound_slug()
 
     # the revset (default all()) scopes which bookmarks to rebase, intersected
     # with grove_bookmarks() so it can never reach non-grove work.
-    sel = f"grove_bookmarks() & ({args.revset})"
+    sel = f"{GROVE_BOOKMARKS_REVSET} & ({args.revset})"
     selected = _ids(sel)
     if not selected:
         info(f"nothing to restack for grove '{slug}'")
@@ -616,7 +719,7 @@ def cmd_restack(args) -> None:
     # `-b` rebases whole branches, so a selected bookmark pulls the rest of its
     # stack along. capture both sets as change-ids (stable across the rebase) so
     # the post-rebase reasoning holds even for a commit-hash revset.
-    moved = _ids(f"grove_bookmarks() & reachable(({sel}), mutable())")
+    moved = _ids(f"{GROVE_BOOKMARKS_REVSET} & reachable(({sel}), mutable())")
 
     # rebase the selected branches onto current trunk. jj records any conflicts
     # rather than failing, so this won't abort mid-way.
