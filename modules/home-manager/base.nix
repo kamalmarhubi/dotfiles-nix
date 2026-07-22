@@ -19,8 +19,9 @@
     magic-wormhole
     (pkgs.runCommand "moreutils-selected" {} ''
       mkdir -p $out/bin
-      ln -s ${moreutils}/bin/vipe $out/bin/
       ln -s ${moreutils}/bin/sponge $out/bin/
+      ln -s ${moreutils}/bin/ts $out/bin/
+      ln -s ${moreutils}/bin/vipe $out/bin/
     '')
     mtr
     nushell

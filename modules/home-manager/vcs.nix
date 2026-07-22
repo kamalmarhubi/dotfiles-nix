@@ -1,8 +1,6 @@
 {
   config,
   pkgs,
-  inputs,
-  system,
   ...
 }: {
   home = {
@@ -11,20 +9,19 @@
     };
 
     packages =
-      (with pkgs; [
+      with pkgs; [
         delta
         gh
         git
         git-absorb
         git-lfs
         git-branchless
+        # TODO(bump): Switch to unstable on next flake update for unstable.
+        master.hunk
         jujutsu
         mine.jj-hunk
         # git-filter-repo
         lazygit
-      ])
-      ++ [
-        inputs.hunk.packages.${system}.hunk
       ];
     file.".local/bin/jj-gh-fork".source =
       config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/jj/jj-gh-fork";
