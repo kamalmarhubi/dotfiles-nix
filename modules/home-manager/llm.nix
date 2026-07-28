@@ -8,6 +8,7 @@
       unstable.codex
       # zig and e2fsprogs for https://github.com/earendil-works/gondolin
       e2fsprogs
+      unstable.tuicr
       zig
       brewCasks.voiceink
     ])
