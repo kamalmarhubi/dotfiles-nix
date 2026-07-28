@@ -16,8 +16,7 @@
         git-absorb
         git-lfs
         git-branchless
-        # TODO(bump): Switch to unstable on next flake update for unstable.
-        master.hunk
+        unstable.hunk
         jujutsu
         mine.jj-hunk
         # git-filter-repo

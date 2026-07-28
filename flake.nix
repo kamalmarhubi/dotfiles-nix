@@ -131,7 +131,7 @@
       # Overlays for llm-agents stuff.
       {
         nixpkgs.overlays = [
-          llm-agents.overlays.default
+          llm-agents.overlays.shared-nixpkgs
         ];
       }
     ];
