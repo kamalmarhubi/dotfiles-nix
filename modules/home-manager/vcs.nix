@@ -16,7 +16,7 @@
         git-absorb
         git-lfs
         git-branchless
-        unstable.hunk
+        llm-agents.hunk
         jujutsu
         mine.jj-hunk
         # git-filter-repo
