@@ -2,21 +2,24 @@
 """jj-grove: manage groves and their workspaces.
 
 A "grove" is a long-lived line of work marked by an empty orphan commit
-bookmarked `kamal/<slug>/__marker__`. Private work is attached to that marker as an
-extra parent, with one or more jj workspaces bound to it via per-workspace
-config (`grove_marker()` / `grove_bookmarks()`). The revset machinery
-(grove_marker/grove_markers/grove_bookmarks/grove/is_grove_marker) lives in jj's
-config.toml; this script is the front door for creating and managing groves.
+bookmarked `kamal/<slug>/__marker__`. Grove work descends from that marker
+through empty attachment commits, with one or more jj workspaces bound to it via
+per-workspace config (`grove_marker()` / `grove_bookmarks()`). The revset
+machinery (grove_marker/grove_markers/grove_bookmarks/grove/grove_attachments/
+is_grove_marker) lives in jj's config.toml; this script is the front door for
+creating and managing groves.
 
 Subcommands:
   new <slug> [--bare] [--root DIR]   create a grove (+ a workspace unless --bare)
   workspace add <slug> <name> [--root DIR]
                                       add another workspace to an existing grove
   use <slug>                         bind the current workspace to an existing grove
+  sprout [REVSETS]... [-- <jj new args>]
+                                      start work from parent revsets (default trunk)
   list                               list groves and their workspaces
   rm <slug> [--force]                remove a grove and its workspaces
   graft <revset> [--push]            graduate a rooted prefix onto trunk as bookmarks to push
-  sync [--no-fetch] [--keep-merged]  rebase grove roots onto trunk; prune merged bookmarks
+  sync [--no-fetch] [--keep-merged]  rebase grove attachments onto trunk; prune merged bookmarks
   restack [revset] [--push]          rebase grove bookmarks onto trunk (default: all)
   push                               push the grove's bookmarks to the remote
 
@@ -42,6 +45,7 @@ GROVE_BOOKMARKS_ALIAS = 'revset-aliases."grove_bookmarks()"'
 GROVE_MARKER_REVSET = "grove_marker()"
 GROVE_MARKERS_REVSET = "grove_markers()"
 GROVE_BOOKMARKS_REVSET = "grove_bookmarks()"
+GROVE_ATTACHMENTS_REVSET = "grove_attachments()"
 MARKER_NAME = "jj-grove"
 MARKER_EMAIL = "jj-grove@example.invalid"
 MARKER_DATE = "1970-01-01T00:00:00 +0000"
@@ -249,7 +253,7 @@ def grove_exists(slug: str) -> bool:
 
 
 def at_on_marker(slug: str, cwd: str | None = None) -> bool:
-    # is @ inside the grove's private work (descended from the marker)?
+    # is @ inside the grove's marker-descended work?
     out = jj(
         "log",
         "--no-graph",
@@ -375,6 +379,88 @@ def create_marker(slug: str, cwd: str | None = None) -> None:
     do("git", "import", cwd=cwd, why="import marker ref into jj")
 
 
+def revset_exists(revset: str, cwd: str | None = None) -> bool:
+    out = jj("log", "--no-graph", "-r", revset, "-T", '"x"', cwd=cwd)
+    return bool(out)
+
+
+def single_id(revset: str, what: str, cwd: str | None = None) -> str:
+    ids = _ids(revset, cwd=cwd)
+    if len(ids) != 1:
+        die(f"expected exactly one {what}; got {len(ids)}")
+    return ids[0]
+
+
+def attachments_revset(marker: str = GROVE_MARKER_REVSET) -> str:
+    return f"(children({marker}) & empty() & merges())"
+
+
+def grove_content_revset(marker: str = GROVE_MARKER_REVSET) -> str:
+    return (
+        f"((descendants({marker}) ~ {marker}) "
+        f"~ {attachments_revset(marker)})"
+    )
+
+
+def direct_marker_work_revset(marker: str = GROVE_MARKER_REVSET) -> str:
+    return f"(children({marker}) ~ {attachments_revset(marker)})"
+
+
+def create_attachment(
+    parent_revset: str,
+    marker: str,
+    *,
+    cwd: str | None = None,
+    why: str,
+) -> str:
+    do("new", f"({parent_revset}) | {marker}", cwd=cwd, why=why)
+    return "<attachment>" if DRY else single_id("@", "new attachment", cwd=cwd)
+
+
+def create_grove_work(
+    parent_revsets: list[str],
+    marker: str,
+    new_args: list[str],
+    *,
+    cwd: str | None = None,
+) -> None:
+    parent_revset = " | ".join(f"({revset})" for revset in parent_revsets)
+    if not revset_exists(parent_revset, cwd=cwd):
+        die(f"parent revsets match no commits: {' '.join(parent_revsets)}")
+    if revset_exists(f"({parent_revset}) & {marker}", cwd=cwd):
+        die("parent revsets include the grove marker; choose real parent commits")
+
+    in_grove = revset_exists(
+        f"({parent_revset}) & descendants({marker})", cwd=cwd
+    )
+    outside_grove = revset_exists(
+        f"({parent_revset}) ~ descendants({marker})", cwd=cwd
+    )
+    if in_grove and outside_grove:
+        die("parent revsets mix grove and non-grove commits")
+
+    if in_grove:
+        do("new", parent_revset, *new_args, cwd=cwd, why="new grove work")
+        return
+
+    attachment = create_attachment(
+        parent_revset,
+        marker,
+        cwd=cwd,
+        why="create grove attachment",
+    )
+    do("new", attachment, *new_args, cwd=cwd, why="new work above attachment")
+
+
+def split_sprout_args(argv: list[str]) -> tuple[list[str], list[str]]:
+    if "--" in argv:
+        sep = argv.index("--")
+        revsets, new_args = argv[:sep], argv[sep + 1:]
+    else:
+        revsets, new_args = argv, []
+    return (revsets or ["trunk()"], new_args)
+
+
 # --------------------------------------------------------------------------- #
 # subcommands
 # --------------------------------------------------------------------------- #
@@ -408,9 +494,10 @@ def cmd_new(args) -> None:
         dest,
         "--name",
         name,
-        why="new workspace on trunk + marker",
+        why="new workspace attachment on trunk + marker",
     )
     bind(slug, cwd=dest)
+    do("new", "@", cwd=dest, why="new work above attachment")
     info(f"created grove '{slug}'; workspace at {dest}")
     if not DRY:
         print(dest)
@@ -438,12 +525,21 @@ def cmd_workspace_add(args) -> None:
         dest,
         "--name",
         wsname,
-        why="new workspace on trunk + marker",
+        why="new workspace attachment on trunk + marker",
     )
     bind(slug, cwd=dest)
+    do("new", "@", cwd=dest, why="new work above attachment")
     info(f"added workspace '{wsname}' on grove '{slug}'")
     if not DRY:
         print(dest)
+
+
+def cmd_sprout(args) -> None:
+    revsets, new_args = split_sprout_args(args.args)
+    if binding_slug() is None:
+        do("new", *revsets, *new_args, why="new work")
+        return
+    create_grove_work(revsets, GROVE_MARKER_REVSET, new_args)
 
 
 def cmd_use(args) -> None:
@@ -463,16 +559,32 @@ def cmd_use(args) -> None:
         )
     marker = grove_marker_bookmark(slug)
     if not at_on_marker(slug):
+        current_at = single_id("@", "working copy")
         roots = _ids("roots(::@ & mutable())")
+        restore_at = current_at
         for root in roots:
+            if (
+                root == current_at
+                and revset_exists(f'{root} & empty() & description("")')
+            ):
+                create_grove_work([f"parents({root})"], marker, [])
+                restore_at = ""
+                continue
+            attachment = create_attachment(
+                f"parents({root})",
+                marker,
+                why=f"create attachment for {root}",
+            )
             do(
                 "rebase",
                 "-s",
                 root,
                 "--onto",
-                f"parents({root}) | {marker}",
-                why=f"mark private root {root}",
+                attachment,
+                why=f"attach grove root {root}",
             )
+        if restore_at:
+            do("edit", restore_at, why="restore working copy")
     bind(slug)
     info(f"bound current workspace to grove '{slug}'")
 
@@ -599,31 +711,48 @@ def cmd_rm(args) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _ids(revset: str) -> list[str]:
+def _ids(revset: str, cwd: str | None = None) -> list[str]:
     """Unambiguous short change-ids for a revset (stable across rebase)."""
-    out = jj("log", "--no-graph", "-r", revset, "-T", 'change_id.shortest(8) ++ "\n"')
+    out = jj(
+        "log",
+        "--no-graph",
+        "-r",
+        revset,
+        "-T",
+        'change_id.shortest(8) ++ "\n"',
+        cwd=cwd,
+    )
     return [c for c in out.splitlines() if c]
 
 
 def graft_selection_revset(user_revset: str) -> str:
-    return (
-        f"(({user_revset}) & "
-        f"(descendants({GROVE_MARKER_REVSET}) ~ {GROVE_MARKER_REVSET}))"
-    )
+    return f"(({user_revset}) & {grove_content_revset()})"
 
 
 def graft_prefix_revset(selection_heads: str) -> str:
-    return (
-        f"((ancestors({selection_heads}) & descendants({GROVE_MARKER_REVSET})) "
-        f"~ {GROVE_MARKER_REVSET})"
-    )
+    return f"(ancestors({selection_heads}) & {grove_content_revset()})"
 
 
 def graft_survivors_revset(prefix: str) -> str:
-    return (
-        f"((children(heads({prefix})) & descendants({GROVE_MARKER_REVSET})) "
-        f"~ ({prefix}))"
-    )
+    return f"((children(heads({prefix})) & {grove_content_revset()}) ~ ({prefix}))"
+
+
+def nearest_attachment(rev: str) -> str:
+    attachments = _ids(f"heads(::{rev} & {GROVE_ATTACHMENTS_REVSET})")
+    if len(attachments) != 1:
+        die(
+            f"expected exactly one grove attachment below {rev}; "
+            f"got {len(attachments)}"
+        )
+    return attachments[0]
+
+
+def abandon_attachment_if_unused(attachment: str) -> None:
+    if DRY:
+        plan(f"jj abandon {attachment}   # drop attachment if unused")
+        return
+    if not revset_exists(f"children({attachment})"):
+        do("abandon", attachment, why="drop unused attachment")
 
 
 def merged_grove_bookmarks_revset() -> str:
@@ -649,15 +778,22 @@ def cmd_graft(args) -> None:
         '"x"',
     ):
         die("grove marker is not empty (NONEMPTY-MARKER); markers must stay empty.")
+    malformed = _ids(direct_marker_work_revset())
+    if malformed:
+        die(
+            "direct marker child is not a grove attachment; migrate it first: "
+            f"{', '.join(malformed)}"
+        )
     stray = _ids(f"(({revset}) & mutable()) ~ grove()")
     if stray:
         die(f"revset reaches outside the grove: {', '.join(stray)}")
     if not _ids(S):
-        die("nothing to graft (revset matches no private grove work).")
+        die("nothing to graft (revset matches no marker-descended grove work).")
     bad = _ids(f"({newwork}) & (incomplete() | conflicts())")
     if bad:
         die(f"range has WIP/conflicted commits; finish them first: {', '.join(bad)}")
     roots = _ids(f"roots({newwork})")
+    root_attachments = {r: nearest_attachment(r) for r in roots}
     survivor_ids = _ids(survivors)
     rows = jj(
         "log",
@@ -673,29 +809,39 @@ def cmd_graft(args) -> None:
 
     info(f"grafting '{revset}' onto trunk")
     start_op = jj("op", "log", "-n1", "--no-graph", "-T", "self.id()")
+    current_at = single_id("@", "working copy")
     names: list[str] = []
     try:
-        # Publish the private prefix by dropping the marker parent from each root.
-        for r in roots:
+        # Publish the grove prefix by stripping the empty attachment below each
+        # content root; the attachment itself must not enter public history.
+        for r, attachment in root_attachments.items():
             do(
                 "rebase",
                 "-s",
                 r,
                 "--onto",
-                f"parents({r}) ~ {GROVE_MARKER_REVSET}",
-                why=f"drop marker parent from {r}",
+                f"parents({attachment}) ~ {GROVE_MARKER_REVSET}",
+                why=f"drop attachment below {r}",
             )
-        # Surviving private children moved along with the published prefix; add
-        # the marker parent back so they remain private grove work.
+        # Surviving grove children moved along with the published prefix; add a
+        # fresh attachment below each survivor so the survivor itself stays a
+        # normal content commit.
         for c in survivor_ids:
+            attachment = create_attachment(
+                f"parents({c})",
+                GROVE_MARKER_REVSET,
+                why=f"create attachment for survivor {c}",
+            )
             do(
                 "rebase",
-                "-r",
+                "-s",
                 c,
                 "--onto",
-                f"(parents({c})) | {GROVE_MARKER_REVSET}",
-                why=f"keep {c} marked private",
+                attachment,
+                why=f"keep {c} stack in grove",
             )
+        for attachment in sorted(set(root_attachments.values())):
+            abandon_attachment_if_unused(attachment)
         # bookmark each grafted commit
         for line in rows.splitlines():
             if "\t" not in line:
@@ -704,6 +850,7 @@ def cmd_graft(args) -> None:
             name = f"{grove_prefix()}{slug}/{suffix}"
             do("bookmark", "create", name, "-r", cid, why="bookmark")
             names.append(name)
+        do("edit", current_at, why="restore working copy")
     except SystemExit:
         if not DRY:
             rb = subprocess.run(["jj", "--quiet", "op", "restore", start_op],
@@ -737,14 +884,20 @@ def cmd_graft(args) -> None:
 def cmd_sync(args) -> None:
     slug = bound_slug()
 
-    # refuse if a grove bookmark still sits in the private marker area.
-    private_bookmarks = _ids(
+    # refuse if a grove bookmark still sits in the marker-descended area.
+    marker_descended_bookmarks = _ids(
         f"{GROVE_BOOKMARKS_REVSET} & descendants({GROVE_MARKER_REVSET})"
     )
-    if private_bookmarks:
+    if marker_descended_bookmarks:
         die(
-            "grove bookmark(s) still descend from the private marker: "
-            f"{', '.join(private_bookmarks)}"
+            "grove bookmark(s) still descend from the grove marker: "
+            f"{', '.join(marker_descended_bookmarks)}"
+        )
+    malformed = _ids(direct_marker_work_revset())
+    if malformed:
+        die(
+            "direct marker child is not a grove attachment; migrate it first: "
+            f"{', '.join(malformed)}"
         )
 
     if not args.no_fetch:
@@ -761,12 +914,9 @@ def cmd_sync(args) -> None:
     start_op = jj("op", "log", "-n1", "--no-graph", "-T", "self.id()")
     merged: list[str] = []
     try:
-        roots = _ids(
-            f"roots((descendants({GROVE_MARKER_REVSET}) ~ {GROVE_MARKER_REVSET}) "
-            "& mutable())"
-        )
-        # Move each private root to current trunk while preserving the marker
-        # and any other non-trunk side parents.
+        roots = _ids(f"{GROVE_ATTACHMENTS_REVSET} & mutable()")
+        # Move each attachment to current trunk while preserving the marker and
+        # any other non-trunk side parents.
         for r in roots:
             do(
                 "rebase",
@@ -775,7 +925,7 @@ def cmd_sync(args) -> None:
                 "--onto",
                 f"trunk() | (parents({r}) ~ ::trunk())",
                 "--simplify-parents",
-                why=f"sync private root {r}",
+                why=f"sync attachment {r}",
             )
         # prune merged grove bookmarks; `delete` removes their remote branches on
         # the next push (--keep-merged skips)
@@ -883,11 +1033,11 @@ def cmd_restack(args) -> None:
     if not selected:
         info(f"nothing to restack for grove '{slug}'")
         return
-    private_bookmarks = _ids(f"({sel}) & descendants({GROVE_MARKER_REVSET})")
-    if private_bookmarks:
+    marker_descended_bookmarks = _ids(f"({sel}) & descendants({GROVE_MARKER_REVSET})")
+    if marker_descended_bookmarks:
         die(
-            "selected grove bookmark(s) still descend from the private marker; "
-            f"graft them first: {', '.join(private_bookmarks)}"
+            "selected grove bookmark(s) still descend from the grove marker; "
+            f"graft them first: {', '.join(marker_descended_bookmarks)}"
         )
     # `-b` rebases whole branches, so a selected bookmark pulls the rest of its
     # stack along. capture both sets as change-ids (stable across the rebase) so
@@ -968,6 +1118,17 @@ def main() -> None:
     sp.add_argument("slug")
     sp.set_defaults(fn=cmd_use)
 
+    sp = sub.add_parser(
+        "sprout", parents=[common], help="start work from parent revsets"
+    )
+    sp.add_argument(
+        "args",
+        nargs=argparse.REMAINDER,
+        metavar="REVSETS",
+        help="parent(s) of the new grove work [default: trunk()]; pass jj new args after --",
+    )
+    sp.set_defaults(fn=cmd_sprout)
+
     sp = sub.add_parser("list", help="list groves and their workspaces")
     sp.set_defaults(fn=cmd_list)
 
@@ -981,7 +1142,7 @@ def main() -> None:
     sp.add_argument("revset", help="commits to bookmark; the prefix below them is grafted")
     sp.set_defaults(fn=cmd_graft)
 
-    sp = sub.add_parser("sync", parents=[common], help="rebase grove roots onto trunk; prune merged bookmarks")
+    sp = sub.add_parser("sync", parents=[common], help="rebase grove attachments onto trunk; prune merged bookmarks")
     sp.add_argument("--no-fetch", action="store_true",
                     help="skip the git fetch; advance onto the local trunk")
     sp.add_argument("--keep-merged", action="store_true",

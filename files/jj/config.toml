@@ -22,7 +22,7 @@ diff-formatter = ":git"
 [aliases]
 hunk = ["util", "exec", "--", "jj-hunk"]
 try = ["util", "exec", "--", "jj-try"]
-sprout = ["new", "trunk() | grove_marker()"]
+sprout = ["grove", "sprout"]
 grove = ["util", "exec", "--", "jj-grove"]
 gh-fork = ["util", "exec", "--", "jj-gh-fork"]
 
@@ -33,9 +33,9 @@ gh-fork = ["util", "exec", "--", "jj-gh-fork"]
 
 # A "grove" is a cluster of related work marked by an empty orphan commit. It's
 # the unit the default log is organised around, and lives entirely under
-# `kamal/<slug>/`: marked by `kamal/<slug>/__marker__`, with commits pushed out of it
-# (by dropping the marker parent) bookmarked `kamal/<slug>/<date>-<change_id>` by
-# `git_push_bookmark`. Everything else should "just work".
+# `kamal/<slug>/`: marked by `kamal/<slug>/__marker__`, with active work
+# connected through empty attachment commits and published commits bookmarked
+# `kamal/<slug>/<date>-<change_id>` by `git_push_bookmark`.
 
 # Workspaces specify a grove by overriding `grove_marker()` (the marker
 # bookmark) and `grove_bookmarks()` (its pushed bookmarks, via the glob helper):
@@ -56,6 +56,9 @@ gh-fork = ["util", "exec", "--", "jj-gh-fork"]
 'grove_marker()' = '''none()'''
 'grove_bookmarks()' = '''none()'''
 'grove_bookmarks(pat)' = '''bookmarks(glob:pat) ~ grove_markers()'''
+# Direct marker children are reserved for empty attachment commits. Each
+# attachment also has the actual work parent(s), usually trunk().
+'grove_attachments()' = '''children(grove_marker()) & empty() & merges()'''
 
 # `grove(r)`: live mutable stacks descending from marker `r`, plus
 # pushed-but-unmerged commits. `~ ::trunk()` drops merged commits and keeps
