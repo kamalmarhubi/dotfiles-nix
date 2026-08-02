@@ -313,6 +313,30 @@ def test_new_bare_refuses_mismatched_raw_marker_ref(tmp_path: Path) -> None:
     assert not grove_repo.revset_exists("present(kamal/alpha/__marker__)")
 
 
+def assert_work_above_attachment(
+    grove_repo: GroveRepo,
+    work_revset: str,
+    *,
+    cwd: Cwd = None,
+    parent_revset: str = "trunk()",
+) -> str:
+    attachments = grove_repo.change_ids(
+        f"parents({work_revset}) & grove_attachments()", cwd=cwd
+    )
+    assert len(attachments) == 1
+    attachment = attachments[0]
+    assert grove_repo.revset_exists(
+        f"parents({attachment}) & {parent_revset}", cwd=cwd
+    )
+    assert grove_repo.revset_exists(
+        f"parents({attachment}) & grove_marker()", cwd=cwd
+    )
+    assert not grove_repo.revset_exists(
+        f"parents({work_revset}) & grove_marker()", cwd=cwd
+    )
+    return attachment
+
+
 def test_new_creates_bound_workspace_on_marker(grove_repo: GroveRepo) -> None:
     workspace = grove_repo.create_grove("alpha")
 
@@ -327,8 +351,13 @@ def test_new_creates_bound_workspace_on_marker(grove_repo: GroveRepo) -> None:
     )
     assert grove_repo.revset_exists("@ & descendants(kamal/alpha/__marker__)", cwd=workspace)
     assert not grove_repo.revset_exists("@ & kamal/alpha/__marker__", cwd=workspace)
-    assert grove_repo.revset_exists("parents(@) & trunk()", cwd=workspace)
-    assert grove_repo.revset_exists("parents(@) & kamal/alpha/__marker__", cwd=workspace)
+    assert_work_above_attachment(grove_repo, "@", cwd=workspace)
+    assert (
+        grove_repo.revset_count(
+            "children(grove_marker()) ~ grove_attachments()", cwd=workspace
+        )
+        == 0
+    )
 
 
 def test_workspace_add_binds_second_workspace_to_existing_marker(
@@ -350,8 +379,91 @@ def test_workspace_add_binds_second_workspace_to_existing_marker(
     )
     assert grove_repo.revset_exists("@ & descendants(kamal/alpha/__marker__)", cwd=workspace)
     assert not grove_repo.revset_exists("@ & kamal/alpha/__marker__", cwd=workspace)
-    assert grove_repo.revset_exists("parents(@) & trunk()", cwd=workspace)
-    assert grove_repo.revset_exists("parents(@) & kamal/alpha/__marker__", cwd=workspace)
+    assert_work_above_attachment(grove_repo, "@", cwd=workspace)
+
+
+def test_sprout_outside_grove_defaults_to_trunk(grove_repo: GroveRepo) -> None:
+    grove_repo.jj("sprout", "--", "-m", "outside grove")
+
+    assert (
+        grove_repo.jj_stdout("log", "--no-graph", "-r", "@", "-T", "description.first_line()")
+        == "outside grove"
+    )
+    assert grove_repo.revset_exists("parents(@) & trunk()")
+    assert grove_repo.revset_count("grove_attachments()") == 0
+
+
+def test_sprout_creates_work_above_attachment(grove_repo: GroveRepo) -> None:
+    workspace = grove_repo.create_grove("alpha")
+
+    grove_repo.jj("sprout", "--", "-m", "sprouted", cwd=workspace)
+
+    assert (
+        grove_repo.jj_stdout(
+            "log", "--no-graph", "-r", "@", "-T", "description.first_line()", cwd=workspace
+        )
+        == "sprouted"
+    )
+    assert grove_repo.revset_exists("@ & descendants(grove_marker())", cwd=workspace)
+    assert_work_above_attachment(grove_repo, "@", cwd=workspace)
+
+
+def test_sprout_from_existing_grove_work_does_not_add_attachment(
+    grove_repo: GroveRepo,
+) -> None:
+    workspace = grove_repo.create_grove("alpha")
+    attachment_count = grove_repo.revset_count("grove_attachments()", cwd=workspace)
+
+    grove_repo.grove("sprout", "@", "--", "-m", "child", cwd=workspace)
+
+    assert grove_repo.revset_count("grove_attachments()", cwd=workspace) == attachment_count
+    assert grove_repo.revset_exists("@ & descendants(grove_marker())", cwd=workspace)
+    assert not grove_repo.revset_exists("parents(@) & grove_marker()", cwd=workspace)
+
+
+def test_sprout_accepts_multiple_outside_grove_parents(
+    grove_repo: GroveRepo,
+) -> None:
+    workspace = grove_repo.create_grove("alpha")
+    grove_repo.jj("new", "trunk()", cwd=workspace)
+    grove_repo.create_commit(workspace, "a.txt", "A\n", "A")
+    a_change = grove_repo.change_ids("@", cwd=workspace)[0]
+    grove_repo.jj("new", "trunk()", cwd=workspace)
+    grove_repo.create_commit(workspace, "b.txt", "B\n", "B")
+    b_change = grove_repo.change_ids("@", cwd=workspace)[0]
+
+    grove_repo.jj("sprout", a_change, b_change, "--", "-m", "merge work", cwd=workspace)
+
+    assert (
+        grove_repo.jj_stdout(
+            "log", "--no-graph", "-r", "@", "-T", "description.first_line()", cwd=workspace
+        )
+        == "merge work"
+    )
+    attachment = assert_work_above_attachment(
+        grove_repo, "@", cwd=workspace, parent_revset=a_change
+    )
+    assert grove_repo.revset_exists(f"parents({attachment}) & {b_change}", cwd=workspace)
+
+
+def test_sprout_refuses_mixed_grove_and_non_grove_parents(
+    grove_repo: GroveRepo,
+) -> None:
+    workspace = grove_repo.create_grove("alpha")
+    grove_repo.create_commit(workspace, "grove.txt", "grove\n", "grove")
+    grove_change = grove_repo.change_ids("@", cwd=workspace)[0]
+    grove_repo.jj("new", "trunk()", cwd=workspace)
+    grove_repo.create_commit(workspace, "outside.txt", "outside\n", "outside")
+    outside_change = grove_repo.change_ids("@", cwd=workspace)[0]
+    op_before = grove_repo.op_id(cwd=workspace)
+
+    result = grove_repo.grove(
+        "sprout", grove_change, outside_change, cwd=workspace, check=False
+    )
+
+    assert result.returncode != 0
+    assert "mix grove and non-grove commits" in result.stderr
+    assert grove_repo.op_id(cwd=workspace) == op_before
 
 
 def test_list_marks_current_here_and_stale_groves(grove_repo: GroveRepo) -> None:
@@ -372,7 +484,7 @@ def test_list_marks_current_here_and_stale_groves(grove_repo: GroveRepo) -> None
     assert "[stale]" in stale
 
 
-def test_graft_head_publishes_bookmark_and_removes_private_descendants(
+def test_graft_head_publishes_bookmark_and_removes_marker_descendants(
     grove_repo: GroveRepo,
 ) -> None:
     workspace = grove_repo.create_grove("alpha")
@@ -398,7 +510,7 @@ def test_graft_head_publishes_bookmark_and_removes_private_descendants(
     )
 
 
-def test_graft_prefix_keeps_later_work_private(grove_repo: GroveRepo) -> None:
+def test_graft_prefix_keeps_later_work_in_grove(grove_repo: GroveRepo) -> None:
     workspace = grove_repo.create_grove("alpha")
     grove_repo.create_commit(workspace, "a.txt", "A\n", "A")
     a_change = grove_repo.change_ids("@", cwd=workspace)[0]
@@ -420,6 +532,42 @@ def test_graft_prefix_keeps_later_work_private(grove_repo: GroveRepo) -> None:
     assert grove_repo.revset_exists(
         f"{b_change} & descendants(kamal/alpha/__marker__)", cwd=workspace
     )
+    assert_work_above_attachment(
+        grove_repo, b_change, cwd=workspace, parent_revset=a_change
+    )
+
+
+def test_graft_prefix_keeps_later_stack_in_grove(grove_repo: GroveRepo) -> None:
+    workspace = grove_repo.create_grove("alpha")
+    grove_repo.create_commit(workspace, "a.txt", "A\n", "A")
+    a_change = grove_repo.change_ids("@", cwd=workspace)[0]
+    grove_repo.jj("new", cwd=workspace)
+    grove_repo.create_commit(workspace, "b.txt", "B\n", "B")
+    b_change = grove_repo.change_ids("@", cwd=workspace)[0]
+    grove_repo.jj("new", cwd=workspace)
+    grove_repo.create_commit(workspace, "c.txt", "C\n", "C")
+    c_change = grove_repo.change_ids("@", cwd=workspace)[0]
+
+    result = grove_repo.grove("graft", a_change, cwd=workspace)
+    names = result.stdout.splitlines()
+
+    assert len(names) == 1
+    assert grove_repo.revset_exists(
+        f"{grove_repo.bookmark_revset(names[0])} & {a_change}", cwd=workspace
+    )
+    assert not grove_repo.revset_exists(
+        f"{a_change} & descendants(kamal/alpha/__marker__)", cwd=workspace
+    )
+    assert grove_repo.revset_exists(
+        f"{b_change} & descendants(kamal/alpha/__marker__)", cwd=workspace
+    )
+    assert grove_repo.revset_exists(
+        f"{c_change} & descendants(kamal/alpha/__marker__)", cwd=workspace
+    )
+    assert grove_repo.revset_exists(f"parents({c_change}) & {b_change}", cwd=workspace)
+    assert_work_above_attachment(
+        grove_repo, b_change, cwd=workspace, parent_revset=a_change
+    )
 
 
 def test_graft_push_creates_remote_bookmark(grove_repo: GroveRepo) -> None:
@@ -440,7 +588,7 @@ def test_graft_push_creates_remote_bookmark(grove_repo: GroveRepo) -> None:
     )
 
 
-def test_sync_no_fetch_rebases_private_roots_onto_current_trunk(
+def test_sync_no_fetch_rebases_attachments_onto_current_trunk(
     grove_repo: GroveRepo,
 ) -> None:
     workspace = grove_repo.create_grove("alpha")
@@ -453,16 +601,13 @@ def test_sync_no_fetch_rebases_private_roots_onto_current_trunk(
 
     grove_repo.grove("sync", "--no-fetch", cwd=workspace)
 
-    assert grove_repo.revset_exists(f"parents({work_change}) & trunk()", cwd=workspace)
-    assert grove_repo.revset_exists(
-        f"parents({work_change}) & kamal/alpha/__marker__", cwd=workspace
-    )
     assert grove_repo.revset_exists(
         f"{work_change} & descendants(kamal/alpha/__marker__)", cwd=workspace
     )
+    assert_work_above_attachment(grove_repo, work_change, cwd=workspace)
 
 
-def test_sync_dry_run_prints_private_root_plan_without_mutating(
+def test_sync_dry_run_prints_attachment_plan_without_mutating(
     grove_repo: GroveRepo,
 ) -> None:
     workspace = grove_repo.create_grove("alpha")
@@ -474,11 +619,12 @@ def test_sync_dry_run_prints_private_root_plan_without_mutating(
 
     assert "jj rebase -s" in result.stderr
     assert "--simplify-parents" in result.stderr
-    assert "sync private root" in result.stderr
+    assert "sync attachment" in result.stderr
     assert grove_repo.op_id(cwd=workspace) == op_before
     assert grove_repo.revset_exists(
         f"{work_change} & descendants(kamal/alpha/__marker__)", cwd=workspace
     )
+    assert_work_above_attachment(grove_repo, work_change, cwd=workspace)
 
 
 def test_sync_prunes_merged_grove_bookmarks_but_keeps_marker(
@@ -504,7 +650,7 @@ def test_sync_refuses_grove_bookmark_on_marker_descendant(grove_repo: GroveRepo)
     result = grove_repo.grove("sync", "--no-fetch", cwd=workspace, check=False)
 
     assert result.returncode != 0
-    assert "still descend from the private marker" in result.stderr
+    assert "still descend from the grove marker" in result.stderr
     assert grove_repo.op_id(cwd=workspace) == op_before
     assert grove_repo.revset_exists(
         "kamal/alpha/live & descendants(kamal/alpha/__marker__)", cwd=workspace
@@ -653,11 +799,10 @@ def test_use_binds_unbound_workspace_to_grove(grove_repo: GroveRepo) -> None:
     )
     assert grove_repo.revset_exists("@ & descendants(kamal/alpha/__marker__)")
     assert not grove_repo.revset_exists("@ & kamal/alpha/__marker__")
-    assert grove_repo.revset_exists("parents(@) & trunk()")
-    assert grove_repo.revset_exists("parents(@) & kamal/alpha/__marker__")
+    assert_work_above_attachment(grove_repo, "@")
 
 
-def test_use_marks_existing_unbound_stack_private(grove_repo: GroveRepo) -> None:
+def test_use_moves_existing_unbound_stack_into_grove(grove_repo: GroveRepo) -> None:
     grove_repo.jj("new", "trunk()")
     grove_repo.create_commit(grove_repo.repo, "a.txt", "A\n", "A")
     a_change = grove_repo.change_ids("@")[0]
@@ -670,8 +815,7 @@ def test_use_marks_existing_unbound_stack_private(grove_repo: GroveRepo) -> None
 
     assert grove_repo.revset_exists(f"{a_change} & descendants(kamal/alpha/__marker__)")
     assert grove_repo.revset_exists(f"{b_change} & descendants(kamal/alpha/__marker__)")
-    assert grove_repo.revset_exists(f"parents({a_change}) & trunk()")
-    assert grove_repo.revset_exists(f"parents({a_change}) & kamal/alpha/__marker__")
+    assert_work_above_attachment(grove_repo, a_change)
     assert grove_repo.revset_exists(f"parents({b_change}) & {a_change}")
     assert (
         grove_repo.config_value('revset-aliases."grove_marker()"')
@@ -679,7 +823,7 @@ def test_use_marks_existing_unbound_stack_private(grove_repo: GroveRepo) -> None
     )
 
 
-def test_use_marks_already_bound_off_grove_workspace_private(
+def test_use_moves_already_bound_off_grove_workspace_into_grove(
     grove_repo: GroveRepo,
 ) -> None:
     grove_repo.grove("new", "alpha", "--bare")
@@ -703,11 +847,10 @@ def test_use_marks_already_bound_off_grove_workspace_private(
     grove_repo.grove("use", "alpha")
 
     assert grove_repo.revset_exists("@ & descendants(kamal/alpha/__marker__)")
-    assert grove_repo.revset_exists("parents(@) & trunk()")
-    assert grove_repo.revset_exists("parents(@) & kamal/alpha/__marker__")
+    assert_work_above_attachment(grove_repo, "@")
 
 
-def test_bookmark_advance_keeps_marker_and_private_work_in_place(
+def test_bookmark_advance_keeps_marker_and_grove_work_in_place(
     grove_repo: GroveRepo,
 ) -> None:
     workspace = grove_repo.create_grove("alpha")

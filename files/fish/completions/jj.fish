@@ -94,7 +94,7 @@ function __fish_jj_grove_using_workspace_command
 end
 
 function __fish_jj_grove_using_mutating_command
-    __fish_jj_grove_using_command new use rm graft sync restack push
+    __fish_jj_grove_using_command new use sprout rm graft sync restack push
     or __fish_jj_grove_using_workspace_command add
 end
 
@@ -104,7 +104,7 @@ function __fish_jj_grove_revs_expected
 
     test (count $args) -gt 0
     or return 1
-    contains -- $args[1] graft restack
+    contains -- $args[1] sprout graft restack
     or return 1
 
     set -e args[1]
@@ -166,6 +166,8 @@ complete -c jj -n '__fish_jj_grove_needs_subcommand' -f -a workspace \
     -d 'Manage grove workspaces'
 complete -c jj -n '__fish_jj_grove_needs_subcommand' -f -a use \
     -d 'Bind the current workspace to a grove'
+complete -c jj -n '__fish_jj_grove_needs_subcommand' -f -a sprout \
+    -d 'Start grove work from parent revsets'
 complete -c jj -n '__fish_jj_grove_needs_subcommand' -f -a list \
     -d 'List groves and workspaces'
 complete -c jj -n '__fish_jj_grove_needs_subcommand' -f -a rm \
@@ -173,7 +175,7 @@ complete -c jj -n '__fish_jj_grove_needs_subcommand' -f -a rm \
 complete -c jj -n '__fish_jj_grove_needs_subcommand' -f -a graft \
     -d 'Graduate work onto trunk'
 complete -c jj -n '__fish_jj_grove_needs_subcommand' -f -a sync \
-    -d 'Rebase grove roots onto trunk'
+    -d 'Rebase grove attachments onto trunk'
 complete -c jj -n '__fish_jj_grove_needs_subcommand' -f -a restack \
     -d 'Rebase grove bookmarks onto trunk'
 complete -c jj -n '__fish_jj_grove_needs_subcommand' -f -a push \
