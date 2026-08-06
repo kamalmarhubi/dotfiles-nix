@@ -1,0 +1,10 @@
+[ui]
+agent_panel_sort = "priority"
+
+[ui.sound]
+enabled = false
+
+[theme]
+# TODO(herdrdev/herdr#1307): Set to `terminal` if light terminal handling is fixed.
+name = "tokyo-night-day"
+auto_switch = false

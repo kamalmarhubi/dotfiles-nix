@@ -17,6 +17,7 @@
       chainlink
       claude-code
       claude-agent-acp
+      herdr
       mcporter
       opencode
       pi
@@ -27,4 +28,5 @@
   ];
 
   xdg.configFile."amp/settings.json".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/amp/settings.json";
+  xdg.configFile."herdr/config.toml".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/herdr/config.toml";
 }
