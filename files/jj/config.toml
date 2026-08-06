@@ -66,15 +66,14 @@ gh-fork = ["util", "exec", "--", "jj-gh-fork"]
 # `grove()` is the current workspace's grove, usable as `jj log -r grove()`.
 'grove(r)' = '''(descendants(r) & mutable()) | (descendants(grove_bookmarks()) ~ ::trunk())'''
 'grove()' = '''grove(grove_marker())'''
-'log_ancestors(r, n)' = '''ancestors(r, n) ~ (ancestors(grove_markers()) ~ grove_markers())'''
-'log_heads()' = '''heads(coalesce(grove(), all()))'''
-'global_log_context()' = 'log_ancestors(immutable_heads()..log_heads(), 2)'
+'grove_log_heads()' = '''heads(coalesce(grove(), all()))'''
+'grove_log_context()' = '''ancestors(immutable_heads()..grove_log_heads(), 2) ~ (ancestors(grove_markers()) ~ grove_markers())'''
 
 # "default_blah" are so that repos can be customised without repeating the basics.
 'default_private_commits()' = "(incomplete() & mine()) | descendants(grove_markers())"
 # Like jj's built-in `present(@) | ancestors(immutable_heads().., 2) | trunk()`,
 # but use grove-local heads for the middle term when a workspace is bound.
-'default_log()' = '''present(@) | global_log_context() | trunk()'''
+'default_log()' = '''present(@) | grove_log_context() | trunk()'''
 
 [git]
 private-commits = 'default_private_commits()'
