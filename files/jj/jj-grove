@@ -31,6 +31,7 @@ narration. -n/--dry-run prints the plan without touching anything.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import functools
 import os
 import re
@@ -209,6 +210,27 @@ def do_fs(desc: str, fn) -> None:
         plan(desc)
         return
     fn()
+
+
+@contextlib.contextmanager
+def restore_op_on_error():
+    start_op = jj("op", "log", "-n1", "--no-graph", "-T", "self.id()")
+    try:
+        yield
+    except SystemExit:
+        if not DRY:
+            current_op = jj("op", "log", "-n1", "--no-graph", "-T", "self.id()")
+            if current_op != start_op:
+                rb = subprocess.run(["jj", "--quiet", "op", "restore", start_op],
+                                    text=True, stderr=subprocess.PIPE)
+                if rb.returncode == 0:
+                    info("rolled back; nothing changed.")
+                else:
+                    info(
+                        "rollback FAILED -- restore by hand:  "
+                        f"jj op restore {start_op}"
+                    )
+        raise
 
 
 @functools.cache
@@ -539,7 +561,8 @@ def cmd_sprout(args) -> None:
     if binding_slug() is None:
         do("new", *revsets, *new_args, why="new work")
         return
-    create_grove_work(revsets, GROVE_MARKER_REVSET, new_args)
+    with restore_op_on_error():
+        create_grove_work(revsets, GROVE_MARKER_REVSET, new_args)
 
 
 def cmd_use(args) -> None:
@@ -808,10 +831,9 @@ def cmd_graft(args) -> None:
     )
 
     info(f"grafting '{revset}' onto trunk")
-    start_op = jj("op", "log", "-n1", "--no-graph", "-T", "self.id()")
     current_at = single_id("@", "working copy")
     names: list[str] = []
-    try:
+    with restore_op_on_error():
         # Publish the grove prefix by stripping the empty attachment below each
         # content root; the attachment itself must not enter public history.
         for r, attachment in root_attachments.items():
@@ -851,15 +873,6 @@ def cmd_graft(args) -> None:
             do("bookmark", "create", name, "-r", cid, why="bookmark")
             names.append(name)
         do("edit", current_at, why="restore working copy")
-    except SystemExit:
-        if not DRY:
-            rb = subprocess.run(["jj", "--quiet", "op", "restore", start_op],
-                                text=True, stderr=subprocess.PIPE)
-            if rb.returncode == 0:
-                info("rolled back; nothing changed.")
-            else:
-                info(f"rollback FAILED -- restore by hand:  jj op restore {start_op}")
-        raise
 
     info(f"grafted {len(names)} bookmark(s)" + ("" if args.push else " (local; not pushed)"))
 
@@ -911,9 +924,8 @@ def cmd_sync(args) -> None:
                     f"       use --no-fetch to advance onto the local trunk.")
 
     info(f"syncing grove '{slug}' onto trunk")
-    start_op = jj("op", "log", "-n1", "--no-graph", "-T", "self.id()")
     merged: list[str] = []
-    try:
+    with restore_op_on_error():
         roots = _ids(f"{GROVE_ATTACHMENTS_REVSET} & mutable()")
         # Move each attachment to current trunk while preserving the marker and
         # any other non-trunk side parents.
@@ -936,15 +948,6 @@ def cmd_sync(args) -> None:
             ).splitlines()
             if merged:
                 do("bookmark", "delete", *merged, why="prune merged")
-    except SystemExit:
-        if not DRY:
-            rb = subprocess.run(["jj", "--quiet", "op", "restore", start_op],
-                                text=True, stderr=subprocess.PIPE)
-            if rb.returncode == 0:
-                info("rolled back; nothing changed.")
-            else:
-                info(f"rollback FAILED -- restore by hand:  jj op restore {start_op}")
-        raise
 
     info(f"synced onto trunk{f'; pruned {len(merged)} merged bookmark(s) '
          f'(remote branches deleted on next push)' if merged else ''}")

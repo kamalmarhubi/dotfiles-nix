@@ -466,6 +466,27 @@ def test_sprout_refuses_mixed_grove_and_non_grove_parents(
     assert grove_repo.op_id(cwd=workspace) == op_before
 
 
+def test_sprout_rolls_back_attachment_when_new_fails(grove_repo: GroveRepo) -> None:
+    workspace = grove_repo.create_grove("alpha")
+    attachment_count = grove_repo.revset_count("grove_attachments()", cwd=workspace)
+    at_before = grove_repo.change_ids("@", cwd=workspace)
+
+    result = grove_repo.grove(
+        "sprout",
+        "trunk()",
+        "--",
+        "--definitely-not-a-jj-new-option",
+        cwd=workspace,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "--definitely-not-a-jj-new-option" in result.stderr
+    assert "rolled back; nothing changed." in result.stderr
+    assert grove_repo.change_ids("@", cwd=workspace) == at_before
+    assert grove_repo.revset_count("grove_attachments()", cwd=workspace) == attachment_count
+
+
 def test_list_marks_current_here_and_stale_groves(grove_repo: GroveRepo) -> None:
     workspace = grove_repo.create_grove("alpha")
     grove_repo.grove("new", "stale", "--bare", cwd=grove_repo.repo)
