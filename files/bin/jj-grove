@@ -31,7 +31,6 @@ narration. -n/--dry-run prints the plan without touching anything.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import functools
 import os
 import re
@@ -39,6 +38,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+from abc import ABC, abstractmethod
+from typing import Final
 
 GROVE_MARKER_SUFFIX = "__marker__"
 GROVE_MARKER_ALIAS = 'revset-aliases."grove_marker()"'
@@ -57,7 +58,9 @@ GIT_ROOT_PLACEHOLDER = "<jj git root>"
 
 @functools.cache
 def grove_prefix() -> str:
-    return jj("config", "get", 'revset-aliases."grove_prefix()"').strip('"')
+    return AMBIENT_JJ.query(
+        "config", "get", 'revset-aliases."grove_prefix()"'
+    ).strip('"')
 
 
 def grove_marker_bookmark(slug: str) -> str:
@@ -100,35 +103,213 @@ def die(msg: str, code: int = 1) -> "None":
 
 
 # --------------------------------------------------------------------------- #
-# jj helpers
+# jj context
 # --------------------------------------------------------------------------- #
 
 
-def jj(*args: str, cwd: str | None = None) -> str:
-    """Run a read-only jj query; return stripped stdout."""
+class JjContext(ABC):
+    """A view of jj repository state against which commands run."""
+
+    @abstractmethod
+    def query(self, *args: str, cwd: str | None = None) -> str:
+        """Run a read-only jj command against this context's operation."""
+
+    @abstractmethod
+    def mutate(
+        self,
+        *args: str,
+        cwd: str | None = None,
+        why: str = "",
+    ) -> None:
+        """Run a mutating jj command in this context."""
+
+    def revset_ids(self, revset: str, *, cwd: str | None = None) -> list[str]:
+        """Unambiguous short change IDs for a revset (stable across rebase)."""
+        out = self.query(
+            "log",
+            "--no-graph",
+            "-r",
+            revset,
+            "-T",
+            'change_id.shortest(8) ++ "\n"',
+            cwd=cwd,
+        )
+        return [change_id for change_id in out.splitlines() if change_id]
+
+    def revset_exists(self, revset: str, *, cwd: str | None = None) -> bool:
+        out = self.query(
+            "log", "--no-graph", "-r", revset, "-T", '"x"', cwd=cwd
+        )
+        return bool(out)
+
+    def resolve_one(
+        self,
+        revset: str,
+        *,
+        what: str,
+        cwd: str | None = None,
+    ) -> str:
+        ids = self.revset_ids(revset, cwd=cwd)
+        if len(ids) != 1:
+            die(f"expected exactly one {what}; got {len(ids)}")
+        return ids[0]
+
+
+class AmbientJj(JjContext):
+    def query(self, *args: str, cwd: str | None = None) -> str:
+        r = subprocess.run(
+            ["jj", *args],
+            cwd=cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if r.returncode != 0:
+            die(f"`jj {' '.join(args)}` failed:\n{r.stderr.strip()}")
+        return r.stdout.strip()
+
+    def mutate(
+        self,
+        *args: str,
+        cwd: str | None = None,
+        why: str = "",
+    ) -> None:
+        if DRY:
+            plan("jj " + " ".join(args) + (f"   # {why}" if why else ""))
+            return
+        r = subprocess.run(
+            ["jj", "--quiet", *args], cwd=cwd, text=True, stderr=subprocess.PIPE
+        )
+        if r.returncode != 0:
+            die(f"`jj {' '.join(args)}` failed:\n{r.stderr.strip()}")
+
+
+AMBIENT_JJ: Final[JjContext] = AmbientJj()
+
+
+def _current_operation(*, cwd: str | None = None) -> str:
+    """Return the ambient operation without snapshotting the working copy."""
     r = subprocess.run(
-        ["jj", *args], cwd=cwd, text=True,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        [
+            "jj",
+            "--at-op=@",
+            "op",
+            "log",
+            "-n1",
+            "--no-graph",
+            "-T",
+            "self.id()",
+        ],
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
     if r.returncode != 0:
-        die(f"`jj {' '.join(args)}` failed:\n{r.stderr.strip()}")
+        die(f"could not read current jj operation:\n{r.stderr.strip()}")
     return r.stdout.strip()
 
 
-def do(*args: str, cwd: str | None = None, why: str = "") -> None:
-    """Run a mutating jj command. Honors --dry-run."""
-    if DRY:
-        plan("jj " + " ".join(args) + (f"   # {why}" if why else ""))
-        return
-    r = subprocess.run(["jj", "--quiet", *args], cwd=cwd, text=True,
-                       stderr=subprocess.PIPE)
-    if r.returncode != 0:
-        die(f"`jj {' '.join(args)}` failed:\n{r.stderr.strip()}")
+class JjTransaction(JjContext):
+    """Stage jj operations and integrate them together on a clean body exit."""
+
+    def __init__(self, *, cwd: str | None = None) -> None:
+        self.cwd = cwd
+        self._base_op = ""
+        self._staged_op = ""
+
+    def __enter__(self) -> "JjTransaction":
+        self._base_op = _current_operation(cwd=self.cwd)
+        self._staged_op = self._base_op
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        if exc_type is not None or DRY or self._staged_op == self._base_op:
+            return
+        if _current_operation(cwd=self.cwd) != self._base_op:
+            die("repository changed while staging jj operations; nothing was integrated")
+        r = subprocess.run(
+            ["jj", "--quiet", "op", "integrate", self._staged_op],
+            cwd=self.cwd,
+            text=True,
+            stderr=subprocess.PIPE,
+        )
+        if r.returncode != 0:
+            die(f"could not integrate staged jj operation:\n{r.stderr.strip()}")
+        update = subprocess.run(
+            ["jj", "--quiet", "workspace", "update-stale"],
+            cwd=self.cwd,
+            text=True,
+            stderr=subprocess.PIPE,
+        )
+        if update.returncode != 0:
+            die(
+                "integrated staged operation but could not update workspace:\n"
+                f"{update.stderr.strip()}\n"
+                "run `jj workspace update-stale` to recover"
+            )
+
+    def query(self, *args: str, cwd: str | None = None) -> str:
+        r = subprocess.run(
+            ["jj", "--at-op", self._staged_op, *args],
+            cwd=cwd or self.cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if r.returncode != 0:
+            die(f"`jj {' '.join(args)}` failed:\n{r.stderr.strip()}")
+        return r.stdout.strip()
+
+    def mutate(
+        self,
+        *args: str,
+        cwd: str | None = None,
+        why: str = "",
+    ) -> None:
+        if DRY:
+            plan("jj " + " ".join(args) + (f"   # {why}" if why else ""))
+            return
+        r = subprocess.run(
+            [
+                "jj",
+                "--at-op",
+                self._staged_op,
+                "--no-integrate-operation",
+                *args,
+            ],
+            cwd=cwd or self.cwd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if r.returncode != 0:
+            die(f"`jj {' '.join(args)}` failed:\n{r.stderr.strip()}")
+        matches = re.findall(
+            r"^Operation left uncommitted because --no-integrate-operation was requested: "
+            r"([0-9a-f]+)$",
+            r.stderr,
+            flags=re.MULTILINE,
+        )
+        if matches:
+            self._staged_op = matches[-1]
+            return
+        output = r.stderr.strip()
+        if (
+            output.rstrip(".") == "Already editing that commit"
+            or output == "No revisions to rebase."
+            or output.endswith("Nothing changed.")
+        ):
+            return
+        die(
+            f"`jj {' '.join(args)}` succeeded without reporting its staged operation:\n"
+            f"{output or '(no output)'}"
+        )
 
 
 @functools.cache
 def git_root(cwd: str | None = None) -> str:
-    return jj("git", "root", cwd=cwd)
+    return AMBIENT_JJ.query("git", "root", cwd=cwd)
 
 
 def git_command(git_dir: str, *args: str) -> list[str]:
@@ -212,27 +393,6 @@ def do_fs(desc: str, fn) -> None:
     fn()
 
 
-@contextlib.contextmanager
-def restore_op_on_error():
-    start_op = jj("op", "log", "-n1", "--no-graph", "-T", "self.id()")
-    try:
-        yield
-    except SystemExit:
-        if not DRY:
-            current_op = jj("op", "log", "-n1", "--no-graph", "-T", "self.id()")
-            if current_op != start_op:
-                rb = subprocess.run(["jj", "--quiet", "op", "restore", start_op],
-                                    text=True, stderr=subprocess.PIPE)
-                if rb.returncode == 0:
-                    info("rolled back; nothing changed.")
-                else:
-                    info(
-                        "rollback FAILED -- restore by hand:  "
-                        f"jj op restore {start_op}"
-                    )
-        raise
-
-
 @functools.cache
 def push_remote() -> str:
     """The remote `jj git push` targets: git.push, else the sole remote, else origin."""
@@ -240,12 +400,16 @@ def push_remote() -> str:
                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     if r.returncode == 0 and r.stdout.strip():
         return r.stdout.strip()
-    remotes = [ln.split()[0] for ln in jj("git", "remote", "list").splitlines() if ln.strip()]
+    remotes = [
+        line.split()[0]
+        for line in AMBIENT_JJ.query("git", "remote", "list").splitlines()
+        if line.strip()
+    ]
     return remotes[0] if len(remotes) == 1 else "origin"
 
 
 def has_remote() -> bool:
-    return bool(jj("git", "remote", "list").strip())
+    return bool(AMBIENT_JJ.query("git", "remote", "list"))
 
 
 # --------------------------------------------------------------------------- #
@@ -254,7 +418,7 @@ def has_remote() -> bool:
 
 
 def current_ws_root() -> str:
-    return jj("workspace", "root")
+    return AMBIENT_JJ.query("workspace", "root")
 
 
 def siblings_parent() -> str:
@@ -263,7 +427,7 @@ def siblings_parent() -> str:
 
 
 def grove_exists(slug: str) -> bool:
-    out = jj(
+    out = AMBIENT_JJ.query(
         "log",
         "--no-graph",
         "-r",
@@ -276,7 +440,7 @@ def grove_exists(slug: str) -> bool:
 
 def at_on_marker(slug: str, cwd: str | None = None) -> bool:
     # is @ inside the grove's marker-descended work?
-    out = jj(
+    out = AMBIENT_JJ.query(
         "log",
         "--no-graph",
         "-r",
@@ -290,7 +454,7 @@ def at_on_marker(slug: str, cwd: str | None = None) -> bool:
 
 def binding_slug(cwd: str | None = None) -> str | None:
     """The grove a workspace is bound to (its grove_marker() override), or None."""
-    val = jj("config", "get", GROVE_MARKER_ALIAS, cwd=cwd)
+    val = AMBIENT_JJ.query("config", "get", GROVE_MARKER_ALIAS, cwd=cwd)
     return slug_of(val)
 
 
@@ -313,7 +477,9 @@ def slug_of(marker_value: str) -> str | None:
 
 
 def workspaces() -> list[tuple[str, str]]:
-    out = jj("workspace", "list", "-T", 'name ++ "\t" ++ root ++ "\n"')
+    out = AMBIENT_JJ.query(
+        "workspace", "list", "-T", 'name ++ "\t" ++ root ++ "\n"'
+    )
     pairs = []
     for line in out.splitlines():
         if "\t" in line:
@@ -333,7 +499,7 @@ def validate_slug(slug: str, what: str = "grove name") -> None:
 
 
 def bind(slug: str, cwd: str | None = None) -> None:
-    do(
+    AMBIENT_JJ.mutate(
         "config",
         "set",
         "--workspace",
@@ -342,7 +508,7 @@ def bind(slug: str, cwd: str | None = None) -> None:
         cwd=cwd,
         why=f"bind {GROVE_MARKER_REVSET}",
     )
-    do(
+    AMBIENT_JJ.mutate(
         "config",
         "set",
         "--workspace",
@@ -398,19 +564,26 @@ def create_marker(slug: str, cwd: str | None = None) -> None:
                 f"marker ref already exists in Git and points at a different "
                 f"commit: {marker_ref}"
             )
-    do("git", "import", cwd=cwd, why="import marker ref into jj")
+    AMBIENT_JJ.mutate("git", "import", cwd=cwd, why="import marker ref into jj")
 
 
-def revset_exists(revset: str, cwd: str | None = None) -> bool:
-    out = jj("log", "--no-graph", "-r", revset, "-T", '"x"', cwd=cwd)
-    return bool(out)
+def revset_exists(
+    revset: str,
+    cwd: str | None = None,
+    *,
+    jj: JjContext = AMBIENT_JJ,
+) -> bool:
+    return jj.revset_exists(revset, cwd=cwd)
 
 
-def single_id(revset: str, what: str, cwd: str | None = None) -> str:
-    ids = _ids(revset, cwd=cwd)
-    if len(ids) != 1:
-        die(f"expected exactly one {what}; got {len(ids)}")
-    return ids[0]
+def single_id(
+    revset: str,
+    what: str,
+    cwd: str | None = None,
+    *,
+    jj: JjContext = AMBIENT_JJ,
+) -> str:
+    return jj.resolve_one(revset, what=what, cwd=cwd)
 
 
 def attachments_revset(marker: str = GROVE_MARKER_REVSET) -> str:
@@ -434,9 +607,14 @@ def create_attachment(
     *,
     cwd: str | None = None,
     why: str,
+    jj: JjContext,
 ) -> str:
-    do("new", f"({parent_revset}) | {marker}", cwd=cwd, why=why)
-    return "<attachment>" if DRY else single_id("@", "new attachment", cwd=cwd)
+    jj.mutate("new", f"({parent_revset}) | {marker}", cwd=cwd, why=why)
+    return (
+        "<attachment>"
+        if DRY
+        else jj.resolve_one("@", what="new attachment", cwd=cwd)
+    )
 
 
 def create_grove_work(
@@ -445,24 +623,25 @@ def create_grove_work(
     new_args: list[str],
     *,
     cwd: str | None = None,
+    jj: JjContext,
 ) -> None:
     parent_revset = " | ".join(f"({revset})" for revset in parent_revsets)
-    if not revset_exists(parent_revset, cwd=cwd):
+    if not jj.revset_exists(parent_revset, cwd=cwd):
         die(f"parent revsets match no commits: {' '.join(parent_revsets)}")
-    if revset_exists(f"({parent_revset}) & {marker}", cwd=cwd):
+    if jj.revset_exists(f"({parent_revset}) & {marker}", cwd=cwd):
         die("parent revsets include the grove marker; choose real parent commits")
 
-    in_grove = revset_exists(
+    in_grove = jj.revset_exists(
         f"({parent_revset}) & descendants({marker})", cwd=cwd
     )
-    outside_grove = revset_exists(
+    outside_grove = jj.revset_exists(
         f"({parent_revset}) ~ descendants({marker})", cwd=cwd
     )
     if in_grove and outside_grove:
         die("parent revsets mix grove and non-grove commits")
 
     if in_grove:
-        do("new", parent_revset, *new_args, cwd=cwd, why="new grove work")
+        jj.mutate("new", parent_revset, *new_args, cwd=cwd, why="new grove work")
         return
 
     attachment = create_attachment(
@@ -470,8 +649,9 @@ def create_grove_work(
         marker,
         cwd=cwd,
         why="create grove attachment",
+        jj=jj,
     )
-    do("new", attachment, *new_args, cwd=cwd, why="new work above attachment")
+    jj.mutate("new", attachment, *new_args, cwd=cwd, why="new work above attachment")
 
 
 def split_sprout_args(argv: list[str]) -> tuple[list[str], list[str]]:
@@ -508,7 +688,7 @@ def cmd_new(args) -> None:
     parent = os.path.dirname(dest)
     do_fs(f"mkdir -p {parent}", lambda: os.makedirs(parent, exist_ok=True))
     create_marker(slug)
-    do(
+    AMBIENT_JJ.mutate(
         "workspace",
         "add",
         "-r",
@@ -519,7 +699,7 @@ def cmd_new(args) -> None:
         why="new workspace attachment on trunk + marker",
     )
     bind(slug, cwd=dest)
-    do("new", "@", cwd=dest, why="new work above attachment")
+    AMBIENT_JJ.mutate("new", "@", cwd=dest, why="new work above attachment")
     info(f"created grove '{slug}'; workspace at {dest}")
     if not DRY:
         print(dest)
@@ -539,7 +719,7 @@ def cmd_workspace_add(args) -> None:
     info(f"adding workspace '{wsname}' on grove '{slug}' at {dest}")
     parent = os.path.dirname(dest)
     do_fs(f"mkdir -p {parent}", lambda: os.makedirs(parent, exist_ok=True))
-    do(
+    AMBIENT_JJ.mutate(
         "workspace",
         "add",
         "-r",
@@ -550,7 +730,7 @@ def cmd_workspace_add(args) -> None:
         why="new workspace attachment on trunk + marker",
     )
     bind(slug, cwd=dest)
-    do("new", "@", cwd=dest, why="new work above attachment")
+    AMBIENT_JJ.mutate("new", "@", cwd=dest, why="new work above attachment")
     info(f"added workspace '{wsname}' on grove '{slug}'")
     if not DRY:
         print(dest)
@@ -559,10 +739,10 @@ def cmd_workspace_add(args) -> None:
 def cmd_sprout(args) -> None:
     revsets, new_args = split_sprout_args(args.args)
     if binding_slug() is None:
-        do("new", *revsets, *new_args, why="new work")
+        AMBIENT_JJ.mutate("new", *revsets, *new_args, why="new work")
         return
-    with restore_op_on_error():
-        create_grove_work(revsets, GROVE_MARKER_REVSET, new_args)
+    with JjTransaction() as tx:
+        create_grove_work(revsets, GROVE_MARKER_REVSET, new_args, jj=tx)
 
 
 def cmd_use(args) -> None:
@@ -590,15 +770,18 @@ def cmd_use(args) -> None:
                 root == current_at
                 and revset_exists(f'{root} & empty() & description("")')
             ):
-                create_grove_work([f"parents({root})"], marker, [])
+                create_grove_work(
+                    [f"parents({root})"], marker, [], jj=AMBIENT_JJ
+                )
                 restore_at = ""
                 continue
             attachment = create_attachment(
                 f"parents({root})",
                 marker,
                 why=f"create attachment for {root}",
+                jj=AMBIENT_JJ,
             )
-            do(
+            AMBIENT_JJ.mutate(
                 "rebase",
                 "-s",
                 root,
@@ -607,13 +790,13 @@ def cmd_use(args) -> None:
                 why=f"attach grove root {root}",
             )
         if restore_at:
-            do("edit", restore_at, why="restore working copy")
+            AMBIENT_JJ.mutate("edit", restore_at, why="restore working copy")
     bind(slug)
     info(f"bound current workspace to grove '{slug}'")
 
 
 def cmd_list(args) -> None:
-    markers = jj(
+    markers = AMBIENT_JJ.query(
         "log", "--no-graph", "-r", GROVE_MARKERS_REVSET, "-T", 'bookmarks ++ "\n"'
     )
     slugs = sorted(filter(None, (slug_of(b.strip()) for b in markers.splitlines())))
@@ -635,7 +818,7 @@ def cmd_list(args) -> None:
     for s in slugs:
         marker = grove_marker_bookmark(s)
         # stale: no live mutable work and no unmerged pushed bookmarks
-        live = jj(
+        live = AMBIENT_JJ.query(
             "log",
             "--no-graph",
             "-r",
@@ -643,7 +826,7 @@ def cmd_list(args) -> None:
             "-T",
             '"x"',
         )
-        unmerged = jj(
+        unmerged = AMBIENT_JJ.query(
             "log",
             "--no-graph",
             "-r",
@@ -681,7 +864,7 @@ def cmd_rm(args) -> None:
 
     # guard: refuse if any bound workspace has non-empty (would-be-lost) work
     if not args.force:
-        risky = jj(
+        risky = AMBIENT_JJ.query(
             "log",
             "--no-graph",
             "-r",
@@ -722,10 +905,12 @@ def cmd_rm(args) -> None:
             die("aborted", code=1)
 
     if bound:
-        do("workspace", "forget", *[n for n, _ in bound], why="forget workspaces")
+        AMBIENT_JJ.mutate(
+            "workspace", "forget", *[n for n, _ in bound], why="forget workspaces"
+        )
     for _, root in bound:
         do_fs(f"rm -rf {root}", lambda root=root: shutil.rmtree(root, ignore_errors=True))
-    do("bookmark", "delete", marker, why="remove grove marker")
+    AMBIENT_JJ.mutate("bookmark", "delete", marker, why="remove grove marker")
     info(f"removed grove '{slug}'")
 
 
@@ -734,18 +919,13 @@ def cmd_rm(args) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def _ids(revset: str, cwd: str | None = None) -> list[str]:
-    """Unambiguous short change-ids for a revset (stable across rebase)."""
-    out = jj(
-        "log",
-        "--no-graph",
-        "-r",
-        revset,
-        "-T",
-        'change_id.shortest(8) ++ "\n"',
-        cwd=cwd,
-    )
-    return [c for c in out.splitlines() if c]
+def _ids(
+    revset: str,
+    cwd: str | None = None,
+    *,
+    jj: JjContext = AMBIENT_JJ,
+) -> list[str]:
+    return jj.revset_ids(revset, cwd=cwd)
 
 
 def graft_selection_revset(user_revset: str) -> str:
@@ -760,8 +940,10 @@ def graft_survivors_revset(prefix: str) -> str:
     return f"((children(heads({prefix})) & {grove_content_revset()}) ~ ({prefix}))"
 
 
-def nearest_attachment(rev: str) -> str:
-    attachments = _ids(f"heads(::{rev} & {GROVE_ATTACHMENTS_REVSET})")
+def nearest_attachment(rev: str, *, jj: JjContext = AMBIENT_JJ) -> str:
+    attachments = jj.revset_ids(
+        f"heads(::{rev} & {GROVE_ATTACHMENTS_REVSET})"
+    )
     if len(attachments) != 1:
         die(
             f"expected exactly one grove attachment below {rev}; "
@@ -770,12 +952,14 @@ def nearest_attachment(rev: str) -> str:
     return attachments[0]
 
 
-def abandon_attachment_if_unused(attachment: str) -> None:
+def abandon_attachment_if_unused(
+    attachment: str, *, jj: JjContext = AMBIENT_JJ
+) -> None:
     if DRY:
         plan(f"jj abandon {attachment}   # drop attachment if unused")
         return
-    if not revset_exists(f"children({attachment})"):
-        do("abandon", attachment, why="drop unused attachment")
+    if not jj.revset_exists(f"children({attachment})"):
+        jj.mutate("abandon", attachment, why="drop unused attachment")
 
 
 def merged_grove_bookmarks_revset() -> str:
@@ -785,59 +969,55 @@ def merged_grove_bookmarks_revset() -> str:
 def cmd_graft(args) -> None:
     revset = args.revset
     slug = bound_slug()
-
-    S = graft_selection_revset(revset)            # commits to bookmark
-    heads_S = f"heads({S})"
-    newwork = graft_prefix_revset(heads_S)
-    survivors = graft_survivors_revset(newwork)
-
-    # guards: all before mutating
-    if jj(
-        "log",
-        "--no-graph",
-        "-r",
-        f"{GROVE_MARKER_REVSET} & ~empty()",
-        "-T",
-        '"x"',
-    ):
-        die("grove marker is not empty (NONEMPTY-MARKER); markers must stay empty.")
-    malformed = _ids(direct_marker_work_revset())
-    if malformed:
-        die(
-            "direct marker child is not a grove attachment; migrate it first: "
-            f"{', '.join(malformed)}"
-        )
-    stray = _ids(f"(({revset}) & mutable()) ~ grove()")
-    if stray:
-        die(f"revset reaches outside the grove: {', '.join(stray)}")
-    if not _ids(S):
-        die("nothing to graft (revset matches no marker-descended grove work).")
-    bad = _ids(f"({newwork}) & (incomplete() | conflicts())")
-    if bad:
-        die(f"range has WIP/conflicted commits; finish them first: {', '.join(bad)}")
-    roots = _ids(f"roots({newwork})")
-    root_attachments = {r: nearest_attachment(r) for r in roots}
-    survivor_ids = _ids(survivors)
-    rows = jj(
-        "log",
-        "--no-graph",
-        "--reversed",
-        "-r",
-        S,
-        "-T",
-        'change_id.shortest(8) ++ "\t"'
-        ' ++ author.timestamp().local().format("%Y-%m-%d") ++ "-" ++ change_id.short()'
-        ' ++ "\n"',
-    )
-
-    info(f"grafting '{revset}' onto trunk")
-    current_at = single_id("@", "working copy")
     names: list[str] = []
-    with restore_op_on_error():
+    with JjTransaction() as tx:
+        selection = graft_selection_revset(revset)  # commits to bookmark
+        selection_heads = f"heads({selection})"
+        newwork = graft_prefix_revset(selection_heads)
+        survivors = graft_survivors_revset(newwork)
+
+        # Evaluate guards and the mutation plan against the transaction's base.
+        if tx.revset_exists(f"{GROVE_MARKER_REVSET} & ~empty()"):
+            die(
+                "grove marker is not empty (NONEMPTY-MARKER); markers must stay empty."
+            )
+        malformed = tx.revset_ids(direct_marker_work_revset())
+        if malformed:
+            die(
+                "direct marker child is not a grove attachment; migrate it first: "
+                f"{', '.join(malformed)}"
+            )
+        stray = tx.revset_ids(f"(({revset}) & mutable()) ~ grove()")
+        if stray:
+            die(f"revset reaches outside the grove: {', '.join(stray)}")
+        if not tx.revset_ids(selection):
+            die("nothing to graft (revset matches no marker-descended grove work).")
+        bad = tx.revset_ids(f"({newwork}) & (incomplete() | conflicts())")
+        if bad:
+            die(
+                f"range has WIP/conflicted commits; finish them first: {', '.join(bad)}"
+            )
+        roots = tx.revset_ids(f"roots({newwork})")
+        root_attachments = {r: nearest_attachment(r, jj=tx) for r in roots}
+        survivor_ids = tx.revset_ids(survivors)
+        rows = tx.query(
+            "log",
+            "--no-graph",
+            "--reversed",
+            "-r",
+            selection,
+            "-T",
+            'change_id.shortest(8) ++ "\t"'
+            ' ++ author.timestamp().local().format("%Y-%m-%d") ++ "-"'
+            ' ++ change_id.short() ++ "\n"',
+        )
+        current_at = tx.resolve_one("@", what="working copy")
+        info(f"grafting '{revset}' onto trunk")
+
         # Publish the grove prefix by stripping the empty attachment below each
         # content root; the attachment itself must not enter public history.
         for r, attachment in root_attachments.items():
-            do(
+            tx.mutate(
                 "rebase",
                 "-s",
                 r,
@@ -853,8 +1033,9 @@ def cmd_graft(args) -> None:
                 f"parents({c})",
                 GROVE_MARKER_REVSET,
                 why=f"create attachment for survivor {c}",
+                jj=tx,
             )
-            do(
+            tx.mutate(
                 "rebase",
                 "-s",
                 c,
@@ -863,16 +1044,16 @@ def cmd_graft(args) -> None:
                 why=f"keep {c} stack in grove",
             )
         for attachment in sorted(set(root_attachments.values())):
-            abandon_attachment_if_unused(attachment)
+            abandon_attachment_if_unused(attachment, jj=tx)
         # bookmark each grafted commit
         for line in rows.splitlines():
             if "\t" not in line:
                 continue
             cid, suffix = line.split("\t", 1)
             name = f"{grove_prefix()}{slug}/{suffix}"
-            do("bookmark", "create", name, "-r", cid, why="bookmark")
+            tx.mutate("bookmark", "create", name, "-r", cid, why="bookmark")
             names.append(name)
-        do("edit", current_at, why="restore working copy")
+        tx.mutate("edit", current_at, why="restore working copy")
 
     info(f"grafted {len(names)} bookmark(s)" + ("" if args.push else " (local; not pushed)"))
 
@@ -897,22 +1078,6 @@ def cmd_graft(args) -> None:
 def cmd_sync(args) -> None:
     slug = bound_slug()
 
-    # refuse if a grove bookmark still sits in the marker-descended area.
-    marker_descended_bookmarks = _ids(
-        f"{GROVE_BOOKMARKS_REVSET} & descendants({GROVE_MARKER_REVSET})"
-    )
-    if marker_descended_bookmarks:
-        die(
-            "grove bookmark(s) still descend from the grove marker: "
-            f"{', '.join(marker_descended_bookmarks)}"
-        )
-    malformed = _ids(direct_marker_work_revset())
-    if malformed:
-        die(
-            "direct marker child is not a grove attachment; migrate it first: "
-            f"{', '.join(malformed)}"
-        )
-
     if not args.no_fetch:
         if DRY:
             plan("jj git fetch")
@@ -925,12 +1090,27 @@ def cmd_sync(args) -> None:
 
     info(f"syncing grove '{slug}' onto trunk")
     merged: list[str] = []
-    with restore_op_on_error():
-        roots = _ids(f"{GROVE_ATTACHMENTS_REVSET} & mutable()")
+    with JjTransaction() as tx:
+        # Evaluate guards and the mutation plan against the transaction's base.
+        marker_descended_bookmarks = tx.revset_ids(
+            f"{GROVE_BOOKMARKS_REVSET} & descendants({GROVE_MARKER_REVSET})"
+        )
+        if marker_descended_bookmarks:
+            die(
+                "grove bookmark(s) still descend from the grove marker: "
+                f"{', '.join(marker_descended_bookmarks)}"
+            )
+        malformed = tx.revset_ids(direct_marker_work_revset())
+        if malformed:
+            die(
+                "direct marker child is not a grove attachment; migrate it first: "
+                f"{', '.join(malformed)}"
+            )
+        roots = tx.revset_ids(f"{GROVE_ATTACHMENTS_REVSET} & mutable()")
         # Move each attachment to current trunk while preserving the marker and
         # any other non-trunk side parents.
         for r in roots:
-            do(
+            tx.mutate(
                 "rebase",
                 "-s",
                 r,
@@ -942,12 +1122,12 @@ def cmd_sync(args) -> None:
         # prune merged grove bookmarks; `delete` removes their remote branches on
         # the next push (--keep-merged skips)
         if not args.keep_merged:
-            merged = jj(
+            merged = tx.query(
                 "bookmark", "list", "-r", merged_grove_bookmarks_revset(),
                 "-T", 'if(!remote && present && !conflict, name ++ "\n")'
             ).splitlines()
             if merged:
-                do("bookmark", "delete", *merged, why="prune merged")
+                tx.mutate("bookmark", "delete", *merged, why="prune merged")
 
     info(f"synced onto trunk{f'; pruned {len(merged)} merged bookmark(s) '
          f'(remote branches deleted on next push)' if merged else ''}")
@@ -995,14 +1175,18 @@ def cmd_push(args) -> None:
     remote = push_remote()
 
     # live bookmarks: present locally under the grove glob.
-    live = jj("bookmark", "list", glob,
-              "-T", 'if(!remote && present, name ++ "\n")').splitlines()
+    live = AMBIENT_JJ.query(
+        "bookmark", "list", glob,
+        "-T", 'if(!remote && present, name ++ "\n")'
+    ).splitlines()
     # merged-bookmark deletions: locally deleted, still on the push remote
     # (sync deletes them locally; this flushes the removal to the remote).
     # --remote scopes to the push remote (and excludes any colocated `git`
     # remote); `tracked` drops the local-only entry --remote also surfaces.
-    gone = jj("bookmark", "list", "--remote", remote, glob,
-              "-T", 'if(tracked && present && !tracking_present, name ++ "\n")').splitlines()
+    gone = AMBIENT_JJ.query(
+        "bookmark", "list", "--remote", remote, glob,
+        "-T", 'if(tracked && present && !tracking_present, name ++ "\n")'
+    ).splitlines()
     live = {n for n in live if n and n != marker}
     gone = {n for n in gone if n and n != marker}
     names = sorted(live | gone)
@@ -1050,7 +1234,9 @@ def cmd_restack(args) -> None:
     # rebase the selected branches onto current trunk. jj records any conflicts
     # rather than failing, so this won't abort mid-way.
     info(f"restacking grove '{slug}' onto trunk")
-    do("rebase", "-b", sel, "-d", "trunk()", why="rebase bookmarks onto trunk")
+    AMBIENT_JJ.mutate(
+        "rebase", "-b", sel, "-d", "trunk()", why="rebase bookmarks onto trunk"
+    )
 
     movedset, selectedset = " | ".join(moved), " | ".join(selected)
     conflicted = _ids(f"({movedset}) & conflicts()")
@@ -1067,8 +1253,10 @@ def cmd_restack(args) -> None:
     # `_push`'s `-b <name>` force-with-lease updates them. conflicted ones
     # can't push.
     pushed = sorted(
-        n for n in jj("bookmark", "list", "-r", f"({selectedset}) ~ conflicts()",
-                      "-T", 'if(!remote, name ++ "\n")').splitlines()
+        n for n in AMBIENT_JJ.query(
+            "bookmark", "list", "-r", f"({selectedset}) ~ conflicts()",
+            "-T", 'if(!remote, name ++ "\n")'
+        ).splitlines()
         if n
     )
     if pushed:
@@ -1077,8 +1265,10 @@ def cmd_restack(args) -> None:
     # the rest of the stack moved locally but wasn't pushed (not named); flag it
     # so the remote drift isn't silent.
     extra = sorted(
-        n for n in jj("bookmark", "list", "-r", f"({movedset}) ~ conflicts()",
-                      "-T", 'if(!remote, name ++ "\n")').splitlines()
+        n for n in AMBIENT_JJ.query(
+            "bookmark", "list", "-r", f"({movedset}) ~ conflicts()",
+            "-T", 'if(!remote, name ++ "\n")'
+        ).splitlines()
         if n and n not in set(pushed)
     )
     if extra:

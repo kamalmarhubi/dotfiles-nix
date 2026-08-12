@@ -466,10 +466,13 @@ def test_sprout_refuses_mixed_grove_and_non_grove_parents(
     assert grove_repo.op_id(cwd=workspace) == op_before
 
 
-def test_sprout_rolls_back_attachment_when_new_fails(grove_repo: GroveRepo) -> None:
+def test_sprout_does_not_integrate_attachment_when_new_fails(
+    grove_repo: GroveRepo,
+) -> None:
     workspace = grove_repo.create_grove("alpha")
     attachment_count = grove_repo.revset_count("grove_attachments()", cwd=workspace)
     at_before = grove_repo.change_ids("@", cwd=workspace)
+    op_before = grove_repo.op_id(cwd=workspace)
 
     result = grove_repo.grove(
         "sprout",
@@ -482,9 +485,53 @@ def test_sprout_rolls_back_attachment_when_new_fails(grove_repo: GroveRepo) -> N
 
     assert result.returncode != 0
     assert "--definitely-not-a-jj-new-option" in result.stderr
-    assert "rolled back; nothing changed." in result.stderr
     assert grove_repo.change_ids("@", cwd=workspace) == at_before
     assert grove_repo.revset_count("grove_attachments()", cwd=workspace) == attachment_count
+    assert grove_repo.op_id(cwd=workspace) == op_before
+
+
+def test_transaction_refuses_to_integrate_after_ambient_operation_moves(
+    grove_repo: GroveRepo,
+) -> None:
+    at_before = grove_repo.change_ids("@")
+    code = f"""
+import runpy
+import subprocess
+
+grove = runpy.run_path({str(JJ_GROVE)!r}, run_name="jj_grove")
+with grove["JjTransaction"](cwd={str(grove_repo.repo)!r}) as tx:
+    tx.mutate("new", "trunk()", "-m", "staged transaction")
+    subprocess.run(
+        ["jj", "bookmark", "create", "concurrent", "-r", "trunk()"],
+        cwd={str(grove_repo.repo)!r},
+        check=True,
+    )
+"""
+
+    result = grove_repo.run(sys.executable, "-c", code, check=False)
+
+    assert result.returncode != 0
+    assert "repository changed while staging jj operations" in result.stderr
+    assert grove_repo.revset_exists("concurrent")
+    assert not grove_repo.revset_exists('description("staged transaction")')
+    assert grove_repo.change_ids("@") == at_before
+
+
+def test_transaction_accepts_known_successful_no_op(grove_repo: GroveRepo) -> None:
+    op_before = grove_repo.op_id()
+    current = grove_repo.change_ids("@")[0]
+    code = f"""
+import runpy
+
+grove = runpy.run_path({str(JJ_GROVE)!r}, run_name="jj_grove")
+with grove["JjTransaction"](cwd={str(grove_repo.repo)!r}) as tx:
+    tx.mutate("edit", {current!r})
+"""
+
+    result = grove_repo.run(sys.executable, "-c", code, check=False)
+
+    assert result.returncode == 0
+    assert grove_repo.op_id() == op_before
 
 
 def test_list_marks_current_here_and_stale_groves(grove_repo: GroveRepo) -> None:
