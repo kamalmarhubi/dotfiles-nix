@@ -25,7 +25,7 @@ in {
         git-lfs
         git-branchless
         llm-agents.hunk
-        jujutsu
+        unstable.jujutsu
         mine.jj-hunk
         # git-filter-repo
         lazygit
