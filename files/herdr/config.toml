@@ -1,6 +1,11 @@
 [ui]
 agent_panel_sort = "priority"
 
+[ui.sidebar.agents]
+rows = [
+  ["state_icon", "workspace", "agent"],
+]
+
 [ui.sound]
 enabled = false
 
