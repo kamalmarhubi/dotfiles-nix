@@ -6,8 +6,8 @@
           "clippy"
           "rustc"
           "rust-src"
-          "rustfmt"
         ])
+        default.rustfmt
       ]
       ++ (with targets; [
         x86_64-apple-darwin.stable.rust-std
