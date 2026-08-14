@@ -25,17 +25,8 @@
     '')
     mtr
     nushell
-    # TODO(NixOS/nixpkgs#522307): Drop this override after the issue is resolved.
-    # packaging 26 normalizes direct-reference spacing differently than these
-    # pipx 1.8.0 tests expect.
-    (pipx.overridePythonAttrs (old: {
-      disabledTests =
-        (old.disabledTests or [])
-        ++ [
-          "test_fix_package_name"
-          "test_parse_specifier_for_metadata"
-        ];
-    }))
+    # TODO(26.11): Go back to stable pipx after upgrading nixpkgs.
+    unstable.pipx
     poetry
     pstree
     pv
