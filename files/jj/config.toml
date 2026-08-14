@@ -31,6 +31,17 @@ gh-fork = ["util", "exec", "--", "jj-gh-fork"]
 # marker-descendant merge commits are scratch work.
 'incomplete()' = '''((empty() & (~merges() | descendants(grove_markers()))) | description("") | description(regex-i:'^(wip|tktk)\b')) ~ root()'''
 
+# Preserve the selected revisions. From each tip of a directly contiguous
+# selected component, add contiguous descendant fixup commits.
+'with_fixups(r)' = '''with_fixups(r, visible_heads())'''
+# Restrict added fixups to ancestry paths leading to `to`.
+'with_fixups(r, to)' = '''
+  r | reachable(
+    r ~ parents(r),
+    (r ~ parents(r))::to & ((r ~ parents(r)) | subject(regex:"^fixup\\b"))
+  )
+'''
+
 # A "grove" is a cluster of related work marked by an empty orphan commit. It's
 # the unit the default log is organised around, and lives entirely under
 # `kamal/<slug>/`: marked by `kamal/<slug>/__marker__`, with active work
