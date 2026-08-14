@@ -37,6 +37,7 @@
   xdg.configFile."git/ignore".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/git/ignore";
   xdg.configFile."hunk/config.toml".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/hunk/config.toml";
   xdg.configFile."git/config.mine".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/git/config.mine";
+  xdg.dataFile."gh/extensions/gh-stack".source = "${pkgs.unstable.gh-stack}/bin";
   xdg.configFile."git/config.system".text = let
     credentialHelper =
       if pkgs.stdenv.isLinux
