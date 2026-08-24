@@ -1,0 +1,24 @@
+{
+  "after_operation": "01d5cd5d6e80aa4ec9ae52cc9a8ba116e3e1f90cc5478bac69572d1154a65b7641bfe6cb1b84534bd1e5dfaf0caab497107442ba5f7acdc8bd7c6c7b8bb814ae",
+  "base": "16811f9c52b75e02dbd315c41ba6d07d105e878b",
+  "before_operation": "01d5cd5d6e80aa4ec9ae52cc9a8ba116e3e1f90cc5478bac69572d1154a65b7641bfe6cb1b84534bd1e5dfaf0caab497107442ba5f7acdc8bd7c6c7b8bb814ae",
+  "commits": [
+    {
+      "new_oid": "440ed4e9e9e47b89123402946d91d062b467affb",
+      "old_oid": "440ed4e9e9e47b89123402946d91d062b467affb"
+    },
+    {
+      "new_oid": "0531d24f5074b10ed83c9e4417229414f63a246e",
+      "old_oid": "0531d24f5074b10ed83c9e4417229414f63a246e"
+    },
+    {
+      "new_oid": "ba2305dbc9f2f8a8957f779723c8818b3bfaaba7",
+      "old_oid": "ba2305dbc9f2f8a8957f779723c8818b3bfaaba7"
+    }
+  ],
+  "metaedit_argv": null,
+  "missing_change_ids": [],
+  "new_tip": "ba2305dbc9f2f8a8957f779723c8818b3bfaaba7",
+  "old_tip": "ba2305dbc9f2f8a8957f779723c8818b3bfaaba7",
+  "tip_bookmark": "C"
+}

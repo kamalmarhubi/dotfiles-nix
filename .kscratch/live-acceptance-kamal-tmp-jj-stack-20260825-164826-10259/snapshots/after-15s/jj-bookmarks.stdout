@@ -1,0 +1,15 @@
+fixture-a: kqykotwm db209536 A
+  @git: kqykotwm db209536 A
+fixture-a@origin: kqykotwm db209536 A
+fixture-b: mlumvyxq 7500d352 B
+  @git: mlumvyxq 7500d352 B
+fixture-b@origin: mlumvyxq 7500d352 B
+fixture-c: rryqwmns ba6a9d1e C
+  @git: rryqwmns ba6a9d1e C
+  @origin: rryqwmns ba6a9d1e C
+fixture-x: pqvtlzks b27ff9e9 X
+  @git: pqvtlzks b27ff9e9 X
+  @origin: pqvtlzks b27ff9e9 X
+main: klvvymzv aa22d1fb fixture base
+  @git: klvvymzv aa22d1fb fixture base
+main@origin: klvvymzv aa22d1fb fixture base

@@ -1,0 +1,9 @@
++ cd /Users/kamal/.config/home-manager/.kscratch/live-acceptance-kamal-tmp-jj-stack-20260825-164826-10259/repo
++ gh stack link --base main fixture-a fixture-b fixture-c
+Checking existing stacks...
+Pushing 3 branches to origin...
+Looking up PRs for 3 branches...
+Found PR #1 for branch fixture-a
+Found PR #2 for branch fixture-b
+Found PR #3 for branch fixture-c
+✓ Created stack with 3 PRs (stack #4)

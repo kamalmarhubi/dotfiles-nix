@@ -1,0 +1,9 @@
+[
+  "gh",
+  "api",
+  "-X",
+  "POST",
+  "repos/kamalmarhubi/kamal-tmp-postdetach-20260825T163621Z/rulesets",
+  "--input",
+  "-"
+]

@@ -28,6 +28,8 @@
       config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/jj/jj-try";
     file.".local/bin/jj-grove".source =
       config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/jj/jj-grove";
+    file.".local/bin/jj-stack".source =
+      config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/jj/jj-stack";
   };
 
   xdg.configFile."fish/completions/jj.fish".source =

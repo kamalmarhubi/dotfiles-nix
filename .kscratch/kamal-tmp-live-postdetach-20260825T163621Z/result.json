@@ -1,0 +1,45 @@
+{
+  "blockers": [
+    "branch protection required status API returned HTTP 403: Upgrade to GitHub Pro or make this repository public",
+    "repository ruleset required review API returned HTTP 403 with same restriction"
+  ],
+  "classification": "GitHub platform/account-plan restriction, not harness or product failure",
+  "constructed": {
+    "B_auto_merge": false,
+    "B_ready": true,
+    "allow_auto_merge_requested": true,
+    "initial_stack": 4,
+    "prs": {
+      "A": 1,
+      "B": 2,
+      "C": 3
+    }
+  },
+  "exact_oids": {
+    "A": "440ed4e9e9e47b89123402946d91d062b467affb",
+    "B": "0531d24f5074b10ed83c9e4417229414f63a246e",
+    "C": "ba2305dbc9f2f8a8957f779723c8818b3bfaaba7",
+    "main": "16811f9c52b75e02dbd315c41ba6d07d105e878b"
+  },
+  "intended_publication_effects_if_unblocked": [
+    "publish exact A-X-C refs",
+    "unstack old A-B-C stack",
+    "relink A-X-C successfully",
+    "wrapper enables auto-merge on detached B",
+    "verify_detached_omissions rejects B and exits 1",
+    "B remains OPEN, detached, pending autoMergeRequest, branch exact and unclosed"
+  ],
+  "jj_operation": "57c75ba8e6b8e9e086d133831c21c4c79928fbada85ada5d21ea5c9566db539c78f0c42fa3e0bca89dc7197c04f17bd2eead1f634d29d9333eb35ee200d3a3da",
+  "not_performed": [
+    "A-X-C local rebuild",
+    "controlled gh wrapper",
+    "target --close-omitted run",
+    "post-detach auto-merge mutation"
+  ],
+  "outcome": "PLATFORM_BLOCKED_BEFORE_TARGET_RUN",
+  "private": true,
+  "reason": "No safe pending requirement can be configured while retaining the disposable repository as private; enabling auto-merge without one risks immediate merge. Per no-retry-same-partial-fixture, this fixture was not repurposed or retried.",
+  "repo": "kamalmarhubi/kamal-tmp-postdetach-20260825T163621Z",
+  "retained": true,
+  "source_sha256": "ae74a5a0ac33ac04623a82853b26a731189e015d0f0e2203614e30b5e73fdfb9"
+}

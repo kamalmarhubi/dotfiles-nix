@@ -1,0 +1,7 @@
+[
+  "gh",
+  "api",
+  "repos/kamalmarhubi/kamal-tmp-postdetach-20260825T163621Z",
+  "--jq",
+  "{private,visibility,allow_auto_merge}"
+]

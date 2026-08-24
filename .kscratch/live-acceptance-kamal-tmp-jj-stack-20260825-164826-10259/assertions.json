@@ -1,0 +1,49 @@
+{
+  "b": {
+    "autoMergeRequest": {
+      "authorEmail": null,
+      "commitBody": null,
+      "commitHeadline": null,
+      "enabledAt": "2026-08-25T16:51:37Z",
+      "enabledBy": {
+        "id": "MDQ6VXNlcjUwOTM2",
+        "is_bot": false,
+        "login": "kamalmarhubi",
+        "name": "Kamal Al Marhubi"
+      },
+      "mergeMethod": "MERGE"
+    },
+    "baseRefName": "fixture-a",
+    "body": "Fixture B",
+    "closedAt": null,
+    "createdAt": "2026-08-25T16:49:30Z",
+    "headRefName": "fixture-b",
+    "headRefOid": "7500d35286ab13f2f8e97c7aba509412b1a83afb",
+    "id": "PR_kwDOUEBL1c8AAAABA91-ZQ",
+    "isDraft": false,
+    "mergeCommit": null,
+    "mergeStateStatus": "BLOCKED",
+    "mergedAt": null,
+    "number": 2,
+    "state": "OPEN",
+    "title": "B",
+    "updatedAt": "2026-08-25T16:49:30Z",
+    "url": "https://github.com/wavemm/kamal-tmp-jj-stack-20260825-164826-10259/pull/2"
+  },
+  "checks": {
+    "auto_merge_enable_exit_0": true,
+    "b_branch_unchanged": true,
+    "b_detached_from_replacement_stack": true,
+    "b_not_closed": true,
+    "b_open": true,
+    "b_pending_auto_merge": true,
+    "expected_error": true,
+    "link_real_exit_0": true,
+    "replacement_stack_has_a_x_c": true,
+    "source_hash_matches": true,
+    "target_exit_is_1": true
+  },
+  "classification": "expected-product-validation",
+  "replacement_stack_number": 6,
+  "result": "PASS"
+}

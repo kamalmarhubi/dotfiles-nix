@@ -1,0 +1,36 @@
+{
+  "after_operation": "34b46b6d82f0f93d93f71a66642c8a0eed7ee9e927c68e8326f483cd4ed3a947772d63ed9a84217544a9de0470c372a0a27c4b90fcf856935384266cdc21d53a",
+  "base": "aa22d1fb267453248a710103853be11120b8227f",
+  "before_operation": "7b481df5049c902b113608baf93a849b3bf3503a70e4525f173877faae46576a3bb55bde1f4df6b9db6f8341af46d44857b510dea798cf05f418dc542023b98c",
+  "commits": [
+    {
+      "new_oid": "db209536369c5419938cb7aec7e7531ca458cd6d",
+      "old_oid": "3d237ae039e4870022c4224f5db600c13de96d7e"
+    },
+    {
+      "new_oid": "7500d35286ab13f2f8e97c7aba509412b1a83afb",
+      "old_oid": "572868885e613edab8ae1823cd69769e1d770cf3"
+    },
+    {
+      "new_oid": "aed8a31279aa1a95e8d10e2ff53e8727299f4eda",
+      "old_oid": "a45bb3e212aaabc5da57f80003d8aecde0db0279"
+    }
+  ],
+  "metaedit_argv": [
+    "jj",
+    "--ignore-immutable",
+    "metaedit",
+    "--update-change-id",
+    "3d237ae039e4870022c4224f5db600c13de96d7e",
+    "572868885e613edab8ae1823cd69769e1d770cf3",
+    "a45bb3e212aaabc5da57f80003d8aecde0db0279"
+  ],
+  "missing_change_ids": [
+    "3d237ae039e4870022c4224f5db600c13de96d7e",
+    "572868885e613edab8ae1823cd69769e1d770cf3",
+    "a45bb3e212aaabc5da57f80003d8aecde0db0279"
+  ],
+  "new_tip": "aed8a31279aa1a95e8d10e2ff53e8727299f4eda",
+  "old_tip": "a45bb3e212aaabc5da57f80003d8aecde0db0279",
+  "tip_bookmark": "fixture-c"
+}

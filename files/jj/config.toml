@@ -25,6 +25,7 @@ try = ["util", "exec", "--", "jj-try"]
 sprout = ["grove", "sprout"]
 grove = ["util", "exec", "--", "jj-grove"]
 gh-fork = ["util", "exec", "--", "jj-gh-fork"]
+stack = ["util", "exec", "--", "jj-stack"]
 
 [revset-aliases]
 # Empty non-merge commits, blank descriptions, wip/tktk descriptions, and empty

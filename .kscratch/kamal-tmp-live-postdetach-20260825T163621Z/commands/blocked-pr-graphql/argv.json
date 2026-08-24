@@ -1,0 +1,11 @@
+[
+  "gh",
+  "pr",
+  "list",
+  "--repo",
+  "kamalmarhubi/kamal-tmp-postdetach-20260825T163621Z",
+  "--state",
+  "all",
+  "--json",
+  "number,id,state,isDraft,headRefName,headRefOid,baseRefName,autoMergeRequest,mergeStateStatus"
+]

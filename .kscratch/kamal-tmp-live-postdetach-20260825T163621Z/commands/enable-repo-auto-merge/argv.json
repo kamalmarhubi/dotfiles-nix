@@ -1,0 +1,9 @@
+[
+  "gh",
+  "api",
+  "-X",
+  "PATCH",
+  "repos/kamalmarhubi/kamal-tmp-postdetach-20260825T163621Z",
+  "-f",
+  "allow_auto_merge=true"
+]

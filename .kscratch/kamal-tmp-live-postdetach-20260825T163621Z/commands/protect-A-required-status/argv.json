@@ -1,0 +1,11 @@
+[
+  "gh",
+  "api",
+  "-X",
+  "PUT",
+  "repos/kamalmarhubi/kamal-tmp-postdetach-20260825T163621Z/branches/A/protection",
+  "-H",
+  "Accept: application/vnd.github+json",
+  "--input",
+  "-"
+]

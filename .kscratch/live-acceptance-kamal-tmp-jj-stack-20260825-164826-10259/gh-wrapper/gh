@@ -1,0 +1,27 @@
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+real = os.environ["JJ_STACK_ACCEPTANCE_REAL_GH"]
+log = Path(os.environ["JJ_STACK_ACCEPTANCE_GH_LOG"])
+args = sys.argv[1:]
+is_link = args[:2] == ["stack", "link"]
+
+def refs():
+    result = subprocess.run(["git", "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"], capture_output=True, text=True)
+    return {"exit": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+
+entry = {"at": datetime.now(timezone.utc).isoformat(), "argv": args, "cwd": os.getcwd(), "is_stack_link": is_link, "refs_before": refs()}
+result = subprocess.run([real, *args])
+entry["real_exit"] = result.returncode
+entry["refs_after"] = refs()
+if is_link and result.returncode == 0:
+    auto = subprocess.run([real, "pr", "merge", "2", "--auto", "--merge"], capture_output=True, text=True)
+    entry["auto_merge"] = {"argv": ["pr", "merge", "2", "--auto", "--merge"], "exit": auto.returncode, "stdout": auto.stdout, "stderr": auto.stderr}
+with log.open("a") as output:
+    output.write(json.dumps(entry, sort_keys=True) + "\n")
+raise SystemExit(result.returncode)

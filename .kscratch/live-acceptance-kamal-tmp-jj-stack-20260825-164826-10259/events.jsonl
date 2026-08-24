@@ -1,0 +1,6 @@
+{"at": "2026-08-25T16:48:27.577112+00:00", "event": "session-created"}
+{"at": "2026-08-25T16:49:10.905666+00:00", "event": "fixture-prepared", "new_tip": "aed8a31279aa1a95e8d10e2ff53e8727299f4eda", "old_tip": "a45bb3e212aaabc5da57f80003d8aecde0db0279", "repaired": 3}
+{"at": "2026-08-25T16:50:47.770001+00:00", "event": "snapshot", "label": "before-target"}
+{"argv": ["/Users/kamal/.config/home-manager/.kscratch/live-acceptance-kamal-tmp-jj-stack-20260825-164826-10259/jj-stack-source", "push", "--base", "main", "--detach-omitted", "--close-omitted", "2", "fixture-a|fixture-x|fixture-c"], "at": "2026-08-25T16:51:48.642423+00:00", "cwd": "/Users/kamal/.config/home-manager/.kscratch/live-acceptance-kamal-tmp-jj-stack-20260825-164826-10259/repo", "event": "command", "exit": 1, "name": "target"}
+{"at": "2026-08-25T16:51:58.534752+00:00", "event": "snapshot", "label": "immediate"}
+{"at": "2026-08-25T16:52:22.721206+00:00", "event": "snapshot", "label": "after-15s"}
