@@ -1,0 +1,8 @@
+2b1d2da7ce3859fd7f3ad3145678c758484edebb	HEAD
+87ba85fc4824414249f8e5b5a297b60d2fd12887	refs/heads/fixture-a
+19c6b8806089c7eb9c8c7be1496bf106b6a043f7	refs/heads/fixture-b
+2b1d2da7ce3859fd7f3ad3145678c758484edebb	refs/heads/main
+87ba85fc4824414249f8e5b5a297b60d2fd12887	refs/pull/1/head
+ded3cca2a4b6eee47d12ea8d29f82c6b5742d58d	refs/pull/1/merge
+19c6b8806089c7eb9c8c7be1496bf106b6a043f7	refs/pull/2/head
+1f4cba47084a4f1ade595a7a616ab37d153971c3	refs/pull/2/merge

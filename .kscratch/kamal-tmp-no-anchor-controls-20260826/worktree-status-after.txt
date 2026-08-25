@@ -1,0 +1,11 @@
+ M files/jj/jj-stack
+ M files/jj/tests/test_jj_stack.py
+?? .kscratch/LATEST_SCENARIO2_ROOT
+?? .kscratch/kamal-tmp-live-postdetach-20260825T163558Z/repo/
+?? .kscratch/kamal-tmp-live-postdetach-20260825T163621Z/repo/
+?? .kscratch/kamal-tmp-no-anchor-controls-20260826/
+?? .kscratch/kamal-tmp-partial-replay-20260826T003211Z/
+?? .kscratch/kamal-tmp-partial-replay-20260826T003647Z/
+?? .kscratch/live-acceptance-kamal-tmp-jj-stack-20260825-164826-10259/repo/
+?? .kscratch/live-scenario1-kamal-tmp-20260826T003202Z/
+?? .kscratch/scenario2-no-anchor-20260826-003241-53913/

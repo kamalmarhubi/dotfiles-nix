@@ -22,6 +22,69 @@ def load_script():
     return module
 
 
+def test_structured_jj_output_disables_forced_color(tmp_path, monkeypatch):
+    script = load_script()
+    repo = tmp_path / "repo"
+    subprocess.run(
+        ["jj", "git", "init", "--colocate", str(repo)],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    subprocess.run(
+        [
+            "jj",
+            "--repository",
+            str(repo),
+            "config",
+            "set",
+            "--repo",
+            "ui.color",
+            "always",
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    subprocess.run(
+        ["jj", "--repository", str(repo), "bookmark", "create", "-r", "@", "topic"],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    monkeypatch.setenv("JJ_WORKSPACE_ROOT", str(repo))
+    script.JJ = script.jj_command()
+
+    operation = script.begin_inspection_phase()
+    workspaces = script.workspace_targets()
+    bookmarks = script.local_bookmark_targets()
+    target = bookmarks[0][1]
+
+    assert script.JJ == ["jj", "--color=never", "--repository", str(repo)]
+    assert "\x1b" not in operation
+    assert operation and int(operation, 16) >= 0
+    assert workspaces == (("default", target),)
+    assert bookmarks == (("topic", target),)
+    assert "\x1b" not in target
+
+
+@pytest.mark.parametrize("response", ["null", "[]", '"text"', "1"])
+def test_graphql_rejects_non_object_json(monkeypatch, response):
+    script = load_script()
+    monkeypatch.setattr(
+        script,
+        "command",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 1, response, "upstream failure"
+        ),
+    )
+
+    with pytest.raises(script.Error, match="could not query GitHub: upstream failure"):
+        script.graphql(
+            "query { viewer { login } }", {}, {}, ".", "could not query GitHub"
+        )
+
+
 def revision(script, commit, local=(), remote=(), generated=None):
     return script.Revision(
         commit,
@@ -1003,7 +1066,7 @@ def test_selected_pr_expands_to_complete_open_suffix(monkeypatch):
     a = pull_request(script, "a", 1)
     b = pull_request(script, "b", 2)
     c = pull_request(script, "c", 3)
-    stack = script.StackSnapshot("STACK_7", 7, [a, b, c], {"b": b}, {"b": b})
+    stack = script.StackSnapshot("STACK_7", 7, [a, b, c], {"b": b})
     all_revisions = [revision(script, f"oid-{name}") for name in ("a", "b", "c")]
     discovery = script.Discovery(None, all_revisions, [], ["b"], stack, [])
     monkeypatch.setattr(script, "local_bookmark_oid", lambda name: f"oid-{name}")

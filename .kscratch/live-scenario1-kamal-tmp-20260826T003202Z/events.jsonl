@@ -1,0 +1,15 @@
+{"at": "2026-08-26T00:32:06.780530+00:00", "event": "session-created"}
+{"at": "2026-08-26T00:32:35.871883+00:00", "event": "fixture-prepared", "new_tip": "10bbba76fbe56de226676243eac7ddffc38e7dfd", "old_tip": "10bbba76fbe56de226676243eac7ddffc38e7dfd", "repaired": 0}
+{"argv": ["/Users/kamal/.config/home-manager/.kscratch/live-scenario1-kamal-tmp-20260826T003202Z/jj-stack-source", "push", "scenario1-a|scenario1-b|scenario1-c"], "at": "2026-08-26T00:33:33.483902+00:00", "cwd": "/Users/kamal/.config/home-manager/.kscratch/live-scenario1-kamal-tmp-20260826T003202Z/repo", "event": "command", "exit": 0, "name": "publish"}
+{"at": "2026-08-26T00:33:42.492001+00:00", "event": "snapshot", "label": "before-merge"}
+{"argv": ["gh", "pr", "ready", "1"], "at": "2026-08-26T00:33:53.074833+00:00", "cwd": "/Users/kamal/.config/home-manager/.kscratch/live-scenario1-kamal-tmp-20260826T003202Z/repo", "event": "command", "exit": 0, "name": "ready1"}
+{"argv": ["gh", "pr", "ready", "2"], "at": "2026-08-26T00:33:56.043419+00:00", "cwd": "/Users/kamal/.config/home-manager/.kscratch/live-scenario1-kamal-tmp-20260826T003202Z/repo", "event": "command", "exit": 0, "name": "ready2"}
+{"argv": ["gh", "pr", "ready", "3"], "at": "2026-08-26T00:33:58.403032+00:00", "cwd": "/Users/kamal/.config/home-manager/.kscratch/live-scenario1-kamal-tmp-20260826T003202Z/repo", "event": "command", "exit": 0, "name": "ready3"}
+{"at": "2026-08-26T00:34:11.164254+00:00", "event": "snapshot", "label": "ready-before-merge"}
+{"argv": ["gh", "stack", "merge", "1", "--yes", "--squash"], "at": "2026-08-26T00:34:24.540743+00:00", "cwd": "/Users/kamal/.config/home-manager/.kscratch/live-scenario1-kamal-tmp-20260826T003202Z/repo", "event": "command", "exit": 0, "name": "merge-a-async-stack-api"}
+{"at": "2026-08-26T00:35:05.045037+00:00", "event": "snapshot", "label": "post-merge-stable"}
+{"argv": ["gh", "stack", "unstack", "4"], "at": "2026-08-26T00:35:47.136633+00:00", "cwd": "/Users/kamal/.config/home-manager/.kscratch/live-scenario1-kamal-tmp-20260826T003202Z/repo", "event": "command", "exit": 0, "name": "unstack-old-4"}
+{"at": "2026-08-26T00:36:14.590394+00:00", "event": "snapshot", "label": "immediate"}
+{"at": "2026-08-26T00:36:54.556508+00:00", "event": "snapshot", "label": "delayed15"}
+{"argv": ["gh", "stack", "link", "4", "https://github.com/wavemm/kamal-tmp-scenario1-20260826T003202Z/pull/2", "https://github.com/wavemm/kamal-tmp-scenario1-20260826T003202Z/pull/3"], "at": "2026-08-26T00:37:17.178417+00:00", "cwd": "/Users/kamal/.config/home-manager/.kscratch/live-scenario1-kamal-tmp-20260826T003202Z/repo", "event": "command", "exit": 0, "name": "relink-old-4-b-c"}
+{"at": "2026-08-26T00:39:02.168912+00:00", "event": "snapshot", "label": "relink-delayed15"}

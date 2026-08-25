@@ -1,0 +1,20 @@
+* 19c6b88 (origin/fixture-b, fixture-b) Scenario 2 B
+| * c0784b6 
+|/  
+| * 829dffc 
+|/  
+* 87ba85f (HEAD, origin/fixture-a, fixture-a) Scenario 2 A
+| * a9a0da0 
+|/  
+| * 42cf750 
+|/  
+| * 3094d2f Scenario 2 A
+|/  
+| * cd42cd6 
+|/  
+| * f4f2a11 
+|/  
+| * 3982528 
+|/  
+* 2b1d2da (origin/main, origin/HEAD, main) Initial commit
+* eb39cf6 

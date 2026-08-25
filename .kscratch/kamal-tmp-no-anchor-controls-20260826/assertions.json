@@ -1,0 +1,166 @@
+{
+  "source_sha256": "5e3c18debf997a45510ff099d05ab9ba41d317c8a40f202a2f205a99f80fd860",
+  "ordinary_never_stacked": {
+    "1": {
+      "stack": null,
+      "head": "a41c6f0e83a72b45766d07808402623e81d8a352",
+      "base": "9cad78790c936a57be7d8f652db606b4a21fe01d"
+    },
+    "2": {
+      "stack": null,
+      "head": "67e1631a6b75140f43b43c9dbdae7abb33f23e07",
+      "base": "a41c6f0e83a72b45766d07808402623e81d8a352"
+    }
+  },
+  "unstacked": {
+    "3": {
+      "stack": null,
+      "base": "ordinary-a",
+      "events": {
+        "nodes": [
+          {
+            "__typename": "BaseRefChangedEvent",
+            "id": "BRCE_lADOUEXIf88AAAABOQwins8AAAAG_P6eDQ",
+            "createdAt": "2026-08-26T00:42:55Z",
+            "actor": {
+              "login": "kamalmarhubi"
+            },
+            "previousRefName": "main",
+            "currentRefName": "ordinary-a"
+          }
+        ],
+        "pageInfo": {
+          "hasNextPage": false,
+          "hasPreviousPage": false,
+          "startCursor": "Y3Vyc29yOnYyOpPPAAABoDuFHpgBqzMwMDE0MzQ4ODEz",
+          "endCursor": "Y3Vyc29yOnYyOpPPAAABoDuFHpgBqzMwMDE0MzQ4ODEz"
+        }
+      }
+    },
+    "7": {
+      "stack": null,
+      "base": "ordinary-a",
+      "events": {
+        "nodes": [
+          {
+            "__typename": "BaseRefChangedEvent",
+            "id": "BRCE_lADOUEXIf88AAAABOQw6i88AAAAG_P6yBQ",
+            "createdAt": "2026-08-26T00:43:07Z",
+            "actor": {
+              "login": "kamalmarhubi"
+            },
+            "previousRefName": "main",
+            "currentRefName": "ordinary-a"
+          },
+          {
+            "__typename": "BaseRefChangedEvent",
+            "id": "BRCE_lADOUEXIf88AAAABOQw6i88AAAAG_P7IKQ",
+            "createdAt": "2026-08-26T00:43:19Z",
+            "actor": {
+              "login": "kamalmarhubi"
+            },
+            "previousRefName": "ordinary-a",
+            "currentRefName": "main"
+          },
+          {
+            "__typename": "BaseRefChangedEvent",
+            "id": "BRCE_lADOUEXIf88AAAABOQw6i88AAAAG_P7YGQ",
+            "createdAt": "2026-08-26T00:43:27Z",
+            "actor": {
+              "login": "kamalmarhubi"
+            },
+            "previousRefName": "main",
+            "currentRefName": "ordinary-a"
+          }
+        ],
+        "pageInfo": {
+          "hasNextPage": false,
+          "hasPreviousPage": false,
+          "startCursor": "Y3Vyc29yOnYyOpPPAAABoDuFTXgBqzMwMDE0MzUzOTI1",
+          "endCursor": "Y3Vyc29yOnYyOpPPAAABoDuFm5gBqzMwMDE0MzYzNjcz"
+        }
+      }
+    }
+  },
+  "survivors": {
+    "11": {
+      "stack": {
+        "id": "PRS_kwDOUEXIf84ACYHo",
+        "number": 14
+      },
+      "head": "c1ac79f834b02e7c2aa2d8cf8d5fc1073888ef68",
+      "base_oid": "9cad78790c936a57be7d8f652db606b4a21fe01d"
+    },
+    "12": {
+      "stack": {
+        "id": "PRS_kwDOUEXIf84ACYHo",
+        "number": 14
+      },
+      "head": "81c4b5feaacc825068c6d3192f48d5caa86e09c4",
+      "base_oid": "c1ac79f834b02e7c2aa2d8cf8d5fc1073888ef68"
+    },
+    "13": {
+      "stack": {
+        "id": "PRS_kwDOUEXIf84ACYHo",
+        "number": 14
+      },
+      "head": "4c584d532766bb8cd58ca5e6e55d50fd5b22ca23",
+      "base_oid": "81c4b5feaacc825068c6d3192f48d5caa86e09c4"
+    },
+    "15": {
+      "stack": {
+        "id": "PRS_kwDOUEXIf84ACYH1",
+        "number": 18
+      },
+      "head": "135acfcc5fb38c7c84374853904a3cee0c2546a4",
+      "base_oid": "9cad78790c936a57be7d8f652db606b4a21fe01d"
+    },
+    "16": {
+      "stack": {
+        "id": "PRS_kwDOUEXIf84ACYH1",
+        "number": 18
+      },
+      "head": "20f9f1ee1f808017e26a83f5efe58dd443a0ccc7",
+      "base_oid": "135acfcc5fb38c7c84374853904a3cee0c2546a4"
+    },
+    "17": {
+      "stack": {
+        "id": "PRS_kwDOUEXIf84ACYH1",
+        "number": 18
+      },
+      "head": "ef0714ea7582d8a689574acc3bcbc53eb1d09c27",
+      "base_oid": "20f9f1ee1f808017e26a83f5efe58dd443a0ccc7"
+    },
+    "19": {
+      "stack": {
+        "id": "PRS_kwDOUEXIf84ACYIG",
+        "number": 22
+      },
+      "head": "02b571a67c167080d8ad640073bc2a0e218079ca",
+      "base_oid": "9cad78790c936a57be7d8f652db606b4a21fe01d"
+    },
+    "20": {
+      "stack": {
+        "id": "PRS_kwDOUEXIf84ACYIG",
+        "number": 22
+      },
+      "head": "aa7494899e5c1a8d890c8a52c23cd57007395079",
+      "base_oid": "02b571a67c167080d8ad640073bc2a0e218079ca"
+    },
+    "21": {
+      "stack": {
+        "id": "PRS_kwDOUEXIf84ACYIG",
+        "number": 22
+      },
+      "head": "da1c000ddaefd26136d41373225a2f5d7fe64af3",
+      "base_oid": "aa7494899e5c1a8d890c8a52c23cd57007395079"
+    }
+  },
+  "ancestry": {
+    "ordinary_A_is_ancestor_of_B": true,
+    "c2_A_is_ancestor_of_C": true,
+    "c2_candidate_is_not_ancestor_of_c4_top": false,
+    "c5a_top_is_not_ancestor_of_c5b_top": false,
+    "c5b_top_is_not_ancestor_of_c5a_top": false
+  }
+}

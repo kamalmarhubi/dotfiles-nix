@@ -1,0 +1,9 @@
+fixture-a: ynqxxwnk 87ba85fc Scenario 2 A
+  @git: ynqxxwnk 87ba85fc Scenario 2 A
+  @origin: ynqxxwnk 87ba85fc Scenario 2 A
+fixture-b: ryowpnps 19c6b880 Scenario 2 B
+  @git: ryowpnps 19c6b880 Scenario 2 B
+  @origin: ryowpnps 19c6b880 Scenario 2 B
+main: mmsosxyx 2b1d2da7 Initial commit
+  @git: mmsosxyx 2b1d2da7 Initial commit
+main@origin: mmsosxyx 2b1d2da7 Initial commit

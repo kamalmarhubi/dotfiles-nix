@@ -1,0 +1,29 @@
+HTTP/2.0 200 OK
+Access-Control-Allow-Origin: *
+Access-Control-Expose-Headers: ETag, Link, Location, Retry-After, X-GitHub-OTP, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Used, X-RateLimit-Resource, X-RateLimit-Reset, X-OAuth-Scopes, X-Accepted-OAuth-Scopes, X-Poll-Interval, X-GitHub-Media-Type, X-GitHub-SSO, X-GitHub-Request-Id, Deprecation, Sunset, Warning
+Cache-Control: private, max-age=60, s-maxage=60
+Content-Security-Policy: default-src 'none'
+Content-Type: application/json; charset=utf-8
+Date: Wed, 26 Aug 2026 00:42:29 GMT
+Etag: W/"f247e822d35b8720f3264fd562631699c2355a2524d09ee66e4d1b3b219de5f8"
+Referrer-Policy: origin-when-cross-origin, strict-origin-when-cross-origin
+Server: github.com
+Strict-Transport-Security: max-age=31536000; includeSubdomains; preload
+Vary: Accept, Authorization, Cookie, X-GitHub-OTP,Accept-Encoding, Accept, X-Requested-With
+X-Accepted-Oauth-Scopes: repo
+X-Content-Type-Options: nosniff
+X-Frame-Options: deny
+X-Github-Api-Version-Selected: 2022-11-28
+X-Github-Edge-Region: iad
+X-Github-Media-Type: github.v3; format=json
+X-Github-Request-Id: 5DF9:2A3AE6:87927E:1C2B8B7:6A8E3674
+X-Oauth-Client-Id: 178c6fc778ccc68e1d6a
+X-Oauth-Scopes: gist, notifications, read:org, repo, workflow
+X-Ratelimit-Limit: 5000
+X-Ratelimit-Remaining: 4951
+X-Ratelimit-Reset: 1787708457
+X-Ratelimit-Resource: core
+X-Ratelimit-Used: 49
+X-Xss-Protection: 0
+
+[{"sha":"a41c6f0e83a72b45766d07808402623e81d8a352","node_id":"C_kwDOUEXIf9oAKGE0MWM2ZjBlODNhNzJiNDU3NjZkMDc4MDg0MDI2MjNlODFkOGEzNTI","url":"https://api.github.com/repos/wavemm/kamal-tmp-no-anchor-controls-20260826/git/commits/a41c6f0e83a72b45766d07808402623e81d8a352","html_url":"https://github.com/wavemm/kamal-tmp-no-anchor-controls-20260826/commit/a41c6f0e83a72b45766d07808402623e81d8a352","author":{"name":"Kamal Marhubi","email":"kamal@example.invalid","date":"2026-08-26T00:32:59Z"},"committer":{"name":"Kamal Marhubi","email":"kamal@example.invalid","date":"2026-08-26T00:32:59Z"},"tree":{"sha":"14ffb2d5d61e667ad1943ee276a517520feb0a37","url":"https://api.github.com/repos/wavemm/kamal-tmp-no-anchor-controls-20260826/git/trees/14ffb2d5d61e667ad1943ee276a517520feb0a37"},"message":"ordinary A\n\nAmp-Thread-ID: https://ampcode.com/threads/T-01a034cf-01ea-70c9-a839-3dc1c9303c87\nCo-authored-by: Amp <amp@ampcode.com>","parents":[{"sha":"9cad78790c936a57be7d8f652db606b4a21fe01d","url":"https://api.github.com/repos/wavemm/kamal-tmp-no-anchor-controls-20260826/git/commits/9cad78790c936a57be7d8f652db606b4a21fe01d","html_url":"https://github.com/wavemm/kamal-tmp-no-anchor-controls-20260826/commit/9cad78790c936a57be7d8f652db606b4a21fe01d"}],"verification":{"verified":false,"reason":"unsigned","signature":null,"payload":null,"verified_at":null},"event":"committed"}]

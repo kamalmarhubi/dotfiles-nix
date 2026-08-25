@@ -1,0 +1,16 @@
+{
+  "artifact_root": "/Users/kamal/.config/home-manager/.kscratch/scenario2-no-anchor-20260826-003241-53913",
+  "assertions": "assertions.json",
+  "exact_oids": {
+    "A": "87ba85fc4824414249f8e5b5a297b60d2fd12887",
+    "B": "19c6b8806089c7eb9c8c7be1496bf106b6a043f7"
+  },
+  "manifest": "ARTIFACTS.sha256",
+  "new_stack_number": 4,
+  "old_stack_number": 3,
+  "private": true,
+  "repository": "https://github.com/wavemm/kamal-tmp-jj-stack-no-anchor-20260826-003241-53913",
+  "retained_no_cleanup": true,
+  "source_sha256": "5e3c18debf997a45510ff099d05ab9ba41d317c8a40f202a2f205a99f80fd860",
+  "workspace_git_head": "af1727b84e484ebd8ef53779fe614ba318843de9"
+}

@@ -1,0 +1,3 @@
+Installed 2 packages in 35ms
+jj stack: `jj --color=never --at-op=914d122ada94fdb288b4f9bea396dcb9d68c6977418c09f3526dac4e38f6a63cc4e2b70efad0afac32237b32e0bb2648c0042a8abd2fa41e8a09c4f57d88b7d5 log --color=never --no-graph --reversed -r '(trunk()..tip)' -T 'commit_id ++ "\n"'` failed:
+Error: Revision `tip` doesn't exist

@@ -1,0 +1,1 @@
+{"errors":[{"path":["query","repository","pullRequest","pullRequestStack"],"extensions":{"code":"undefinedField","typeName":"PullRequest","fieldName":"pullRequestStack"},"locations":[{"line":1,"column":169}],"message":"Field 'pullRequestStack' doesn't exist on type 'PullRequest'"}]}

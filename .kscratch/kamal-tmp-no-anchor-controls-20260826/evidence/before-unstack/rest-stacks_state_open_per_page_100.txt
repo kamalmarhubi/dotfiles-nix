@@ -1,0 +1,29 @@
+HTTP/2.0 200 OK
+Access-Control-Allow-Origin: *
+Access-Control-Expose-Headers: ETag, Link, Location, Retry-After, X-GitHub-OTP, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Used, X-RateLimit-Resource, X-RateLimit-Reset, X-OAuth-Scopes, X-Accepted-OAuth-Scopes, X-Poll-Interval, X-GitHub-Media-Type, X-GitHub-SSO, X-GitHub-Request-Id, Deprecation, Sunset, Warning
+Cache-Control: private, max-age=60, s-maxage=60
+Content-Security-Policy: default-src 'none'
+Content-Type: application/json; charset=utf-8
+Date: Wed, 26 Aug 2026 00:40:09 GMT
+Etag: W/"919c7f85407453e765faa4e69d9a9bf1bcc6da962ba21011164d4dd6339f3ce0"
+Referrer-Policy: origin-when-cross-origin, strict-origin-when-cross-origin
+Server: github.com
+Strict-Transport-Security: max-age=31536000; includeSubdomains; preload
+Vary: Accept, Authorization, Cookie, X-GitHub-OTP,Accept-Encoding, Accept, X-Requested-With
+X-Accepted-Oauth-Scopes: 
+X-Content-Type-Options: nosniff
+X-Frame-Options: deny
+X-Github-Api-Version-Selected: 2022-11-28
+X-Github-Edge-Region: iad
+X-Github-Media-Type: github.v3; format=json
+X-Github-Request-Id: 5DF9:110215:282254C:84879B0:6A8E35E9
+X-Oauth-Client-Id: 178c6fc778ccc68e1d6a
+X-Oauth-Scopes: gist, notifications, read:org, repo, workflow
+X-Ratelimit-Limit: 5000
+X-Ratelimit-Remaining: 4860
+X-Ratelimit-Reset: 1787707450
+X-Ratelimit-Resource: core
+X-Ratelimit-Used: 140
+X-Xss-Protection: 0
+
+[{"id":623110,"number":22,"node_id":"PRS_kwDOUEXIf84ACYIG","url":"https://api.github.com/repos/wavemm/kamal-tmp-no-anchor-controls-20260826/stacks/22","base":{"ref":"main"},"open":true,"created_at":"2026-08-26T00:38:03Z","pull_requests":[{"number":19,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c5b-a","sha":"02b571a67c167080d8ad640073bc2a0e218079ca"}},{"number":20,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c5b-b","sha":"aa7494899e5c1a8d890c8a52c23cd57007395079"}},{"number":21,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c5b-c","sha":"da1c000ddaefd26136d41373225a2f5d7fe64af3"}}]},{"id":623093,"number":18,"node_id":"PRS_kwDOUEXIf84ACYH1","url":"https://api.github.com/repos/wavemm/kamal-tmp-no-anchor-controls-20260826/stacks/18","base":{"ref":"main"},"open":true,"created_at":"2026-08-26T00:37:07Z","pull_requests":[{"number":15,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c5a-a","sha":"135acfcc5fb38c7c84374853904a3cee0c2546a4"}},{"number":16,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c5a-b","sha":"20f9f1ee1f808017e26a83f5efe58dd443a0ccc7"}},{"number":17,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c5a-c","sha":"ef0714ea7582d8a689574acc3bcbc53eb1d09c27"}}]},{"id":623080,"number":14,"node_id":"PRS_kwDOUEXIf84ACYHo","url":"https://api.github.com/repos/wavemm/kamal-tmp-no-anchor-controls-20260826/stacks/14","base":{"ref":"main"},"open":true,"created_at":"2026-08-26T00:36:15Z","pull_requests":[{"number":11,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c4-a","sha":"c1ac79f834b02e7c2aa2d8cf8d5fc1073888ef68"}},{"number":12,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c4-b","sha":"81c4b5feaacc825068c6d3192f48d5caa86e09c4"}},{"number":13,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c4-c","sha":"4c584d532766bb8cd58ca5e6e55d50fd5b22ca23"}}]},{"id":623064,"number":10,"node_id":"PRS_kwDOUEXIf84ACYHY","url":"https://api.github.com/repos/wavemm/kamal-tmp-no-anchor-controls-20260826/stacks/10","base":{"ref":"main"},"open":true,"created_at":"2026-08-26T00:35:21Z","pull_requests":[{"number":7,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c3-a","sha":"9d8f422231958292fe737a2a6511bf0901354d19"}},{"number":8,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c3-b","sha":"49cf110e7b40194670be15837e62a1a10121d261"}},{"number":9,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c3-c","sha":"409f4f8da2dda2ce86f7df9acf062ffdad7c4683"}}]},{"id":623046,"number":6,"node_id":"PRS_kwDOUEXIf84ACYHG","url":"https://api.github.com/repos/wavemm/kamal-tmp-no-anchor-controls-20260826/stacks/6","base":{"ref":"main"},"open":true,"created_at":"2026-08-26T00:34:10Z","pull_requests":[{"number":3,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c2-a","sha":"b9a2e2035cdb60b91e7a6f7860f4dd0cfb6d8ed3"}},{"number":4,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c2-b","sha":"f94c1a823c54320a9873dff25691115b686ffc09"}},{"number":5,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c2-c","sha":"ea6f3c2181691084eee3a8c872622c9b7f282dea"}}]}]

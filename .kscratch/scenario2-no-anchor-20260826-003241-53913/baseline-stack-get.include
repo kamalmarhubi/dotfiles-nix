@@ -1,0 +1,29 @@
+HTTP/2.0 200 OK
+Access-Control-Allow-Origin: *
+Access-Control-Expose-Headers: ETag, Link, Location, Retry-After, X-GitHub-OTP, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Used, X-RateLimit-Resource, X-RateLimit-Reset, X-OAuth-Scopes, X-Accepted-OAuth-Scopes, X-Poll-Interval, X-GitHub-Media-Type, X-GitHub-SSO, X-GitHub-Request-Id, Deprecation, Sunset, Warning
+Cache-Control: private, max-age=60, s-maxage=60
+Content-Security-Policy: default-src 'none'
+Content-Type: application/json; charset=utf-8
+Date: Wed, 26 Aug 2026 00:35:04 GMT
+Etag: W/"1adb81beffa4e29103331ce9f85b1a2c08e67d92b18ea2355117e294820be0b6"
+Referrer-Policy: origin-when-cross-origin, strict-origin-when-cross-origin
+Server: github.com
+Strict-Transport-Security: max-age=31536000; includeSubdomains; preload
+Vary: Accept, Authorization, Cookie, X-GitHub-OTP,Accept-Encoding, Accept, X-Requested-With
+X-Accepted-Oauth-Scopes: 
+X-Content-Type-Options: nosniff
+X-Frame-Options: deny
+X-Github-Api-Version-Selected: 2022-11-28
+X-Github-Edge-Region: iad
+X-Github-Media-Type: github.v3; format=json
+X-Github-Request-Id: 5DED:65253:5177EDD:11077D17:6A8E34B8
+X-Oauth-Client-Id: 178c6fc778ccc68e1d6a
+X-Oauth-Scopes: gist, notifications, read:org, repo, workflow
+X-Ratelimit-Limit: 5000
+X-Ratelimit-Remaining: 4960
+X-Ratelimit-Reset: 1787707450
+X-Ratelimit-Resource: core
+X-Ratelimit-Used: 40
+X-Xss-Protection: 0
+
+{"id":623058,"number":3,"node_id":"PRS_kwDOUEXKbs4ACYHS","url":"https://api.github.com/repos/wavemm/kamal-tmp-jj-stack-no-anchor-20260826-003241-53913/stacks/3","base":{"ref":"main"},"open":true,"created_at":"2026-08-26T00:34:41Z","pull_requests":[{"url":"https://api.github.com/repos/wavemm/kamal-tmp-jj-stack-no-anchor-20260826-003241-53913/pulls/1","id":4362943135,"number":1,"head":{"ref":"fixture-a","sha":"87ba85fc4824414249f8e5b5a297b60d2fd12887","repo":{"id":1346751086,"url":"https://api.github.com/repos/wavemm/kamal-tmp-jj-stack-no-anchor-20260826-003241-53913","name":"kamal-tmp-jj-stack-no-anchor-20260826-003241-53913"}},"base":{"ref":"main","sha":"2b1d2da7ce3859fd7f3ad3145678c758484edebb","repo":{"id":1346751086,"url":"https://api.github.com/repos/wavemm/kamal-tmp-jj-stack-no-anchor-20260826-003241-53913","name":"kamal-tmp-jj-stack-no-anchor-20260826-003241-53913"}},"node_id":"PR_kwDOUEXKbs8AAAABBA06nw","title":"Scenario 2 A","state":"open","merged_at":null,"draft":false,"html_url":"https://github.com/wavemm/kamal-tmp-jj-stack-no-anchor-20260826-003241-53913/pull/1","user":{"login":"kamalmarhubi","id":50936,"node_id":"MDQ6VXNlcjUwOTM2","avatar_url":"https://avatars.githubusercontent.com/u/50936?v=4","gravatar_id":"","url":"https://api.github.com/users/kamalmarhubi","html_url":"https://github.com/kamalmarhubi","followers_url":"https://api.github.com/users/kamalmarhubi/followers","following_url":"https://api.github.com/users/kamalmarhubi/following{/other_user}","gists_url":"https://api.github.com/users/kamalmarhubi/gists{/gist_id}","starred_url":"https://api.github.com/users/kamalmarhubi/starred{/owner}{/repo}","subscriptions_url":"https://api.github.com/users/kamalmarhubi/subscriptions","organizations_url":"https://api.github.com/users/kamalmarhubi/orgs","repos_url":"https://api.github.com/users/kamalmarhubi/repos","events_url":"https://api.github.com/users/kamalmarhubi/events{/privacy}","received_events_url":"https://api.github.com/users/kamalmarhubi/received_events","type":"User","user_view_type":"public","site_admin":false}},{"url":"https://api.github.com/repos/wavemm/kamal-tmp-jj-stack-no-anchor-20260826-003241-53913/pulls/2","id":4362943320,"number":2,"head":{"ref":"fixture-b","sha":"19c6b8806089c7eb9c8c7be1496bf106b6a043f7","repo":{"id":1346751086,"url":"https://api.github.com/repos/wavemm/kamal-tmp-jj-stack-no-anchor-20260826-003241-53913","name":"kamal-tmp-jj-stack-no-anchor-20260826-003241-53913"}},"base":{"ref":"fixture-a","sha":"87ba85fc4824414249f8e5b5a297b60d2fd12887","repo":{"id":1346751086,"url":"https://api.github.com/repos/wavemm/kamal-tmp-jj-stack-no-anchor-20260826-003241-53913","name":"kamal-tmp-jj-stack-no-anchor-20260826-003241-53913"}},"node_id":"PR_kwDOUEXKbs8AAAABBA07WA","title":"Scenario 2 B","state":"open","merged_at":null,"draft":false,"html_url":"https://github.com/wavemm/kamal-tmp-jj-stack-no-anchor-20260826-003241-53913/pull/2","user":{"login":"kamalmarhubi","id":50936,"node_id":"MDQ6VXNlcjUwOTM2","avatar_url":"https://avatars.githubusercontent.com/u/50936?v=4","gravatar_id":"","url":"https://api.github.com/users/kamalmarhubi","html_url":"https://github.com/kamalmarhubi","followers_url":"https://api.github.com/users/kamalmarhubi/followers","following_url":"https://api.github.com/users/kamalmarhubi/following{/other_user}","gists_url":"https://api.github.com/users/kamalmarhubi/gists{/gist_id}","starred_url":"https://api.github.com/users/kamalmarhubi/starred{/owner}{/repo}","subscriptions_url":"https://api.github.com/users/kamalmarhubi/subscriptions","organizations_url":"https://api.github.com/users/kamalmarhubi/orgs","repos_url":"https://api.github.com/users/kamalmarhubi/repos","events_url":"https://api.github.com/users/kamalmarhubi/events{/privacy}","received_events_url":"https://api.github.com/users/kamalmarhubi/received_events","type":"User","user_view_type":"public","site_admin":false}}]}

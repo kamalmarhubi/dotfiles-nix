@@ -1,0 +1,2 @@
+5e3c18debf997a45510ff099d05ab9ba41d317c8a40f202a2f205a99f80fd860  /Users/kamal/.config/home-manager/.kscratch/kamal-tmp-no-anchor-controls-20260826/jj-stack-source
+5e3c18debf997a45510ff099d05ab9ba41d317c8a40f202a2f205a99f80fd860  files/jj/jj-stack

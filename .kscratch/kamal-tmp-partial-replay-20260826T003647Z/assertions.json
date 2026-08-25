@@ -1,0 +1,41 @@
+{
+  "behavior": "After real unstack, current code discovers all selected existing PRs from only trunk()..tip, recognizes stack-null state, and dry-run plans a new stack/relink without mutation. It does not recover/relink because dry-run was used; recovery remains unimplemented by this replay.",
+  "checks": {
+    "classified_new_stack": true,
+    "discovered_all_three_existing_prs": true,
+    "dry_run_requested": true,
+    "exact_selector_only": true,
+    "fetch_head_neutral": true,
+    "github_prs_neutral": true,
+    "jj_bookmarks_neutral": true,
+    "jj_op_neutral_immediate": true,
+    "jj_op_neutral_plus15": true,
+    "jj_status_neutral": true,
+    "no_relink_executed_after_fault": true,
+    "planned_relink": true,
+    "remote_refs_neutral": true,
+    "source_hash_matches": true,
+    "target_exit_zero": true,
+    "warned_unstacked": true,
+    "workspaces_neutral": true
+  },
+  "classification": "DISCOVERS_UNSTACKED_EXISTING_PRS_AND_PLANS_NEW_STACK",
+  "old_stack_number": 4,
+  "private": true,
+  "repo": "wavemm/kamal-tmp-partial-replay-20260826T003647Z",
+  "result": "PASS",
+  "retained": true,
+  "source_sha256": "5e3c18debf997a45510ff099d05ab9ba41d317c8a40f202a2f205a99f80fd860",
+  "target": {
+    "argv": [
+      "/Users/kamal/.config/home-manager/.kscratch/kamal-tmp-partial-replay-20260826T003647Z/jj-stack-source",
+      "push",
+      "--dry-run",
+      "trunk()..tip"
+    ],
+    "exit": 0,
+    "stderr": "Installed 2 packages in 50ms\nMode: publish local stack\n  topology: selected local boundaries are authoritative\n  pr-1: L=47fa1fbfd309 T=47fa1fbfd309 R=47fa1fbfd309\n  pr-2: L=542b71e76f81 T=542b71e76f81 R=542b71e76f81\n  pr-3: L=4ab8c1021f46 T=4ab8c1021f46 R=4ab8c1021f46\n  main: M=9f6823f0577d\nPlan: new stack\n  base: main at 9f6823f0577d; fork: 9f6823f0577d; first segment: 1 commit(s)\n  1. pr-1: reuse PR #1; readiness unchanged; 1 commit(s); sync title/body\n  2. pr-2: reuse PR #2; readiness unchanged; 1 commit(s); sync title/body\n  3. pr-3: reuse PR #3; readiness unchanged; 1 commit(s); sync title/body\n  warning: existing PRs are unstacked, so no merged prefix can be inferred; this would create a separate stack\n  push 3 canonical bookmark(s) to origin\n  note: merged selectors use exact historical Git OIDs; other patch-equivalent changes landed by squash or cherry-pick are not detected\n  (cd /Users/kamal/.config/home-manager/.kscratch/kamal-tmp-partial-replay-20260826T003647Z/repo/.git && GH_REPO=wavemm/kamal-tmp-partial-replay-20260826T003647Z gh stack link --remote origin --base main -- https://github.com/wavemm/kamal-tmp-partial-replay-20260826T003647Z/pull/1 https://github.com/wavemm/kamal-tmp-partial-replay-20260826T003647Z/pull/2 https://github.com/wavemm/kamal-tmp-partial-replay-20260826T003647Z/pull/3)\n  verify final refs, stack membership, order, metadata, readiness, and segments\n",
+    "stdout": ""
+  },
+  "uncertainty": "GraphQL captures record pageInfo; each fixture timeline fits in first 100 items. REST list/filter calls used --paginate."
+}

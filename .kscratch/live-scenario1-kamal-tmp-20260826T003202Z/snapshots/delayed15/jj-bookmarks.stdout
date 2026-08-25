@@ -1,0 +1,12 @@
+main: nvxqlnmr 18dc4c96 Base
+  @git: nvxqlnmr 18dc4c96 Base
+main@origin: upukmnuw 057be9cc Scenario 1 A (#1)
+scenario1-a: zuptokly 450a8576 Scenario 1 A
+  @git: zuptokly 450a8576 Scenario 1 A
+  @origin: zuptokly 450a8576 Scenario 1 A
+scenario1-b: symulwsp 88ffe532 Scenario 1 B
+  @git: symulwsp 88ffe532 Scenario 1 B
+  @origin: symulwsp 88ffe532 Scenario 1 B
+scenario1-c: tzzunlnp 907e45d8 Scenario 1 C
+  @git: tzzunlnp 907e45d8 Scenario 1 C
+  @origin: tzzunlnp 907e45d8 Scenario 1 C

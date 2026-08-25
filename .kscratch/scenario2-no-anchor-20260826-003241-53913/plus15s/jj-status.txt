@@ -1,0 +1,4 @@
+Working copy changes:
+A .kscratch/scenario2-no-anchor-20260826-003241-53913/repo/B.txt
+Working copy  (@) : ryowpnps 19c6b880 fixture-b | Scenario 2 B
+Parent commit (@-): ynqxxwnk 87ba85fc fixture-a | Scenario 2 A

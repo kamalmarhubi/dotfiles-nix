@@ -1,0 +1,29 @@
+HTTP/2.0 200 OK
+Access-Control-Allow-Origin: *
+Access-Control-Expose-Headers: ETag, Link, Location, Retry-After, X-GitHub-OTP, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Used, X-RateLimit-Resource, X-RateLimit-Reset, X-OAuth-Scopes, X-Accepted-OAuth-Scopes, X-Poll-Interval, X-GitHub-Media-Type, X-GitHub-SSO, X-GitHub-Request-Id, Deprecation, Sunset, Warning
+Cache-Control: private, max-age=60, s-maxage=60
+Content-Security-Policy: default-src 'none'
+Content-Type: application/json; charset=utf-8
+Date: Wed, 26 Aug 2026 00:44:27 GMT
+Etag: W/"831b5849d545b46b30c83660b202c9ec170b156b4329101d68ad9b1a405b2c3e"
+Referrer-Policy: origin-when-cross-origin, strict-origin-when-cross-origin
+Server: github.com
+Strict-Transport-Security: max-age=31536000; includeSubdomains; preload
+Vary: Accept, Authorization, Cookie, X-GitHub-OTP,Accept-Encoding, Accept, X-Requested-With
+X-Accepted-Oauth-Scopes: repo
+X-Content-Type-Options: nosniff
+X-Frame-Options: deny
+X-Github-Api-Version-Selected: 2022-11-28
+X-Github-Edge-Region: iad
+X-Github-Media-Type: github.v3; format=json
+X-Github-Request-Id: 5DFE:336E42:26D9D9A:8050359:6A8E36E8
+X-Oauth-Client-Id: 178c6fc778ccc68e1d6a
+X-Oauth-Scopes: gist, notifications, read:org, repo, workflow
+X-Ratelimit-Limit: 5000
+X-Ratelimit-Remaining: 4926
+X-Ratelimit-Reset: 1787708457
+X-Ratelimit-Resource: core
+X-Ratelimit-Used: 74
+X-Xss-Protection: 0
+
+[{"sha":"aa7494899e5c1a8d890c8a52c23cd57007395079","node_id":"C_kwDOUEXIf9oAKGFhNzQ5NDg5OWU1YzFhOGQ4OTBjOGE1MmMyM2NkNTcwMDczOTUwNzk","url":"https://api.github.com/repos/wavemm/kamal-tmp-no-anchor-controls-20260826/git/commits/aa7494899e5c1a8d890c8a52c23cd57007395079","html_url":"https://github.com/wavemm/kamal-tmp-no-anchor-controls-20260826/commit/aa7494899e5c1a8d890c8a52c23cd57007395079","author":{"name":"Kamal Marhubi","email":"kamal@example.invalid","date":"2026-08-26T00:33:11Z"},"committer":{"name":"Kamal Marhubi","email":"kamal@example.invalid","date":"2026-08-26T00:33:11Z"},"tree":{"sha":"f13b8553759950a06f954f98abbc0abc8e7ab042","url":"https://api.github.com/repos/wavemm/kamal-tmp-no-anchor-controls-20260826/git/trees/f13b8553759950a06f954f98abbc0abc8e7ab042"},"message":"c5b B\n\nAmp-Thread-ID: https://ampcode.com/threads/T-01a034cf-01ea-70c9-a839-3dc1c9303c87\nCo-authored-by: Amp <amp@ampcode.com>","parents":[{"sha":"02b571a67c167080d8ad640073bc2a0e218079ca","url":"https://api.github.com/repos/wavemm/kamal-tmp-no-anchor-controls-20260826/git/commits/02b571a67c167080d8ad640073bc2a0e218079ca","html_url":"https://github.com/wavemm/kamal-tmp-no-anchor-controls-20260826/commit/02b571a67c167080d8ad640073bc2a0e218079ca"}],"verification":{"verified":false,"reason":"unsigned","signature":null,"payload":null,"verified_at":null},"event":"committed"},{"id":30014217902,"node_id":"RTE_lADOUEXIf88AAAABOQxvs88AAAAG_Pyerg","url":"https://api.github.com/repos/wavemm/kamal-tmp-no-anchor-controls-20260826/issues/events/30014217902","actor":{"login":"kamalmarhubi","id":50936,"node_id":"MDQ6VXNlcjUwOTM2","avatar_url":"https://avatars.githubusercontent.com/u/50936?v=4","gravatar_id":"","url":"https://api.github.com/users/kamalmarhubi","html_url":"https://github.com/kamalmarhubi","followers_url":"https://api.github.com/users/kamalmarhubi/followers","following_url":"https://api.github.com/users/kamalmarhubi/following{/other_user}","gists_url":"https://api.github.com/users/kamalmarhubi/gists{/gist_id}","starred_url":"https://api.github.com/users/kamalmarhubi/starred{/owner}{/repo}","subscriptions_url":"https://api.github.com/users/kamalmarhubi/subscriptions","organizations_url":"https://api.github.com/users/kamalmarhubi/orgs","repos_url":"https://api.github.com/users/kamalmarhubi/repos","events_url":"https://api.github.com/users/kamalmarhubi/events{/privacy}","received_events_url":"https://api.github.com/users/kamalmarhubi/received_events","type":"User","user_view_type":"public","site_admin":false},"event":"renamed","commit_id":null,"commit_url":null,"created_at":"2026-08-26T00:38:11Z","rename":{"from":"c5b b","to":"c5b B"},"performed_via_github_app":null}]

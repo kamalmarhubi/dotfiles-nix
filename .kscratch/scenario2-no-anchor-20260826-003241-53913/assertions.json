@@ -1,0 +1,20 @@
+{
+  "checks": {
+    "exact_old_number_recovery_failed": true,
+    "new_stack_number_differs": true,
+    "old_stack_absent_plus15s": true,
+    "old_stack_get_404_plus15s": true,
+    "order_preserved": true,
+    "pr_identity_preserved": true,
+    "pr_metadata_readiness_preserved": true,
+    "unstack_exit_0": true
+  },
+  "classification": "old-number-not-recoverable-pr-identity-and-order-reusable",
+  "exact_old_number_primitive": "gh stack link OLD A_URL B_URL",
+  "new_stack_number": 4,
+  "old_stack_number": 3,
+  "repository": "wavemm/kamal-tmp-jj-stack-no-anchor-20260826-003241-53913",
+  "result": "PASS",
+  "retained": true,
+  "timeline_note": "Base-ref timeline events are historical/heuristic evidence only; stack REST list/get are authoritative for deletion and replacement."
+}

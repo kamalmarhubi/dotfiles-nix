@@ -1,0 +1,135 @@
+18dc4c96921ca9a7e4a0e571b3a919541b379423 refs/heads/main
+450a8576359864cddf2db92e3eea4e0a85cd0d3d refs/heads/scenario1-a
+6841cb3a05547069d70b8b641a973d46e9fb94fc refs/heads/scenario1-b
+10bbba76fbe56de226676243eac7ddffc38e7dfd refs/heads/scenario1-c
+059848eb4e4f34a8d066339dfbd22dacba2a1be8 refs/jj/keep/059848eb4e4f34a8d066339dfbd22dacba2a1be8
+10bbba76fbe56de226676243eac7ddffc38e7dfd refs/jj/keep/10bbba76fbe56de226676243eac7ddffc38e7dfd
+18dc4c96921ca9a7e4a0e571b3a919541b379423 refs/jj/keep/18dc4c96921ca9a7e4a0e571b3a919541b379423
+19daa7119e728715e9c299e1a2017380fc6ef367 refs/jj/keep/19daa7119e728715e9c299e1a2017380fc6ef367
+23df9555a4ce744817fd86383a0567bfc0286443 refs/jj/keep/23df9555a4ce744817fd86383a0567bfc0286443
+2eedc21c4235dfe84a441136860d134cd412fb64 refs/jj/keep/2eedc21c4235dfe84a441136860d134cd412fb64
+450a8576359864cddf2db92e3eea4e0a85cd0d3d refs/jj/keep/450a8576359864cddf2db92e3eea4e0a85cd0d3d
+4c47c82b2c6fd8d01862f4cb3d6eef661705cc64 refs/jj/keep/4c47c82b2c6fd8d01862f4cb3d6eef661705cc64
+6841cb3a05547069d70b8b641a973d46e9fb94fc refs/jj/keep/6841cb3a05547069d70b8b641a973d46e9fb94fc
+7ef55aa3fec4faf0f24bf7a897b567ce8a0159da refs/jj/keep/7ef55aa3fec4faf0f24bf7a897b567ce8a0159da
+becdd1c82e6c200cace691e20d28609ee9124b83 refs/jj/keep/becdd1c82e6c200cace691e20d28609ee9124b83
+e0bc47bde0bd13f4466792fed1e8cdbccc95e55c refs/jj/keep/e0bc47bde0bd13f4466792fed1e8cdbccc95e55c
+057be9ccb461a65f29940b14cf6fc6abca3bfa5a refs/remotes/origin/main
+450a8576359864cddf2db92e3eea4e0a85cd0d3d refs/remotes/origin/scenario1-a
+88ffe53221a2021e48cb47e925538e3290e1716a refs/remotes/origin/scenario1-b
+907e45d88985ccf80af2a80c50d257a959456cf5 refs/remotes/origin/scenario1-c
+TOPOLOGY
+* 907e45d (origin/scenario1-c) Scenario 1 C
+* 88ffe53 (origin/scenario1-b) Scenario 1 B
+* 057be9c (origin/main) Scenario 1 A (#1)
+| * 23df955 
+| * 10bbba7 (HEAD, scenario1-c) Scenario 1 C
+| | * 4c47c82 
+| |/  
+| | * 7ef55aa 
+| | | * e0bc47b 
+| | |/  
+| |/|   
+| * | 6841cb3 (scenario1-b) Scenario 1 B
+| |/  
+| | * 059848e 
+| | * 19daa71 
+| |/  
+|/|   
+| | * 2eedc21 
+| |/  
+| * 450a857 (origin/scenario1-a, scenario1-a) Scenario 1 A
+|/  
+| * becdd1c 
+|/  
+* 18dc4c9 (main) Base
+RAW
+===origin/main
+tree 04d8eb99d8a38774942f315be4b29d352914e4af
+parent 18dc4c96921ca9a7e4a0e571b3a919541b379423
+author Kamal Al Marhubi <kamal@marhubi.com> 1787704461 -0400
+committer GitHub <noreply@github.com> 1787704461 -0400
+gpgsig -----BEGIN PGP SIGNATURE-----
+ 
+ wsFcBAABCAAQBQJqjjSNCRC1aQ7uu5UhlAAAGsQQAC+W2m87POw0BOv9Ss4fGmor
+ h8kpu2qe3XF935XIMU3Bhw6RBXxobL1vFaSI9evyCCnitDfoZ4SYpuRSstaoFGzo
+ G/XCE0IfQH3UHHP3nycUnydJ4K84ewFFEo6Vn/jvX11Gz5FaA1iuosyw7vAa/j63
+ VDlgcscj8O6uakrYCUPVEV08lxTHah5A6ZQmK7XcV+Lr+hGZtlARNmNUkXaNMU6y
+ MWdk7jHo0fAV4eD4oFwq1/1yj28OCeUqCuUnou3ZHOEWQbuUNETN9kzNM4TUpcNg
+ JV6DMt7c3kVngejybHHIfZoU2rtSuyxwO+eo5WbHuiERuvXXxSnXVKUDu6PWAMpQ
+ 2FIL9addMmgYRoJDPM+WLRTEts3KkLAApwlVCooz+CiYzgGkoQGhAn67MnJNpfOD
+ l3mkF7TEVnLcWt7tw8Ji3zRnjS4yv7jfSr5RErAieyanLbrE/72lfaSaaaelOmnd
+ e3y5a1WDUq8PN/BQ4Ej5upomE7v1PIBTxQO1Fm6GbFdsuVtPq1oGzfHTB4rVUgkN
+ 2pJzcubXI6B4c0mK+uPoFlrLe95/5dYPksLtOy2tPHj9+bM3VH+VZjC3JVl3YF3Y
+ xMAtRxnpQXPnjJmzizrQB7ExNd8QkwHKJy7oBuqC1PLNPBGbzw7Gr2VWQhpFt5G4
+ 7rjll9BzOmkkiIyw1oE/
+ =0q5l
+ -----END PGP SIGNATURE-----
+ 
+
+Scenario 1 A (#1)===origin/scenario1-a
+tree 04d8eb99d8a38774942f315be4b29d352914e4af
+parent 18dc4c96921ca9a7e4a0e571b3a919541b379423
+author Kamal Al Marhubi <kamal@marhubi.com> 1787704350 -0400
+committer Kamal Al Marhubi <kamal@marhubi.com> 1787704350 -0400
+change-id zuptoklyzwyuvrxxlwtnnrzoovsprzzu
+
+Scenario 1 A
+===origin/scenario1-b
+tree 97224111b3210b09ad6fd4e906d93d25fb421213
+parent 057be9ccb461a65f29940b14cf6fc6abca3bfa5a
+author Kamal Al Marhubi <kamal@marhubi.com> 1787704351 -0400
+committer Kamal Al Marhubi <kamal@marhubi.com> 1787704463 -0400
+change-id symulwspmkqstrptwnnyorsvwqwloyor
+
+Scenario 1 B
+===origin/scenario1-c
+tree 2f267c3eb16c41fa207d278ba15fc91d1ced6405
+parent 88ffe53221a2021e48cb47e925538e3290e1716a
+author Kamal Al Marhubi <kamal@marhubi.com> 1787704351 -0400
+committer Kamal Al Marhubi <kamal@marhubi.com> 1787704464 -0400
+change-id tzzunlnpxlqsuwxxzttlxpytskpzvllm
+
+Scenario 1 C
+PATCHIDS
+778328b704e242657e2a8e8ffbe275d2048d6789 0000000000000000000000000000000000000000
+4d72b231c6c01c423a3322b737c57c74e405e477 0000000000000000000000000000000000000000
+c4c9b1a3452af2397129917e7acb2d4340c2752f 0000000000000000000000000000000000000000
+JJ
+Updated 2 rewritten commits.
+Rebased 1 descendant commits off of commits rewritten from Git.
+Working copy  (@) now at: xqtxlyov db3bea37 (empty) (no description set)
+Parent commit (@-)      : tzzunlnp 907e45d8 scenario1-c | Scenario 1 C
+Done importing changes from the underlying Git repo.
+324ebfd0c236f6ee560feb4cdd97b24dd5fea0581c8680dd924c44ea630171a67285419fb5df23df8fc860465c64c16f7306af270440f27ea1a227c5077cf847 import git refs
+94fe89be5a0bd92b4d0dad8d8b742b8b83486c4f8519cac491f81b606c0615b6ba7ac39bf42c392c5cdd1c7f395c64283c7c5eb1545afc0978f92a794663c41c track remote bookmark scenario1-a@origin, scenario1-b@origin, scenario1-c@origin
+407104051ad15674978f6a932048775f3405f3f4501e141c7c566147c86cd2b4b77d5bee198521e04a99dcf584bec92b093a0b8efa540115793c33b6c03b4b98 import git refs
+cf8fffff5c43cd8403150df3a821474ba0aea3fb1338f030e3f5b9dc38259fe97503da23ca09ccbd4e90af270dc2d051efaf31720f4b5f70ab5ccb095e5b5639 create bookmark scenario1-c pointing to commit 10bbba76fbe56de226676243eac7ddffc38e7dfd
+0d2ed3052e21b26d31c4d8939d7db86ab12fd52085abaf6dbac6d02bb75c947012a130f02a903f3d27f7142a00f0709daa9d191c46f25177f2869998e9b52391 commit 4c47c82b2c6fd8d01862f4cb3d6eef661705cc64
+ef6c1a227375cf9fbf803522a25da424dcb22a9dba8c6c65c68699617bac4aecac86f820c9624b2e2a15d4e6af8e13e4e03fd141a1b612de133d97aebcc4a48c snapshot working copy
+a266ac56a83714b45d5dcdab0434bd1141ac8b415efa950214e7ce0b045012f403863405f1ff771dc01178a573f49c6f4d027dfdcd478dd44cde06a3071a0c5f create bookmark scenario1-b pointing to commit 6841cb3a05547069d70b8b641a973d46e9fb94fc
+f8956470105f0b6fe7cbada5baae74e1d42c71fb6d40b9f3d3b72707df6bdbf7ed7fda310a5a869fb1d424b235a6755c2d937b6216ce049f1882eb268519dd74 commit 7ef55aa3fec4faf0f24bf7a897b567ce8a0159da
+76e428bb588eb80800987442caaf3fd30bf0b0b5592f46709b888c022e06c5e1e51c744e6ae8f8eed96240c797ab7e06894df2bbe0fbe60363ea5ef5275ee789 snapshot working copy
+89a6af2b38438fd473d4aec068e4d7a6d8a5031ae78172b599bd8972c41a0097577d52c26fb95e104a32ac6fb76ea47d33047ad2d472657dab572fb343ffb624 create bookmark scenario1-a pointing to commit 450a8576359864cddf2db92e3eea4e0a85cd0d3d
+ed536ffe855aa97514c4741fd9003ec2fa4e131d0ce54d3fb952deea1a1bcd6968825d20b8443ded738d3a43d34e09d60e45ffe7383c0fc211c350530d5c18a6 commit 19daa7119e728715e9c299e1a2017380fc6ef367
+0a3f0a5905c2023c41f2f27db05d15856461cfc081dfc98683fee402044567a51eab23cc203e73e9a81c7ccc52473b9685ff7a1dbba533931dbb66b20c3ad167 snapshot working copy
+ae6e251d9651e968e9adec25886ba30a598005dc65438e3a87047e3d9b42148c6ba211e3937ecb51ad52e7274c158fc2bb0bc0c7470249087a2d23e30a05205d import git head
+371067fcf0498ed5cbb5c1d72985440701dc8b52c9a965fb5ebac09ecf8ca0fbf51d483d25cf42e7fe07bbb15ea131c2623f83af035d8a6ea8cab444cdca2229 import git refs
+acbc6f7d1d97b69d969acbfcbab3ceb917859c2928fdf7d1ee50eb1f28c32995a0349e07c0a0ec309cf3e0c78504f831aa40222c9e293b8ddb7445cb36f8043c add workspace 'default'
+00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 
+The working copy has no changes.
+Working copy  (@) : xqtxlyov db3bea37 (empty) (no description set)
+Parent commit (@-): tzzunlnp 907e45d8 scenario1-c | Scenario 1 C
+main: nvxqlnmr 18dc4c96 Base
+  @git: nvxqlnmr 18dc4c96 Base
+main@origin: upukmnuw 057be9cc Scenario 1 A (#1)
+scenario1-a: zuptokly 450a8576 Scenario 1 A
+  @git: zuptokly 450a8576 Scenario 1 A
+  @origin: zuptokly 450a8576 Scenario 1 A
+scenario1-b: symulwsp 88ffe532 Scenario 1 B
+  @git: symulwsp 88ffe532 Scenario 1 B
+  @origin: symulwsp 88ffe532 Scenario 1 B
+scenario1-c: tzzunlnp 907e45d8 Scenario 1 C
+  @git: tzzunlnp 907e45d8 Scenario 1 C
+  @origin: tzzunlnp 907e45d8 Scenario 1 C
+default: . xqtxlyov db3bea37 (empty) (no description set)

@@ -1,0 +1,6 @@
+[
+  "/Users/kamal/.config/home-manager/.kscratch/kamal-tmp-partial-replay-20260826T003211Z/jj-stack-source",
+  "push",
+  "--dry-run",
+  "trunk()..tip"
+]

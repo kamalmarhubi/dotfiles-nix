@@ -1,0 +1,8 @@
+{"at": "2026-08-26T00:32:13.184782+00:00", "event": "session-created"}
+{"at": "2026-08-26T00:32:26.099719+00:00", "event": "fixture-prepared", "new_tip": "e054734a0b104cbfb5eef4fb509f29e388ed9bea", "old_tip": "e054734a0b104cbfb5eef4fb509f29e388ed9bea", "repaired": 0}
+{"at": "2026-08-26T00:34:29.820652+00:00", "event": "snapshot", "label": "baseline"}
+{"argv": ["gh", "stack", "unstack", "5"], "at": "2026-08-26T00:34:55.131080+00:00", "cwd": "/Users/kamal/.config/home-manager/.kscratch/kamal-tmp-partial-replay-20260826T003211Z/repo", "event": "command", "exit": 0, "name": "unstack"}
+{"at": "2026-08-26T00:35:09.359193+00:00", "event": "snapshot", "label": "stack-null-immediate"}
+{"argv": ["/Users/kamal/.config/home-manager/.kscratch/kamal-tmp-partial-replay-20260826T003211Z/jj-stack-source", "push", "--dry-run", "trunk()..tip"], "at": "2026-08-26T00:35:28.380193+00:00", "cwd": "/Users/kamal/.config/home-manager/.kscratch/kamal-tmp-partial-replay-20260826T003211Z/repo", "event": "command", "exit": 1, "name": "target-dry-run"}
+{"at": "2026-08-26T00:35:40.054949+00:00", "event": "snapshot", "label": "post-target-immediate"}
+{"at": "2026-08-26T00:36:19.802010+00:00", "event": "snapshot", "label": "post-target-plus15"}

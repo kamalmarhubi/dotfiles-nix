@@ -1,0 +1,1 @@
+gh stack link --base main --open pr-0 pr-1 pr-2 pr-3

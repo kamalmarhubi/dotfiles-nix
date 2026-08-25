@@ -1,0 +1,30 @@
+HTTP/2.0 200 OK
+Access-Control-Allow-Origin: *
+Access-Control-Expose-Headers: ETag, Link, Location, Retry-After, X-GitHub-OTP, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Used, X-RateLimit-Resource, X-RateLimit-Reset, X-OAuth-Scopes, X-Accepted-OAuth-Scopes, X-Poll-Interval, X-GitHub-Media-Type, X-GitHub-SSO, X-GitHub-Request-Id, Deprecation, Sunset, Warning
+Cache-Control: private, max-age=60, s-maxage=60
+Content-Security-Policy: default-src 'none'
+Content-Type: application/json; charset=utf-8
+Date: Wed, 26 Aug 2026 00:40:06 GMT
+Etag: W/"6d76be85942b4ec59c4b7f7ff066117ca7e92b569e725083326f3d364e6130e5"
+Link: <https://api.github.com/repositories/1346750591/stacks?per_page=2&page=1>; rel="prev", <https://api.github.com/repositories/1346750591/stacks?per_page=2&page=3>; rel="next", <https://api.github.com/repositories/1346750591/stacks?per_page=2&page=3>; rel="last", <https://api.github.com/repositories/1346750591/stacks?per_page=2&page=1>; rel="first"
+Referrer-Policy: origin-when-cross-origin, strict-origin-when-cross-origin
+Server: github.com
+Strict-Transport-Security: max-age=31536000; includeSubdomains; preload
+Vary: Accept, Authorization, Cookie, X-GitHub-OTP,Accept-Encoding, Accept, X-Requested-With
+X-Accepted-Oauth-Scopes: 
+X-Content-Type-Options: nosniff
+X-Frame-Options: deny
+X-Github-Api-Version-Selected: 2022-11-28
+X-Github-Edge-Region: iad
+X-Github-Media-Type: github.v3; format=json
+X-Github-Request-Id: 5DE8:110215:2821130:84837DF:6A8E35E6
+X-Oauth-Client-Id: 178c6fc778ccc68e1d6a
+X-Oauth-Scopes: gist, notifications, read:org, repo, workflow
+X-Ratelimit-Limit: 5000
+X-Ratelimit-Remaining: 4862
+X-Ratelimit-Reset: 1787707450
+X-Ratelimit-Resource: core
+X-Ratelimit-Used: 138
+X-Xss-Protection: 0
+
+[{"id":623080,"number":14,"node_id":"PRS_kwDOUEXIf84ACYHo","url":"https://api.github.com/repos/wavemm/kamal-tmp-no-anchor-controls-20260826/stacks/14","base":{"ref":"main"},"open":true,"created_at":"2026-08-26T00:36:15Z","pull_requests":[{"number":11,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c4-a","sha":"c1ac79f834b02e7c2aa2d8cf8d5fc1073888ef68"}},{"number":12,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c4-b","sha":"81c4b5feaacc825068c6d3192f48d5caa86e09c4"}},{"number":13,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c4-c","sha":"4c584d532766bb8cd58ca5e6e55d50fd5b22ca23"}}]},{"id":623064,"number":10,"node_id":"PRS_kwDOUEXIf84ACYHY","url":"https://api.github.com/repos/wavemm/kamal-tmp-no-anchor-controls-20260826/stacks/10","base":{"ref":"main"},"open":true,"created_at":"2026-08-26T00:35:21Z","pull_requests":[{"number":7,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c3-a","sha":"9d8f422231958292fe737a2a6511bf0901354d19"}},{"number":8,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c3-b","sha":"49cf110e7b40194670be15837e62a1a10121d261"}},{"number":9,"state":"open","draft":true,"merged_at":null,"head":{"ref":"c3-c","sha":"409f4f8da2dda2ce86f7df9acf062ffdad7c4683"}}]}]

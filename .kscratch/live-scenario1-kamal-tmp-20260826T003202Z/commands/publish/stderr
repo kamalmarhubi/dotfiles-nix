@@ -1,0 +1,24 @@
+Installed 2 packages in 5ms
+Mode: publish local stack
+  topology: selected local boundaries are authoritative
+  main: M=18dc4c96921c
+Plan: new stack
+  base: main at 18dc4c96921c; fork: 18dc4c96921c; first segment: 1 commit(s)
+  1. scenario1-a: create draft PR; readiness draft; 1 commit(s); sync title/body
+  2. scenario1-b: create draft PR; readiness draft; 1 commit(s); sync title/body
+  3. scenario1-c: create draft PR; readiness draft; 1 commit(s); sync title/body
+  push 3 canonical bookmark(s) to origin
+  note: merged selectors use exact historical Git OIDs; other patch-equivalent changes landed by squash or cherry-pick are not detected
+Preflight atomic push:
+To https://github.com/wavemm/kamal-tmp-scenario1-20260826T003202Z.git
+ * [new branch]      450a8576359864cddf2db92e3eea4e0a85cd0d3d -> scenario1-a
+ * [new branch]      6841cb3a05547069d70b8b641a973d46e9fb94fc -> scenario1-b
+ * [new branch]      10bbba76fbe56de226676243eac7ddffc38e7dfd -> scenario1-c
+Checking existing stacks...
+Pushing 3 branches to origin...
+Looking up PRs for 3 branches...
+Creating 3 PRs...
+✓ Created PR #1 for scenario1-a (base: main)
+✓ Created PR #2 for scenario1-b (base: scenario1-a)
+✓ Created PR #3 for scenario1-c (base: scenario1-b)
+✓ Created stack with 3 PRs (stack #4)

@@ -1,0 +1,17 @@
+Installed 2 packages in 50ms
+Mode: publish local stack
+  topology: selected local boundaries are authoritative
+  pr-1: L=47fa1fbfd309 T=47fa1fbfd309 R=47fa1fbfd309
+  pr-2: L=542b71e76f81 T=542b71e76f81 R=542b71e76f81
+  pr-3: L=4ab8c1021f46 T=4ab8c1021f46 R=4ab8c1021f46
+  main: M=9f6823f0577d
+Plan: new stack
+  base: main at 9f6823f0577d; fork: 9f6823f0577d; first segment: 1 commit(s)
+  1. pr-1: reuse PR #1; readiness unchanged; 1 commit(s); sync title/body
+  2. pr-2: reuse PR #2; readiness unchanged; 1 commit(s); sync title/body
+  3. pr-3: reuse PR #3; readiness unchanged; 1 commit(s); sync title/body
+  warning: existing PRs are unstacked, so no merged prefix can be inferred; this would create a separate stack
+  push 3 canonical bookmark(s) to origin
+  note: merged selectors use exact historical Git OIDs; other patch-equivalent changes landed by squash or cherry-pick are not detected
+  (cd /Users/kamal/.config/home-manager/.kscratch/kamal-tmp-partial-replay-20260826T003647Z/repo/.git && GH_REPO=wavemm/kamal-tmp-partial-replay-20260826T003647Z gh stack link --remote origin --base main -- https://github.com/wavemm/kamal-tmp-partial-replay-20260826T003647Z/pull/1 https://github.com/wavemm/kamal-tmp-partial-replay-20260826T003647Z/pull/2 https://github.com/wavemm/kamal-tmp-partial-replay-20260826T003647Z/pull/3)
+  verify final refs, stack membership, order, metadata, readiness, and segments

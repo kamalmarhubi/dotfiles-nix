@@ -1,0 +1,35 @@
+{
+  "outcome": "PASS",
+  "scenario": 1,
+  "source_sha256": "5e3c18debf997a45510ff099d05ab9ba41d317c8a40f202a2f205a99f80fd860",
+  "repo": "wavemm/kamal-tmp-scenario1-20260826T003202Z",
+  "private": true,
+  "retained": true,
+  "stack": {"id": 623034, "number": 4, "node_id": "PRS_kwDOUEXHiM4ACYG6"},
+  "initial_oids": {"main":"18dc4c96921ca9a7e4a0e571b3a919541b379423","A":"450a8576359864cddf2db92e3eea4e0a85cd0d3d","B":"6841cb3a05547069d70b8b641a973d46e9fb94fc","C":"10bbba76fbe56de226676243eac7ddffc38e7dfd"},
+  "post_merge": {"main":"057be9ccb461a65f29940b14cf6fc6abca3bfa5a","A_head":"450a8576359864cddf2db92e3eea4e0a85cd0d3d","B_head":"88ffe53221a2021e48cb47e925538e3290e1716a","C_head":"907e45d88985ccf80af2a80c50d257a959456cf5"},
+  "unstack_assertions": {
+    "old_stack_remained": true,
+    "old_stack_exact_id_retained": true,
+    "old_stack_open_after_unstack": false,
+    "old_stack_members_after_unstack": [1],
+    "B_filter_empty_immediate_and_delayed": true,
+    "C_filter_empty_immediate_and_delayed": true,
+    "B_C_uniquely_attached_to_merged_A_by_current_base_oid_topology": false,
+    "mechanical_reason": "B base was main at squash merge 057be9c, not A ref/OID 450a857; C base was B head 88ffe53. Thus B/C formed a chain rooted at current main, but current refs/OID ancestry did not uniquely identify merged PR A."
+  },
+  "inference_warning": "BaseRefChangedEvent and REST issue timeline base_ref_changed entries contain no stack ID. Any membership conclusion from those events is explicitly heuristic, not membership proof; membership assertions here use GET stacks/{id} and stacks?pull_request filters.",
+  "relink": {
+    "command": ["gh","stack","link","4","https://github.com/wavemm/kamal-tmp-scenario1-20260826T003202Z/pull/2","https://github.com/wavemm/kamal-tmp-scenario1-20260826T003202Z/pull/3"],
+    "exit": 0,
+    "old_stack_id_number_retained": true,
+    "final_order": [1,2,3],
+    "delayed_stable": true,
+    "B_C_node_identity_preserved": true,
+    "B_C_ready_preserved": true,
+    "B_C_title_body_head_preserved": true,
+    "base_metadata": "B intentionally changed main -> scenario1-a by relink; C remained scenario1-b"
+  },
+  "graphql_base_event": {"pr":2,"previousRefName":"main","currentRefName":"scenario1-a","createdAt":"2026-08-26T00:37:16Z","actor":"kamalmarhubi"},
+  "jj_operation_fixture": "cf8fffff5c43cd8403150df3a821474ba0aea3fb1338f030e3f5b9dc38259fe97503da23ca09ccbd4e90af270dc2d051efaf31720f4b5f70ab5ccb095e5b5639"
+}
