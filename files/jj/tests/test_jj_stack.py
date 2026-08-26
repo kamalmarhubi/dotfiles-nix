@@ -2017,9 +2017,7 @@ def test_consequential_plan_requires_confirmation_noninteractively(monkeypatch):
         script.sys, "stdin", type("Stdin", (), {"isatty": lambda _self: False})()
     )
 
-    assert script.requires_confirmation(
-        plan, stack, script.ReconciliationKind.NORMAL_PUBLISH, None
-    )
+    assert script.requires_confirmation(plan, stack, None, local_rewrite=False)
     with pytest.raises(script.Error, match="rerun with --yes"):
         script.authorize_plan(required=True, plan_only=False, yes=False)
     script.authorize_plan(required=True, plan_only=True, yes=False)
@@ -2062,14 +2060,24 @@ def test_routine_plans_do_not_require_confirmation():
     existing = pull_request(script, "a", 1)
     stack = script.StackSnapshot("STACK_7", 7, [existing], {"a": existing})
 
-    assert not script.requires_confirmation(
-        new, empty, script.ReconciliationKind.NORMAL_PUBLISH, None
+    assert not script.requires_confirmation(new, empty, None, local_rewrite=False)
+    assert not script.requires_confirmation(append, stack, None, local_rewrite=False)
+    assert script.requires_confirmation(append, stack, None, local_rewrite=True)
+
+
+def test_amended_head_only_requires_rewrite_when_fork_is_stale():
+    script = load_script()
+    current = script.Selection(("a",), ("a",), "base", "a")
+    stale = script.Selection(("a",), ("a",), "old-base", "a")
+
+    assert not script.needs_local_rewrite(
+        script.ReconciliationKind.LOCAL_AUTHORITY, current, "base"
     )
-    assert not script.requires_confirmation(
-        append, stack, script.ReconciliationKind.NORMAL_PUBLISH, None
+    assert script.needs_local_rewrite(
+        script.ReconciliationKind.LOCAL_AUTHORITY, stale, "base"
     )
-    assert not script.requires_confirmation(
-        append, stack, script.ReconciliationKind.REMOTE_ADOPT, None
+    assert not script.needs_local_rewrite(
+        script.ReconciliationKind.NORMAL_PUBLISH, stale, "base"
     )
 
 
@@ -2087,9 +2095,7 @@ def test_omitted_prs_are_covered_by_unified_confirmation():
         False,
     )
     stack = script.StackSnapshot("STACK_7", 7, [first, second])
-    assert script.requires_confirmation(
-        plan, stack, script.ReconciliationKind.NORMAL_PUBLISH, None
-    )
+    assert script.requires_confirmation(plan, stack, None, local_rewrite=False)
     script.validate_close_targets(plan, frozenset({12}))
 
     with pytest.raises(script.Error, match="not an omitted open PR"):

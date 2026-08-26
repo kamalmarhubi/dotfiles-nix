@@ -2490,11 +2490,12 @@ def print_plan(
 def requires_confirmation(
     plan: Plan,
     stack: StackSnapshot,
-    reconciliation: ReconciliationKind,
     recovery: RecoveryEvidence | None,
+    *,
+    local_rewrite: bool,
 ) -> bool:
     return bool(
-        reconciliation is ReconciliationKind.LOCAL_AUTHORITY
+        local_rewrite
         or plan.boundary
         or plan.kind
         in {
@@ -2504,6 +2505,18 @@ def requires_confirmation(
         or plan.omitted
         or recovery is not None
         or (plan.kind is TopologyKind.NEW and stack.discovered)
+    )
+
+
+def needs_local_rewrite(
+    reconciliation: ReconciliationKind,
+    selection: Selection | None,
+    base_oid: str,
+) -> bool:
+    return bool(
+        reconciliation is ReconciliationKind.LOCAL_AUTHORITY
+        and selection is not None
+        and selection.fork != base_oid
     )
 
 
@@ -3243,9 +3256,9 @@ def main() -> None:
     validate_close_targets(initial_plan, close_numbers)
     verify_unstackable(initial_plan, stack)
     closure = None
-    if reconciliation is ReconciliationKind.LOCAL_AUTHORITY:
-        if selection is None:
-            raise Error("local reconciliation requires a nonempty open suffix")
+    local_rewrite = needs_local_rewrite(reconciliation, selection, base_oid)
+    if local_rewrite:
+        assert selection is not None
         closure = capture_closure(selection.commits[0])
     print_plan(
         initial_plan,
@@ -3265,7 +3278,7 @@ def main() -> None:
         close_numbers=close_numbers,
     )
     confirmation_required = requires_confirmation(
-        initial_plan, stack, reconciliation, recovery_evidence
+        initial_plan, stack, recovery_evidence, local_rewrite=local_rewrite
     )
     authorize_plan(
         required=confirmation_required,
@@ -3282,7 +3295,9 @@ def main() -> None:
                     f"  {shlex.join([*JJ, 'git', 'fetch', '--remote', remote])}",
                     file=sys.stderr,
                 )
-        elif reconciliation is ReconciliationKind.LOCAL_AUTHORITY:
+        elif (
+            reconciliation is ReconciliationKind.LOCAL_AUTHORITY and closure is not None
+        ):
             assert closure is not None
             if args.verbose >= 2:
                 print(
@@ -3359,7 +3374,7 @@ def main() -> None:
         if any(fetched_after.get(name) != oid for name, oid in expected.items()):
             raise Error("jj fetch did not import the complete planned GitHub suffix")
         open_oids = [state.live_oid for state in states]
-    elif reconciliation is ReconciliationKind.LOCAL_AUTHORITY:
+    elif reconciliation is ReconciliationKind.LOCAL_AUTHORITY and closure is not None:
         assert closure is not None
         fetch_exact_branches(repo, remote, {repo.base: base_oid})
         planned_operation = begin_inspection_phase()
@@ -3435,9 +3450,7 @@ def main() -> None:
         if preflight_result.returncode != 0:
             detail = preflight_result.stderr.strip() or preflight_result.stdout.strip()
             local_state = (
-                "; the local stack remains rebased"
-                if reconciliation is ReconciliationKind.LOCAL_AUTHORITY
-                else ""
+                "; the local stack remains rebased" if closure is not None else ""
             )
             raise Error(
                 "preflight atomic push failed; no remote refs were changed"
@@ -3462,9 +3475,7 @@ def main() -> None:
         if pushed.returncode != 0:
             detail = pushed.stderr.strip() or pushed.stdout.strip()
             local_state = (
-                "; the local stack remains rebased"
-                if reconciliation is ReconciliationKind.LOCAL_AUTHORITY
-                else ""
+                "; the local stack remains rebased" if closure is not None else ""
             )
             raise Error(
                 "atomic push failed; inspect live refs before retrying"
