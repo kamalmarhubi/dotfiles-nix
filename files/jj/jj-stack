@@ -2291,6 +2291,13 @@ def validate_close_targets(plan: Plan, close_numbers: frozenset[int]) -> None:
         )
 
 
+def counted(count: int, noun: str) -> str:
+    if count == 1:
+        return f"{count} {noun}"
+    suffix = "es" if noun.endswith(("ch", "sh", "s", "x", "z")) else "s"
+    return f"{count} {noun + suffix}"
+
+
 def print_plan(
     plan: Plan,
     revisions: list[Revision],
@@ -2315,66 +2322,75 @@ def print_plan(
         title = f"stack #{stack.number} is already converged"
     elif recovery is not None:
         title = (
-            f"attach {len(plan.heads)} existing PR(s) to surviving "
+            f"attach {counted(len(plan.heads), 'existing PR')} to surviving "
             f"stack #{stack.number}"
         )
     elif plan.kind is TopologyKind.NEW:
-        title = f"create a stack with {len(plan.heads)} PR(s)"
+        title = f"create a stack with {counted(len(plan.heads), 'PR')}"
     elif plan.kind is TopologyKind.APPEND:
-        title = f"append {len(plan.link_heads)} PR(s) to stack #{stack.number}"
+        title = f"append {counted(len(plan.link_heads), 'PR')} to stack #{stack.number}"
     elif plan.kind is TopologyKind.METADATA_ONLY:
         title = f"update stack #{stack.number}"
     else:
         title = f"rebuild the open suffix of stack #{stack.number}"
     print(f"Plan: {title}", file=sys.stderr)
 
+    if reconciliation is ReconciliationKind.ALREADY_CONVERGED and not plan.omitted:
+        print("  No local, remote, or GitHub changes.", file=sys.stderr)
     if closure is not None:
         workspaces = len(closure.workspaces)
         print(
-            f"  Local: rebase a {len(closure.commits)}-commit descendant closure "
-            f"onto {remote}/{repo.base}; {workspaces} workspace(s) follow.",
+            f"  Rebase {counted(len(closure.commits), 'local commit')} onto "
+            f"{remote}/{repo.base}; move {counted(workspaces, 'workspace')} with them.",
             file=sys.stderr,
         )
     elif reconciliation is ReconciliationKind.REMOTE_ADOPT:
         print(
-            "  Local: import the mechanically verified GitHub restack.", file=sys.stderr
+            "  Adopt GitHub's mechanically verified restack locally; do not publish refs.",
+            file=sys.stderr,
         )
-    elif reconciliation is ReconciliationKind.ALREADY_CONVERGED:
-        print("  Local: no history changes.", file=sys.stderr)
-    else:
-        print("  Local: preserve the selected history.", file=sys.stderr)
 
-    publication = []
     if plan.heads and reconciliation not in {
         ReconciliationKind.ALREADY_CONVERGED,
         ReconciliationKind.REMOTE_ADOPT,
     }:
-        publication.append(f"publish {len(plan.heads)} canonical branch(es)")
-    if plan.boundary:
-        publication.append(
-            f"advance merged boundary {plan.boundary.head} to {repo.base}"
+        print(
+            f"  Publish {counted(len(plan.heads), 'branch')} atomically.",
+            file=sys.stderr,
         )
-    print(
-        "  Remote: "
-        + ("; ".join(publication) + "." if publication else "no ref changes."),
-        file=sys.stderr,
-    )
-    github = [f"reuse {existing} PR(s)", f"create {created} draft PR(s)"]
+    if plan.boundary:
+        print(
+            f"  Move merged boundary {plan.boundary.head} to {repo.base}.",
+            file=sys.stderr,
+        )
+    if existing:
+        print(
+            f"  Reuse {counted(existing, 'existing PR')} in the selected order; "
+            "preserve readiness.",
+            file=sys.stderr,
+        )
+    if created:
+        print(f"  Create {counted(created, 'draft PR')}.", file=sys.stderr)
     if plan.kind in {
         TopologyKind.FULLY_OPEN_REBUILD,
         TopologyKind.MERGED_PREFIX_REBUILD,
     }:
-        github.append("unstack and relink the open suffix")
+        print("  Unstack and relink the open suffix.", file=sys.stderr)
     elif recovery is not None:
-        github.append(f"link them after merged PR #{recovery.boundary.number}")
+        print(
+            f"  Link the selected PRs after merged PR #{recovery.boundary.number}.",
+            file=sys.stderr,
+        )
     if plan.omitted:
         detached = ", ".join(f"#{pr.number}" for pr in plan.omitted)
-        github.append(f"detach {detached}")
+        print(f"  Detach {detached}; retain their branches.", file=sys.stderr)
     if close_numbers:
-        github.append(
-            "close " + ", ".join(f"#{number}" for number in sorted(close_numbers))
+        print(
+            "  Close "
+            + ", ".join(f"#{number}" for number in sorted(close_numbers))
+            + " after successful publication.",
+            file=sys.stderr,
         )
-    print("  GitHub: " + "; ".join(github) + ".", file=sys.stderr)
     if recovery is not None:
         print(
             "  History identifies this as the unique surviving stack consistent "
@@ -3248,10 +3264,11 @@ def main() -> None:
         existing_evidence=existing_evidence,
         close_numbers=close_numbers,
     )
+    confirmation_required = requires_confirmation(
+        initial_plan, stack, reconciliation, recovery_evidence
+    )
     authorize_plan(
-        required=requires_confirmation(
-            initial_plan, stack, reconciliation, recovery_evidence
-        ),
+        required=confirmation_required,
         plan_only=args.plan,
         yes=args.yes,
     )
@@ -3308,6 +3325,8 @@ def main() -> None:
             print(f"  {gh_plan(repo, link)}", file=sys.stderr)
         if operation_id() != planned_operation:
             raise Error("jj operation changed during planning; replan and retry")
+        if confirmation_required:
+            print("A live run will require confirmation.", file=sys.stderr)
         print("No changes made.", file=sys.stderr)
         return
 

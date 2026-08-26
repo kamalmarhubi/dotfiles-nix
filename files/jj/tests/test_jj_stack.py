@@ -85,6 +85,22 @@ def test_graphql_rejects_non_object_json(monkeypatch, response):
         )
 
 
+def test_double_verbose_routes_child_output_to_stderr(capsys):
+    script = load_script()
+    script.VERBOSITY = 2
+
+    result = script.command(
+        ["python3", "-c", "import sys; print('out'); print('err', file=sys.stderr)"]
+    )
+
+    captured = capsys.readouterr()
+    assert result.stdout == "out\n"
+    assert result.stderr == "err\n"
+    assert captured.out == ""
+    assert "+ python3 -c" in captured.err
+    assert "out\nerr\n" in captured.err
+
+
 def revision(script, commit, local=(), remote=(), generated=None):
     return script.Revision(
         commit,
@@ -347,6 +363,18 @@ def test_recovery_refuses_ambiguous_base_history(monkeypatch):
 
     with pytest.raises(script.Error, match="multiple recorded base changes"):
         script.recover_surviving_stack([first], repo, {})
+
+
+def test_merged_head_reuse_refuses_recovery(monkeypatch):
+    script = load_script()
+    monkeypatch.setattr(
+        script,
+        "graphql",
+        lambda *_args: {"repository": {"pullRequests": {"totalCount": 2, "nodes": []}}},
+    )
+
+    with pytest.raises(script.Error, match="identifies multiple merged PRs"):
+        script.merged_pull_request_by_head("owner/repo", "reused", {}, ".")
 
 
 def test_selectors_retain_complete_prefix_and_enforce_comparable_order(monkeypatch):
@@ -677,6 +705,68 @@ def test_omission_plan_prints_validated_consequences(capsys):
     assert "branch: retain topic @ live-oid" in output
     assert "remote check: live head matches tracked baseline" in output
     assert "do not prove its changes are present" in output
+
+
+def test_default_plan_is_concise_and_verbose_plan_adds_evidence(capsys):
+    script = load_script()
+    pr = pull_request(script, "topic", 12, head_oid="live-oid")
+    stack = script.StackSnapshot("STACK_7", 7, [pr], {"topic": pr})
+    item = revision(script, "local-oid", local=("topic",))
+    plan = script.Plan(
+        script.TopologyKind.METADATA_ONLY,
+        ["topic"],
+        [],
+        [],
+        7,
+        None,
+        False,
+        (1,),
+    )
+    state = script.BoundaryState("topic", "local-oid", "tracked-oid", "live-oid", pr)
+    repo = script.Repository(
+        ".",
+        "owner/repo",
+        "owner/repo",
+        "github.com",
+        "main",
+        "https://github.com/owner/repo",
+    )
+
+    script.print_plan(
+        plan,
+        [item],
+        stack,
+        repo,
+        "origin",
+        script.Selection(("local-oid",), ("local-oid",), "base-oid", "local-oid"),
+        "base-oid",
+        {},
+        states=(state,),
+    )
+    concise = capsys.readouterr().err
+    assert "Plan: update stack #7" in concise
+    assert "Publish 1 branch atomically." in concise
+    assert "Reuse 1 existing PR" in concise
+    assert "local-oid" not in concise
+    assert "tracked-oid" not in concise
+    assert "1. topic" not in concise
+
+    script.print_plan(
+        plan,
+        [item],
+        stack,
+        repo,
+        "origin",
+        script.Selection(("local-oid",), ("local-oid",), "base-oid", "local-oid"),
+        "base-oid",
+        {},
+        states=(state,),
+        verbosity=1,
+    )
+    verbose = capsys.readouterr().err
+    assert "local=local-oid" in verbose
+    assert "tracked=tracked-oid" in verbose
+    assert "1. topic" in verbose
 
 
 def test_closed_unmerged_entry_forces_merged_prefix_rebuild():
@@ -1946,6 +2036,41 @@ def test_consequential_plan_can_be_confirmed(monkeypatch, capsys):
     script.authorize_plan(required=True, plan_only=False, yes=False)
 
     assert "Continue? [y/N]" in capsys.readouterr().err
+
+
+def test_routine_plans_do_not_require_confirmation():
+    script = load_script()
+    new = script.Plan(
+        script.TopologyKind.NEW,
+        ["a", "b"],
+        [],
+        ["a", "b"],
+        None,
+        None,
+        False,
+    )
+    append = script.Plan(
+        script.TopologyKind.APPEND,
+        ["a", "b"],
+        [],
+        ["b"],
+        7,
+        None,
+        False,
+    )
+    empty = script.StackSnapshot(None, None, [])
+    existing = pull_request(script, "a", 1)
+    stack = script.StackSnapshot("STACK_7", 7, [existing], {"a": existing})
+
+    assert not script.requires_confirmation(
+        new, empty, script.ReconciliationKind.NORMAL_PUBLISH, None
+    )
+    assert not script.requires_confirmation(
+        append, stack, script.ReconciliationKind.NORMAL_PUBLISH, None
+    )
+    assert not script.requires_confirmation(
+        append, stack, script.ReconciliationKind.REMOTE_ADOPT, None
+    )
 
 
 def test_omitted_prs_are_covered_by_unified_confirmation():
