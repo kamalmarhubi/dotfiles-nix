@@ -51,6 +51,8 @@ def command(
     stdin_text: str | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
+    if globals().get("VERBOSITY", 0) >= 2:
+        print(f"+ {shlex.join(args)}", file=sys.stderr)
     result = subprocess.run(
         args,
         cwd=cwd,
@@ -60,6 +62,10 @@ def command(
         capture_output=True,
         check=False,
     )
+    if globals().get("VERBOSITY", 0) >= 2:
+        for output in (result.stdout, result.stderr):
+            if output.strip():
+                print(output.rstrip(), file=sys.stderr)
     if check and result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         raise Error(f"`{shlex.join(args)}` failed" + (f":\n{detail}" if detail else ""))
@@ -75,6 +81,7 @@ def jj_command() -> list[str]:
 
 JJ = jj_command()
 INSPECTION_OPERATION: str | None = None
+VERBOSITY = 0
 
 
 def jj(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -859,6 +866,239 @@ def fetch_stack(stack_id: str, gh_env: dict[str, str], git_root: str) -> StackSn
         raise
     except (KeyError, TypeError) as exc:
         raise Error("could not read GitHub stack") from exc
+
+
+@dataclass(frozen=True)
+class BaseTransition:
+    node_id: str
+    created_at: str
+    previous: str
+    current: str
+
+
+@dataclass(frozen=True)
+class RecoveryEvidence:
+    first_pr_id: str
+    transition: BaseTransition
+    boundary: PullRequest
+    stack_id: str
+    stack_number: int
+
+
+def pull_request_base_transitions(
+    pr: PullRequest, gh_env: dict[str, str], git_root: str
+) -> tuple[BaseTransition, ...]:
+    transitions = []
+    cursor = None
+    while True:
+        query = """query($id: ID!, $cursor: String) {
+          node(id: $id) {
+            ... on PullRequest {
+              timelineItems(
+                first: 100
+                after: $cursor
+                itemTypes: [BASE_REF_CHANGED_EVENT]
+              ) {
+                nodes {
+                  ... on BaseRefChangedEvent {
+                    id createdAt previousRefName currentRefName
+                  }
+                }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }"""
+        data = graphql(
+            query,
+            {"id": pr.node_id, "cursor": cursor},
+            gh_env,
+            git_root,
+            f"could not read base history for PR #{pr.number}",
+        )
+        try:
+            node = data["node"]
+            if node is None:
+                raise KeyError("node")
+            timeline = node["timelineItems"]
+            transitions.extend(
+                BaseTransition(
+                    event["id"],
+                    event["createdAt"],
+                    event["previousRefName"],
+                    event["currentRefName"],
+                )
+                for event in timeline["nodes"]
+            )
+            page = timeline["pageInfo"]
+            if not page["hasNextPage"]:
+                return tuple(transitions)
+            cursor = page["endCursor"]
+            if not cursor:
+                raise KeyError("endCursor")
+        except (KeyError, TypeError) as exc:
+            raise Error(f"could not read base history for PR #{pr.number}") from exc
+
+
+def merged_pull_request_by_head(
+    name_with_owner: str,
+    head: str,
+    gh_env: dict[str, str],
+    git_root: str,
+) -> PullRequest | None:
+    owner, name = name_with_owner.split("/", 1)
+    query = f"""query(
+      $owner: String!, $name: String!, $head: String!
+    ) {{
+      repository(owner: $owner, name: $name) {{
+        pullRequests(first: 2, states: [MERGED], headRefName: $head) {{
+          totalCount
+          nodes {{ {_PR_FIELDS} }}
+        }}
+      }}
+    }}"""
+    data = graphql(
+        query,
+        {"owner": owner, "name": name, "head": head},
+        gh_env,
+        git_root,
+        f"could not identify merged PR with historical head {head}",
+    )
+    try:
+        repository = data["repository"]
+        if repository is None:
+            raise KeyError("repository")
+        connection = repository["pullRequests"]
+        if connection["totalCount"] > 1:
+            raise Error(
+                f"historical branch {head} identifies multiple merged PRs; "
+                "cannot choose a surviving stack"
+            )
+        nodes = connection["nodes"]
+        if not nodes:
+            return None
+        if len(nodes) != 1:
+            raise KeyError("nodes")
+        pr = parse_pr(nodes[0])
+        if (
+            not pr.merged
+            or pr.repository is None
+            or pr.repository.lower() != name_with_owner.lower()
+        ):
+            raise Error(
+                f"historical branch {head} does not identify one repository-local merged PR"
+            )
+        return pr
+    except Error:
+        raise
+    except (KeyError, TypeError) as exc:
+        raise Error(
+            f"could not identify merged PR with historical head {head}"
+        ) from exc
+
+
+def recover_surviving_stack(
+    selected: list[PullRequest],
+    repo: Repository,
+    gh_env: dict[str, str],
+) -> tuple[StackSnapshot, RecoveryEvidence] | None:
+    if not selected:
+        return None
+    if any(
+        pr.state != "OPEN"
+        or pr.stack_id is not None
+        or pr.repository is None
+        or pr.repository.lower() != repo.name_with_owner.lower()
+        or pr.head_repository is None
+        or pr.head_repository.lower() != repo.name_with_owner.lower()
+        for pr in selected
+    ):
+        return None
+    first = selected[0]
+    transitions = pull_request_base_transitions(first, gh_env, repo.git_root)
+    if not transitions:
+        return None
+    if len(transitions) != 1:
+        raise Error(
+            f"PR #{first.number} has multiple recorded base changes; "
+            "cannot choose a surviving stack"
+        )
+    transition = transitions[0]
+    if transition.current != first.base:
+        raise Error(
+            f"PR #{first.number} base history changed while resolving its stack target"
+        )
+    endpoints = {transition.previous, transition.current}
+    candidates = endpoints - {repo.base}
+    if repo.base not in endpoints or len(candidates) != 1:
+        raise Error(
+            f"PR #{first.number} base history does not identify one historical "
+            "boundary branch"
+        )
+    candidate = candidates.pop()
+    boundary = merged_pull_request_by_head(
+        repo.name_with_owner, candidate, gh_env, repo.git_root
+    )
+    if boundary is None or boundary.stack_id is None:
+        return None
+    stack = fetch_stack(boundary.stack_id, gh_env, repo.git_root)
+    if stack.node_id is None or stack.number is None:
+        return None
+    if not stack.entries or stack.entries[-1].node_id != boundary.node_id:
+        raise Error(
+            f"merged PR #{boundary.number} is not the final member of its surviving stack"
+        )
+    if any(not pr.merged for pr in stack.entries):
+        raise Error(
+            f"surviving stack {stack.number} has unexpected unmerged entries; "
+            "cannot attach the selected PRs safely"
+        )
+    return stack, RecoveryEvidence(
+        first.node_id,
+        transition,
+        boundary,
+        stack.node_id,
+        stack.number,
+    )
+
+
+def verify_recovery_suffix(
+    evidence: RecoveryEvidence,
+    stack: StackSnapshot,
+    states: tuple["BoundaryState", ...],
+    counts: tuple[int, ...],
+    repo: Repository,
+    remote: str,
+) -> None:
+    if (
+        stack.node_id != evidence.stack_id
+        or stack.number != evidence.stack_number
+        or not stack.merged
+        or stack.merged[-1].node_id != evidence.boundary.node_id
+    ):
+        raise Error("surviving stack target changed during recovery planning")
+    if any(state.tracked_oid is None for state in states):
+        raise Error(
+            "historical stack recovery requires a tracked baseline for every PR"
+        )
+    if any(state.live_oid != state.tracked_oid for state in states):
+        verify_mechanical_restack(
+            states,
+            open_suffix_root(stack, ""),
+            counts,
+            repo.git_root,
+            remote,
+            allow_restacked_first=True,
+        )
+    else:
+        verify_live_suffix(
+            states,
+            open_suffix_root(stack, ""),
+            counts,
+            repo.git_root,
+            remote,
+            allow_restacked_first=True,
+        )
 
 
 def change_id_at(commit_id: str) -> str:
@@ -2061,35 +2301,118 @@ def print_plan(
     base_oid: str,
     selectors: dict[str, tuple[PullRequest, ...]],
     *,
+    reconciliation: ReconciliationKind = ReconciliationKind.NORMAL_PUBLISH,
+    states: tuple[BoundaryState, ...] = (),
+    closure: ClosureSnapshot | None = None,
+    recovery: RecoveryEvidence | None = None,
+    verbosity: int = 0,
     existing_evidence: tuple[ExistingBoundary, ...] = (),
     close_numbers: frozenset[int] = frozenset(),
 ) -> None:
-    print(f"Plan: {plan.kind.value}", file=sys.stderr)
+    existing = sum(head in stack.discovered for head in plan.heads)
+    created = len(plan.heads) - existing
+    if reconciliation is ReconciliationKind.ALREADY_CONVERGED and not plan.omitted:
+        title = f"stack #{stack.number} is already converged"
+    elif recovery is not None:
+        title = (
+            f"attach {len(plan.heads)} existing PR(s) to surviving "
+            f"stack #{stack.number}"
+        )
+    elif plan.kind is TopologyKind.NEW:
+        title = f"create a stack with {len(plan.heads)} PR(s)"
+    elif plan.kind is TopologyKind.APPEND:
+        title = f"append {len(plan.link_heads)} PR(s) to stack #{stack.number}"
+    elif plan.kind is TopologyKind.METADATA_ONLY:
+        title = f"update stack #{stack.number}"
+    else:
+        title = f"rebuild the open suffix of stack #{stack.number}"
+    print(f"Plan: {title}", file=sys.stderr)
+
+    if closure is not None:
+        workspaces = len(closure.workspaces)
+        print(
+            f"  Local: rebase a {len(closure.commits)}-commit descendant closure "
+            f"onto {remote}/{repo.base}; {workspaces} workspace(s) follow.",
+            file=sys.stderr,
+        )
+    elif reconciliation is ReconciliationKind.REMOTE_ADOPT:
+        print(
+            "  Local: import the mechanically verified GitHub restack.", file=sys.stderr
+        )
+    elif reconciliation is ReconciliationKind.ALREADY_CONVERGED:
+        print("  Local: no history changes.", file=sys.stderr)
+    else:
+        print("  Local: preserve the selected history.", file=sys.stderr)
+
+    publication = []
+    if plan.heads and reconciliation not in {
+        ReconciliationKind.ALREADY_CONVERGED,
+        ReconciliationKind.REMOTE_ADOPT,
+    }:
+        publication.append(f"publish {len(plan.heads)} canonical branch(es)")
+    if plan.boundary:
+        publication.append(
+            f"advance merged boundary {plan.boundary.head} to {repo.base}"
+        )
+    print(
+        "  Remote: "
+        + ("; ".join(publication) + "." if publication else "no ref changes."),
+        file=sys.stderr,
+    )
+    github = [f"reuse {existing} PR(s)", f"create {created} draft PR(s)"]
+    if plan.kind in {
+        TopologyKind.FULLY_OPEN_REBUILD,
+        TopologyKind.MERGED_PREFIX_REBUILD,
+    }:
+        github.append("unstack and relink the open suffix")
+    elif recovery is not None:
+        github.append(f"link them after merged PR #{recovery.boundary.number}")
+    if plan.omitted:
+        detached = ", ".join(f"#{pr.number}" for pr in plan.omitted)
+        github.append(f"detach {detached}")
+    if close_numbers:
+        github.append(
+            "close " + ", ".join(f"#{number}" for number in sorted(close_numbers))
+        )
+    print("  GitHub: " + "; ".join(github) + ".", file=sys.stderr)
+    if recovery is not None:
+        print(
+            "  History identifies this as the unique surviving stack consistent "
+            "with the selected PRs; GitHub does not retain former stack membership.",
+            file=sys.stderr,
+        )
+    elif plan.kind is TopologyKind.NEW and stack.discovered:
+        print(
+            "  No surviving stack was identified; any former stack number is unavailable.",
+            file=sys.stderr,
+        )
+
+    if verbosity < 1:
+        return
+    print(f"Evidence: {reconciliation.value}", file=sys.stderr)
     if selection is not None:
         print(
-            f"  base: {repo.base} at {base_oid[:12]}; fork: {selection.fork[:12]}; "
-            f"first segment: {plan.segment_commits[0]} commit(s)",
+            f"  base {repo.base}={base_oid[:12]}; fork={selection.fork[:12]}; "
+            f"segments={','.join(map(str, plan.segment_commits))}",
             file=sys.stderr,
         )
-    else:
+    for state in states:
+        tracked = state.tracked_oid[:12] if state.tracked_oid else "missing"
         print(
-            f"  base: {repo.base} at {base_oid[:12]}; open suffix: empty",
+            f"  {state.branch}: local={state.local_oid[:12]} "
+            f"tracked={tracked} remote={state.live_oid[:12]}",
             file=sys.stderr,
         )
-    if stack.number is not None:
-        print(f"  existing stack: {repo.url}/stacks/{stack.number}", file=sys.stderr)
+    if recovery is not None:
+        event = recovery.transition
+        print(
+            f"  PR base event {event.node_id}: {event.previous} → {event.current} "
+            f"at {event.created_at}",
+            file=sys.stderr,
+        )
     for oid, matches in selectors.items():
         prs = ", ".join(f"#{pr.number}" for pr in matches)
-        print(
-            f"  merged selector {oid[:12]}: {prs}; retain complete merged prefix",
-            file=sys.stderr,
-        )
-    if stack.closed:
-        print(
-            "  remove closed, unmerged entries during stack rebuild:", file=sys.stderr
-        )
-        for pr in stack.closed:
-            print(f"    #{pr.number} {pr.head} {pr.url}", file=sys.stderr)
+        print(f"  merged selector {oid[:12]}: {prs}", file=sys.stderr)
     for index, (revision, head) in enumerate(
         zip(revisions, plan.heads, strict=True), 1
     ):
@@ -2141,101 +2464,42 @@ def print_plan(
                         f"{item.check.value}"
                     )
                 print(f"      remote check: {check}", file=sys.stderr)
-        if len(plan.omitted) == 1:
-            note = (
-                "  note: this check compares the omitted PR with its tracked remote "
-                "baseline;\n"
-                "        it does not verify that the PR's changes are present in the "
-                "desired stack"
-            )
-        else:
-            note = (
-                "  note: these checks compare omitted PRs with their tracked remote "
-                "baselines;\n"
-                "        they do not verify that the PRs' changes are present in the "
-                "desired stack"
-            )
-        print(note, file=sys.stderr)
-    if plan.boundary:
-        if plan.kind is TopologyKind.MERGED_PREFIX_REBUILD:
-            action = "then rebuild the open suffix"
-        elif plan.kind is TopologyKind.APPEND and not stack.active:
-            action = "before appending the new open suffix"
-        else:
-            action = "then refresh the first open PR base"
         print(
-            f"  move merged boundary {plan.boundary.head} to {repo.base}, "
-            f"{action} in stack {stack.number}",
+            "  omission checks compare each PR with its tracked remote baseline; "
+            "they do not prove its changes are present in the desired stack",
             file=sys.stderr,
         )
-    elif plan.kind is TopologyKind.FULLY_OPEN_REBUILD:
-        print(
-            "  dissolve and recreate stack; stack number and URL will change",
-            file=sys.stderr,
-        )
-    if plan.kind is TopologyKind.NEW and stack.discovered:
-        print(
-            "  warning: existing PRs are unstacked, so no merged prefix can be inferred; "
-            "this would create a separate stack",
-            file=sys.stderr,
-        )
-    if plan.heads:
-        print(
-            f"  push {len(plan.heads)} canonical bookmark(s) to {remote}",
-            file=sys.stderr,
-        )
-    else:
-        print("  no open bookmarks or PRs to publish", file=sys.stderr)
-    print(
-        "  note: merged selectors use exact historical Git OIDs; other patch-equivalent "
-        "changes landed by squash or cherry-pick are not detected",
-        file=sys.stderr,
+
+
+def requires_confirmation(
+    plan: Plan,
+    stack: StackSnapshot,
+    reconciliation: ReconciliationKind,
+    recovery: RecoveryEvidence | None,
+) -> bool:
+    return bool(
+        reconciliation is ReconciliationKind.LOCAL_AUTHORITY
+        or plan.boundary
+        or plan.kind
+        in {
+            TopologyKind.FULLY_OPEN_REBUILD,
+            TopologyKind.MERGED_PREFIX_REBUILD,
+        }
+        or plan.omitted
+        or recovery is not None
+        or (plan.kind is TopologyKind.NEW and stack.discovered)
     )
 
 
-def authorize_omissions(
-    plan: Plan,
-    detach_omitted: bool,
-    close_numbers: frozenset[int],
-    dry_run: bool,
-) -> None:
-    validate_close_targets(plan, close_numbers)
-    unauthorized = [pr for pr in plan.omitted if pr.number not in close_numbers]
-    if not unauthorized or dry_run or detach_omitted:
+def authorize_plan(*, required: bool, plan_only: bool, yes: bool) -> None:
+    if not required or plan_only or yes:
         return
     if not sys.stdin.isatty():
-        raise Error(
-            "omitted open PRs require --detach-omitted when input is not interactive"
-        )
-    rendered = ", ".join(f"#{pr.number}" for pr in unauthorized)
-    subject = rendered if len(unauthorized) == 1 else f"these PRs ({rendered})"
+        raise Error("this plan requires confirmation; rerun with --yes")
+    print(file=sys.stderr)
+    print("Continue? [y/N] ", end="", file=sys.stderr, flush=True)
     try:
-        answer = input(f"Detach {subject} from the stack and continue? [y/N] ")
-    except EOFError:
-        answer = ""
-    if answer.strip().lower() not in {"y", "yes"}:
-        raise Error("publication cancelled")
-
-
-def authorize_separate_stack(plan: Plan, stack: StackSnapshot, dry_run: bool) -> None:
-    if plan.kind is not TopologyKind.NEW or not stack.discovered or dry_run:
-        return
-    # TODO: Revisit automatic recovery when stronger stack evidence is available:
-    # (1) the first selected PR still bases on a merged stack boundary, or
-    # (2) the open suffix forks exactly at a historical merged stacked PR head.
-    # A recent matching `mine() & ::trunk()` commit may also be worth showing as
-    # a weaker suggestion. Until those semantics are settled, never infer stack
-    # identity from these signals; require confirmation before creating a new one.
-    if not sys.stdin.isatty():
-        raise Error(
-            "selected existing PRs are unstacked; creating a separate stack "
-            "requires interactive confirmation"
-        )
-    try:
-        answer = input(
-            "Selected existing PRs have no identifiable stack. "
-            "Create a separate stack? [y/N] "
-        )
+        answer = input()
     except EOFError:
         answer = ""
     if answer.strip().lower() not in {"y", "yes"}:
@@ -2342,7 +2606,7 @@ def run_stack_link(
                 ]
             )
             changed.append(branch)
-        return subprocess.run(args, cwd=git_root, env=gh_env, check=False)
+        return command(args, cwd=git_root, env=gh_env, check=False)
     finally:
         for branch in reversed(changed):
             ref = f"refs/heads/{branch}"
@@ -2765,11 +3029,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--base", help="trunk branch (default: repository default branch)"
     )
     push.add_argument(
-        "--detach-omitted",
-        action="store_true",
-        help="leave omitted open PRs open, but detach them from their GitHub stack",
-    )
-    push.add_argument(
         "--close-omitted",
         action="append",
         type=int,
@@ -2780,21 +3039,43 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "repeat for multiple PRs"
         ),
     )
-    push.add_argument(
-        "-n",
-        "--dry-run",
+    execution = push.add_mutually_exclusive_group()
+    execution.add_argument(
+        "--plan",
         action="store_true",
         help=(
-            "validate current inputs and describe planned live actions; only missing "
-            "Git objects may be downloaded locally"
+            "validate current inputs and describe planned actions without publishing; "
+            "only missing Git objects may be downloaded locally"
         ),
     )
+    execution.add_argument(
+        "--yes",
+        action="store_true",
+        help="accept a consequential plan without an interactive prompt",
+    )
+    push.add_argument(
+        "--create-separate-stack",
+        action="store_true",
+        help="do not recover a surviving historical stack for unstacked existing PRs",
+    )
+    push.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="show evidence; repeat once to also show commands and child output",
+    )
     push.add_argument("revset")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.verbose > 2:
+        parser.error("at most -vv is supported")
+    return args
 
 
 def main() -> None:
+    global VERBOSITY
     args = parse_args()
+    VERBOSITY = args.verbose
     # Pin every inspection to one operation. `--at-op` implies
     # `--ignore-working-copy` and avoids reconciling divergent operation heads.
     planned_operation = begin_inspection_phase()
@@ -2836,6 +3117,7 @@ def main() -> None:
             identified_stack,
             reject_divergence=False,
         )
+    recovery_evidence = None
     selection = discovered.selection
     if selection is not None:
         open_oids = list(selection.boundaries)
@@ -2849,6 +3131,31 @@ def main() -> None:
     revisions = discovered.revisions
     heads = discovered.heads
     stack = discovered.stack
+    if (
+        not args.create_separate_stack
+        and identified_stack is None
+        and stack.number is None
+        and heads
+        and len(stack.discovered) == len(heads)
+    ):
+        recovery = recover_surviving_stack(
+            [stack.discovered[head] for head in heads], repo, gh_env
+        )
+        if recovery is not None:
+            identified_stack, recovery_evidence = recovery
+            discovered = discover_publication(
+                open_oids,
+                base_oid,
+                repo,
+                remote,
+                gh_env,
+                identified_stack,
+                reject_divergence=False,
+            )
+            selection = discovered.selection
+            revisions = discovered.revisions
+            heads = discovered.heads
+            stack = discovered.stack
     validate_head_ref_collisions(
         revisions, heads, stack.discovered, actual_refs, repo.base
     )
@@ -2889,6 +3196,8 @@ def main() -> None:
         has_new_boundaries=has_new_boundaries,
         topology_changed=topology_delta,
     )
+    if recovery_evidence is not None:
+        verify_recovery_suffix(recovery_evidence, stack, states, counts, repo, remote)
     if not topology_delta:
         verify_reconciliation_suffix(
             reconciliation,
@@ -2917,19 +3226,11 @@ def main() -> None:
     close_numbers = frozenset(args.close_omitted)
     validate_close_targets(initial_plan, close_numbers)
     verify_unstackable(initial_plan, stack)
-    print(f"Mode: {reconciliation.value}", file=sys.stderr)
-    if topology_delta:
-        print(
-            "  topology: selected local boundaries are authoritative", file=sys.stderr
-        )
-    for state in states:
-        tracked = state.tracked_oid[:12] if state.tracked_oid else "missing"
-        print(
-            f"  {state.branch}: L={state.local_oid[:12]} T={tracked} "
-            f"R={state.live_oid[:12]}",
-            file=sys.stderr,
-        )
-    print(f"  {repo.base}: M={base_oid[:12]}", file=sys.stderr)
+    closure = None
+    if reconciliation is ReconciliationKind.LOCAL_AUTHORITY:
+        if selection is None:
+            raise Error("local reconciliation requires a nonempty open suffix")
+        closure = capture_closure(selection.commits[0])
     print_plan(
         initial_plan,
         revisions,
@@ -2939,61 +3240,52 @@ def main() -> None:
         selection,
         base_oid,
         selectors,
+        reconciliation=reconciliation,
+        states=states,
+        closure=closure,
+        recovery=recovery_evidence,
+        verbosity=args.verbose,
         existing_evidence=existing_evidence,
         close_numbers=close_numbers,
     )
-    authorize_omissions(initial_plan, args.detach_omitted, close_numbers, args.dry_run)
-    authorize_separate_stack(initial_plan, stack, args.dry_run)
-    closure = None
-    if reconciliation is ReconciliationKind.LOCAL_AUTHORITY:
-        if selection is None:
-            raise Error("local reconciliation requires a nonempty open suffix")
-        closure = capture_closure(selection.commits[0])
-        print(
-            f"  descendant closure: {len(closure.commits)} commit(s); workspaces: "
-            + (", ".join(name for name, _oid in closure.workspaces) or "none"),
-            file=sys.stderr,
-        )
+    authorize_plan(
+        required=requires_confirmation(
+            initial_plan, stack, reconciliation, recovery_evidence
+        ),
+        plan_only=args.plan,
+        yes=args.yes,
+    )
 
-    if args.dry_run:
+    if args.plan:
+        if args.verbose >= 2:
+            print("Commands:", file=sys.stderr)
         if reconciliation is ReconciliationKind.REMOTE_ADOPT:
-            print(
-                f"  {shlex.join([*JJ, 'git', 'fetch', '--remote', remote])}",
-                file=sys.stderr,
-            )
+            if args.verbose >= 2:
+                print(
+                    f"  {shlex.join([*JJ, 'git', 'fetch', '--remote', remote])}",
+                    file=sys.stderr,
+                )
         elif reconciliation is ReconciliationKind.LOCAL_AUTHORITY:
             assert closure is not None
-            print(
-                f"  {shlex.join([*JJ, 'git', 'fetch', '--remote', remote, '--branch', repo.base])}",
-                file=sys.stderr,
-            )
-            print(
-                f"  {shlex.join([*JJ, '--ignore-immutable', 'rebase', '-s', closure.root, '-o', base_oid])}",
-                file=sys.stderr,
-            )
-            print(
-                "  determine rewritten OIDs and conflicts during live execution, then "
-                "atomically push every canonical open branch with the displayed R leases",
-                file=sys.stderr,
-            )
-            print(
-                "  import and track each successfully published canonical bookmark in jj",
-                file=sys.stderr,
-            )
+            if args.verbose >= 2:
+                print(
+                    f"  {shlex.join([*JJ, 'git', 'fetch', '--remote', remote, '--branch', repo.base])}",
+                    file=sys.stderr,
+                )
+                print(
+                    f"  {shlex.join([*JJ, '--ignore-immutable', 'rebase', '-s', closure.root, '-o', base_oid])}",
+                    file=sys.stderr,
+                )
         else:
             ref_plan = make_ref_publication_plan(
                 reconciliation, revisions, heads, actual_refs
             )
-            if ref_plan.updates:
+            if ref_plan.updates and args.verbose >= 2:
                 print(
                     f"  {shlex.join(atomic_push_command(repo.git_root, remote, ref_plan.updates))}",
                     file=sys.stderr,
                 )
-                print(
-                    "  import and track each successfully published canonical bookmark in jj",
-                    file=sys.stderr,
-                )
-        if initial_plan.boundary:
+        if initial_plan.boundary and args.verbose >= 2:
             for boundary_command in boundary_commands(
                 initial_plan.boundary.head,
                 base_oid,
@@ -3002,11 +3294,7 @@ def main() -> None:
                 actual_refs.get(initial_plan.boundary.head),
             ):
                 print(f"  {shlex.join(boundary_command)}", file=sys.stderr)
-            print(
-                "  import and track the published merged-boundary bookmark in jj",
-                file=sys.stderr,
-            )
-        if initial_plan.kind in {
+        if args.verbose >= 2 and initial_plan.kind in {
             TopologyKind.FULLY_OPEN_REBUILD,
             TopologyKind.MERGED_PREFIX_REBUILD,
         }:
@@ -3014,20 +3302,23 @@ def main() -> None:
                 f"  {gh_plan(repo, ['gh', 'stack', 'unstack', str(initial_plan.stack_number)])}",
                 file=sys.stderr,
             )
-        if link := link_command(initial_plan, stack, repo, remote):
+        if args.verbose >= 2 and (
+            link := link_command(initial_plan, stack, repo, remote)
+        ):
             print(f"  {gh_plan(repo, link)}", file=sys.stderr)
-        print(
-            "  verify final refs, stack membership, order, metadata, readiness, and segments",
-            file=sys.stderr,
-        )
-        for number in sorted(close_numbers):
-            print(
-                f"  close detached PR #{number}; retain its remote branch",
-                file=sys.stderr,
-            )
         if operation_id() != planned_operation:
             raise Error("jj operation changed during planning; replan and retry")
+        print("No changes made.", file=sys.stderr)
         return
+
+    if recovery_evidence is not None:
+        current_recovery = recover_surviving_stack(
+            [stack.discovered[head] for head in heads], repo, gh_env
+        )
+        if current_recovery is None or current_recovery[1] != recovery_evidence:
+            raise Error("historical stack evidence changed after confirmation; replan")
+    if operation_id() != planned_operation:
+        raise Error("jj operation changed during planning; replan and retry")
 
     old_stack = stack
     old_states = states
@@ -3134,13 +3425,6 @@ def main() -> None:
                 + local_state
                 + (f":\n{detail}" if detail else "")
             )
-        preflight_detail = "\n".join(
-            part.strip()
-            for part in (preflight_result.stdout, preflight_result.stderr)
-            if part.strip()
-        )
-        print("Preflight atomic push:", file=sys.stderr)
-        print(preflight_detail or "  no remote ref changes", file=sys.stderr)
     live_after_preflight = remote_refs(repo.git_root, remote)
     verify_existing_refs_unchanged(existing_evidence, live_after_preflight)
     expected_before_publication = {head: current_live.get(head) for head in heads}
@@ -3194,7 +3478,7 @@ def main() -> None:
             repo.git_root,
             current_live.get(plan.boundary.head),
         ):
-            if subprocess.run(boundary_command, check=False).returncode != 0:
+            if command(boundary_command, check=False).returncode != 0:
                 raise Error(
                     "could not complete the merged-boundary advance; GitHub stack "
                     "metadata was not changed, but published remote or local refs may remain"
@@ -3246,12 +3530,7 @@ def main() -> None:
         TopologyKind.MERGED_PREFIX_REBUILD,
     }:
         unstack = ["gh", "stack", "unstack", str(plan.stack_number)]
-        if (
-            subprocess.run(
-                unstack, cwd=repo.git_root, env=gh_env, check=False
-            ).returncode
-            != 0
-        ):
+        if command(unstack, cwd=repo.git_root, env=gh_env, check=False).returncode != 0:
             raise Error(
                 "could not unstack GitHub stack; the stack may be partially changed"
             )
@@ -3260,7 +3539,7 @@ def main() -> None:
     if plan.refresh_base and plan.boundary:
         first = stack.discovered[heads[0]]
         for base in (repo.base, plan.boundary.head):
-            result = subprocess.run(
+            result = command(
                 ["gh", "pr", "edit", first.url, "--base", base],
                 cwd=repo.git_root,
                 env=gh_env,

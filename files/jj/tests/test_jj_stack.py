@@ -217,6 +217,138 @@ def test_rejects_oid_that_is_both_open_boundary_and_merged_selector(monkeypatch)
         script.discover_merged_selectors("owner/repo", ["same"], {}, ".")
 
 
+def test_base_transition_history_is_paginated(monkeypatch):
+    script = load_script()
+    pr = pull_request(script, "topic", 2, stack_id=None, stack_number=None)
+    responses = iter(
+        [
+            {
+                "node": {
+                    "timelineItems": {
+                        "nodes": [
+                            {
+                                "id": "EVENT_1",
+                                "createdAt": "2026-01-01T00:00:00Z",
+                                "previousRefName": "main",
+                                "currentRefName": "merged-a",
+                            }
+                        ],
+                        "pageInfo": {"hasNextPage": True, "endCursor": "NEXT"},
+                    }
+                }
+            },
+            {
+                "node": {
+                    "timelineItems": {
+                        "nodes": [
+                            {
+                                "id": "EVENT_2",
+                                "createdAt": "2026-01-02T00:00:00Z",
+                                "previousRefName": "merged-a",
+                                "currentRefName": "main",
+                            }
+                        ],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
+                }
+            },
+        ]
+    )
+    cursors = []
+
+    def graphql(_query, variables, *_args):
+        cursors.append(variables["cursor"])
+        return next(responses)
+
+    monkeypatch.setattr(script, "graphql", graphql)
+
+    transitions = script.pull_request_base_transitions(pr, {}, ".")
+
+    assert [item.node_id for item in transitions] == ["EVENT_1", "EVENT_2"]
+    assert cursors == [None, "NEXT"]
+
+
+def test_recovers_unique_surviving_merged_stack(monkeypatch):
+    script = load_script()
+    first = pull_request(
+        script,
+        "b",
+        2,
+        stack_id=None,
+        stack_number=None,
+        base="merged-a",
+        base_oid="base",
+    )
+    second = pull_request(
+        script,
+        "c",
+        3,
+        stack_id=None,
+        stack_number=None,
+        base="b",
+        base_oid="b",
+    )
+    boundary = pull_request(
+        script, "merged-a", 1, state="MERGED", merged=True, head_oid="old-a"
+    )
+    surviving = script.StackSnapshot("STACK_7", 7, [boundary])
+    transition = script.BaseTransition(
+        "EVENT_1", "2026-01-01T00:00:00Z", "main", "merged-a"
+    )
+    monkeypatch.setattr(
+        script, "pull_request_base_transitions", lambda *_args: (transition,)
+    )
+    monkeypatch.setattr(script, "merged_pull_request_by_head", lambda *_args: boundary)
+    monkeypatch.setattr(script, "fetch_stack", lambda *_args: surviving)
+    repo = script.Repository(
+        ".",
+        "owner/repo",
+        "owner/repo",
+        "github.com",
+        "main",
+        "https://github.com/owner/repo",
+    )
+
+    recovered = script.recover_surviving_stack([first, second], repo, {})
+
+    assert recovered is not None
+    stack, evidence = recovered
+    assert stack is surviving
+    assert evidence.stack_number == 7
+    assert evidence.boundary is boundary
+    assert evidence.transition is transition
+
+
+def test_recovery_refuses_ambiguous_base_history(monkeypatch):
+    script = load_script()
+    first = pull_request(
+        script,
+        "b",
+        2,
+        stack_id=None,
+        stack_number=None,
+        base="merged-a",
+    )
+    transitions = (
+        script.BaseTransition("E1", "one", "main", "merged-a"),
+        script.BaseTransition("E2", "two", "merged-a", "main"),
+    )
+    monkeypatch.setattr(
+        script, "pull_request_base_transitions", lambda *_args: transitions
+    )
+    repo = script.Repository(
+        ".",
+        "owner/repo",
+        "owner/repo",
+        "github.com",
+        "main",
+        "https://github.com/owner/repo",
+    )
+
+    with pytest.raises(script.Error, match="multiple recorded base changes"):
+        script.recover_surviving_stack([first], repo, {})
+
+
 def test_selectors_retain_complete_prefix_and_enforce_comparable_order(monkeypatch):
     script = load_script()
     a = pull_request(script, "a", 1, state="MERGED", merged=True)
@@ -534,6 +666,7 @@ def test_omission_plan_prints_validated_consequences(capsys):
         None,
         "base",
         {},
+        verbosity=1,
         existing_evidence=evidence,
         close_numbers=frozenset({12}),
     )
@@ -543,7 +676,7 @@ def test_omission_plan_prints_validated_consequences(capsys):
     assert "action: detach from stack; close after successful publication" in output
     assert "branch: retain topic @ live-oid" in output
     assert "remote check: live head matches tracked baseline" in output
-    assert "does not verify that the PR's changes are present" in output
+    assert "do not prove its changes are present" in output
 
 
 def test_closed_unmerged_entry_forces_merged_prefix_rebuild():
@@ -1053,6 +1186,7 @@ def test_plan_reports_multi_to_single_metadata_authority_transition(capsys):
         script.Selection(("a",), ("a",), "base", "a"),
         "base",
         {},
+        verbosity=1,
     )
 
     assert (
@@ -1776,7 +1910,7 @@ def test_boundary_push_precedes_local_move_and_quotes_lookup(monkeypatch):
     ]
 
 
-def test_unstacked_existing_prs_require_confirmation(monkeypatch):
+def test_consequential_plan_requires_confirmation_noninteractively(monkeypatch):
     script = load_script()
     pr = pull_request(script, "a", 1, stack_id=None, stack_number=None)
     stack = script.StackSnapshot(None, None, [], {"a": pr})
@@ -1793,34 +1927,28 @@ def test_unstacked_existing_prs_require_confirmation(monkeypatch):
         script.sys, "stdin", type("Stdin", (), {"isatty": lambda _self: False})()
     )
 
-    with pytest.raises(script.Error, match="interactive confirmation"):
-        script.authorize_separate_stack(plan, stack, False)
-
-    script.authorize_separate_stack(plan, stack, True)
-
-
-def test_unstacked_existing_prs_can_be_confirmed(monkeypatch):
-    script = load_script()
-    pr = pull_request(script, "a", 1, stack_id=None, stack_number=None)
-    stack = script.StackSnapshot(None, None, [], {"a": pr})
-    plan = script.Plan(
-        script.TopologyKind.NEW,
-        ["a"],
-        [],
-        ["a"],
-        None,
-        None,
-        False,
+    assert script.requires_confirmation(
+        plan, stack, script.ReconciliationKind.NORMAL_PUBLISH, None
     )
+    with pytest.raises(script.Error, match="rerun with --yes"):
+        script.authorize_plan(required=True, plan_only=False, yes=False)
+    script.authorize_plan(required=True, plan_only=True, yes=False)
+    script.authorize_plan(required=True, plan_only=False, yes=True)
+
+
+def test_consequential_plan_can_be_confirmed(monkeypatch, capsys):
+    script = load_script()
     monkeypatch.setattr(
         script.sys, "stdin", type("Stdin", (), {"isatty": lambda _self: True})()
     )
-    monkeypatch.setattr("builtins.input", lambda _prompt: "yes")
+    monkeypatch.setattr("builtins.input", lambda: "yes")
 
-    script.authorize_separate_stack(plan, stack, False)
+    script.authorize_plan(required=True, plan_only=False, yes=False)
+
+    assert "Continue? [y/N]" in capsys.readouterr().err
 
 
-def test_omitted_prs_prompt_or_accept_exact_authorization(monkeypatch):
+def test_omitted_prs_are_covered_by_unified_confirmation():
     script = load_script()
     first = pull_request(script, "first", 11)
     second = pull_request(script, "second", 12)
@@ -1833,26 +1961,17 @@ def test_omitted_prs_prompt_or_accept_exact_authorization(monkeypatch):
         None,
         False,
     )
-    prompts = []
-    monkeypatch.setattr(
-        script.sys, "stdin", type("Stdin", (), {"isatty": lambda _self: True})()
+    stack = script.StackSnapshot("STACK_7", 7, [first, second])
+    assert script.requires_confirmation(
+        plan, stack, script.ReconciliationKind.NORMAL_PUBLISH, None
     )
-    monkeypatch.setattr(
-        "builtins.input", lambda prompt: prompts.append(prompt) or "yes"
-    )
-
-    script.authorize_omissions(plan, False, frozenset({12}), False)
-
-    assert prompts == ["Detach #11 from the stack and continue? [y/N] "]
-    prompts.clear()
-    script.authorize_omissions(plan, True, frozenset(), False)
-    assert prompts == []
+    script.validate_close_targets(plan, frozenset({12}))
 
     with pytest.raises(script.Error, match="not an omitted open PR"):
-        script.authorize_omissions(plan, True, frozenset({99}), False)
+        script.validate_close_targets(plan, frozenset({99}))
 
 
-def test_noninteractive_omission_requires_flag_unless_exact_close(monkeypatch):
+def test_noninteractive_omission_accepts_yes_not_close_authorization(monkeypatch):
     script = load_script()
     omitted = pull_request(script, "topic", 12)
     plan = script.Plan(
@@ -1868,9 +1987,10 @@ def test_noninteractive_omission_requires_flag_unless_exact_close(monkeypatch):
         script.sys, "stdin", type("Stdin", (), {"isatty": lambda _self: False})()
     )
 
-    with pytest.raises(script.Error, match="--detach-omitted"):
-        script.authorize_omissions(plan, False, frozenset(), False)
-    script.authorize_omissions(plan, False, frozenset({12}), False)
+    with pytest.raises(script.Error, match="rerun with --yes"):
+        script.authorize_plan(required=True, plan_only=False, yes=False)
+    script.authorize_plan(required=True, plan_only=False, yes=True)
+    script.validate_close_targets(plan, frozenset({12}))
 
 
 def test_fully_open_unstack_accepts_missing_rest_stack(monkeypatch):
@@ -2228,6 +2348,11 @@ def test_parser_requires_push_and_revset_and_rejects_abbreviations():
     assert script.parse_args(
         ["push", "--close-omitted", "12", "--close-omitted", "13", "a"]
     ).close_omitted == [12, 13]
+    assert script.parse_args(["push", "--plan", "-vv", "a"]).verbose == 2
+    with pytest.raises(SystemExit):
+        script.parse_args(["push", "--plan", "--yes", "a"])
+    with pytest.raises(SystemExit):
+        script.parse_args(["push", "-vvv", "a"])
 
 
 def test_sparse_boundaries_count_complete_segments():
