@@ -49,6 +49,37 @@ function __fish_jj_grove_is_active
     __fish_jj_grove_args_after_grove >/dev/null
 end
 
+function __fish_jj_args_after_custom_command
+    set -l subcommand $argv[1]
+    set -l args (__fish_jj_grove_args_after_globals)
+    or return 1
+
+    test (count $args) -gt 0
+    or return 1
+    test "$args[1]" = "$subcommand"
+    or return 1
+
+    set -e args[1]
+    if test (count $args) -gt 0
+        printf '%s\n' $args
+    end
+    return 0
+end
+
+function __fish_jj_fixup_is_active
+    __fish_jj_args_after_custom_command fixup >/dev/null
+end
+
+function __fish_jj_squash_fixups_is_active
+    __fish_jj_args_after_custom_command squash-fixups >/dev/null
+end
+
+function __fish_jj_custom_is_active
+    __fish_jj_grove_is_active
+    or __fish_jj_fixup_is_active
+    or __fish_jj_squash_fixups_is_active
+end
+
 function __fish_jj_grove_needs_jj_subcommand
     set -l args (__fish_jj_grove_args_after_globals)
     or return 1
@@ -114,6 +145,26 @@ function __fish_jj_grove_revs_expected
     test (count $argv) -eq 0
 end
 
+function __fish_jj_fixup_revs_expected
+    set -l args (__fish_jj_args_after_custom_command fixup)
+    or return 1
+
+    argparse -s m/message= h/help -- $args 2>/dev/null
+    or return 1
+
+    test (count $argv) -eq 0
+end
+
+function __fish_jj_squash_fixups_revs_expected
+    set -l args (__fish_jj_args_after_custom_command squash-fixups)
+    or return 1
+
+    argparse -s h/help -- $args 2>/dev/null
+    or return 1
+
+    test (count $argv) -eq 0
+end
+
 function __fish_jj_grove_completion_global_args
     set -l words (commandline -xpc)
     set -e words[1]
@@ -152,10 +203,19 @@ function __fish_jj_grove_complete_revs
 end
 
 complete --keep-order --exclusive --command jj \
-    --condition 'not __fish_jj_grove_is_active' \
+    --condition 'not __fish_jj_custom_is_active' \
     --arguments '(COMPLETE=fish jj -- (commandline --current-process --tokenize --cut-at-cursor) (commandline --current-token))'
 
 complete -c jj -n '__fish_jj_grove_is_active' -f
+complete -c jj -n '__fish_jj_fixup_is_active' -f
+complete -c jj -n '__fish_jj_squash_fixups_is_active' -f
+
+complete -c jj -n '__fish_jj_fixup_is_active' -s m -l message -r \
+    -d 'Append a suffix to the fixup description'
+complete -c jj -n '__fish_jj_fixup_revs_expected' \
+    -a '(__fish_jj_grove_complete_revs)'
+complete -c jj -n '__fish_jj_squash_fixups_revs_expected' \
+    -a '(__fish_jj_grove_complete_revs)'
 
 complete -c jj -n '__fish_jj_grove_needs_jj_subcommand' -f -a grove \
     -d 'Manage groves and their workspaces'

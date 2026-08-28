@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  status=${1:-2}
+  cat >&2 <<'EOF'
+usage: jj fixup [REVISION] [-m SUFFIX]
+
+Create a fixup commit at the top of REVISION's existing fixup stack.
+REVISION defaults to @.
+The new fixup becomes the working-copy commit, and existing children are
+rebased onto it.
+EOF
+  exit "$status"
+}
+
+die() {
+  printf 'jj fixup: %s\n' "$*" >&2
+  exit 2
+}
+
+revision=@
+revision_set=0
+suffix=
+while (($#)); do
+  case $1 in
+    -h|--help)
+      usage 0
+      ;;
+    -m|--message)
+      option=$1
+      shift
+      (($#)) || die "$option requires a message"
+      suffix=$1
+      shift
+      ;;
+    --message=*)
+      suffix=${1#--message=}
+      shift
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      ((revision_set == 0)) || die "too many revisions"
+      revision=$1
+      revision_set=1
+      shift
+      ;;
+  esac
+done
+
+jj_cmd=(jj)
+if [[ -n ${JJ_WORKSPACE_ROOT:-} ]]; then
+  jj_cmd+=(--repository "$JJ_WORKSPACE_ROOT")
+fi
+
+target="_fixup_target(($revision))"
+target_id=$("${jj_cmd[@]}" log --no-graph -r "$target" -T 'change_id.short(8)')
+destination="exactly(heads(with_fixups($target)), 1)"
+description="fixup($target_id)"
+if [[ -n $suffix ]]; then
+  description+=": $suffix"
+fi
+
+"${jj_cmd[@]}" new --insert-after "$destination" -m "$description"

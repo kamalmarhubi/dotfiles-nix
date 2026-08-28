@@ -25,22 +25,27 @@ try = ["util", "exec", "--", "jj-try"]
 sprout = ["grove", "sprout"]
 grove = ["util", "exec", "--", "jj-grove"]
 gh-fork = ["util", "exec", "--", "jj-gh-fork"]
+squash-fixups = ["util", "exec", "--", "jj-squash-fixups"]
+fixup = ["util", "exec", "--", "jj-fixup"]
 
 [revset-aliases]
 # Empty non-merge commits, blank descriptions, wip/tktk descriptions, and empty
 # marker-descendant merge commits are scratch work.
 'incomplete()' = '''((empty() & (~merges() | descendants(grove_markers()))) | description("") | description(regex-i:'^(wip|tktk)\b')) ~ root()'''
 
-# Preserve the selected revisions. From each tip of a directly contiguous
-# selected component, add contiguous descendant fixup commits.
-'with_fixups(r)' = '''with_fixups(r, visible_heads())'''
-# Restrict added fixups to ancestry paths leading to `to`.
-'with_fixups(r, to)' = '''
-  r | reachable(
+# Fixups form contiguous chains immediately after their non-fixup targets;
+# topology, rather than the descriptive target ID, defines each chain.
+'fixups()' = '''subject(regex:"^fixup\\b")'''
+'_fixup_target(r)' = '''exactly(heads(::exactly(r, 1) ~ fixups()), 1)'''
+'fixups(r)' = '''fixups(r, visible_heads())'''
+'fixups(r, to)' = '''
+  reachable(
     r ~ parents(r),
-    (r ~ parents(r))::to & ((r ~ parents(r)) | subject(regex:"^fixup\\b"))
-  )
+    (r ~ parents(r))::to & ((r ~ parents(r)) | fixups())
+  ) ~ r
 '''
+'with_fixups(r)' = '''r | fixups(r)'''
+'with_fixups(r, to)' = '''r | fixups(r, to)'''
 
 # A "grove" is a cluster of related work marked by an empty orphan commit. It's
 # the unit the default log is organised around, and lives entirely under

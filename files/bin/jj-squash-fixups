@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  status=${1:-2}
+  cat >&2 <<'EOF'
+usage: jj squash-fixups REVSET
+
+Squash the contiguous fixup commits following exactly one revision into it.
+If this abandons the working-copy commit, jj creates a new empty one.
+EOF
+  exit "$status"
+}
+
+case $# in
+  1)
+    case $1 in
+      -h|--help) usage 0 ;;
+      *) revision=$1 ;;
+    esac
+    ;;
+  *)
+    usage
+    ;;
+esac
+
+destination="_fixup_target(($revision))"
+sources="fixups($destination)"
+sources="($sources) & ::exactly(heads($sources), 1)"
+jj_cmd=(jj)
+if [[ -n ${JJ_WORKSPACE_ROOT:-} ]]; then
+  jj_cmd+=(--repository "$JJ_WORKSPACE_ROOT")
+fi
+"${jj_cmd[@]}" squash \
+  --from "$sources" \
+  --into "$destination" \
+  --use-destination-message
