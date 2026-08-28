@@ -1,0 +1,4403 @@
+#!/usr/bin/env sh
+
+# Trick to make this both a shell script and Python script.
+"""true"
+if command -v uv >/dev/null; then
+  exec uv run --script "$0" "$@"
+elif command -v pipx >/dev/null; then
+  exec pipx run "$0" "$@"
+else
+  echo "Neither uv nor pipx are available" >&2
+  exit 1
+fi
+"""
+
+# <3 PEP 723 – Inline script metadata and uv / pipx support of it.
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "markdown-it-py==4.2.0",
+# ]
+# ///
+# Imports follow the shell/Python polyglot preamble.
+"""Publish jj revision boundaries as the authoritative GitHub PR stack."""
+
+import argparse
+import difflib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from enum import Enum
+from urllib.parse import urlparse
+
+from markdown_it import MarkdownIt
+from markdown_it.rules_inline.newline import newline as _parse_newline
+from markdown_it.rules_inline.state_inline import StateInline
+
+
+class Error(Exception):
+    pass
+
+
+def command(
+    args: list[str],
+    *,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    stdin_text: str | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    if globals().get("VERBOSITY", 0) >= 2:
+        print(f"+ {shlex.join(args)}", file=sys.stderr)
+    result = subprocess.run(
+        args,
+        cwd=cwd,
+        env=env,
+        input=stdin_text,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if globals().get("VERBOSITY", 0) >= 2:
+        for output in (result.stdout, result.stderr):
+            if output.strip():
+                print(output.rstrip(), file=sys.stderr)
+    if check and result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise Error(f"`{shlex.join(args)}` failed" + (f":\n{detail}" if detail else ""))
+    return result
+
+
+def jj_command() -> list[str]:
+    result = ["jj", "--color=never"]
+    if root := os.environ.get("JJ_WORKSPACE_ROOT"):
+        result.extend(["--repository", root])
+    return result
+
+
+JJ = jj_command()
+INSPECTION_OPERATION: str | None = None
+VERBOSITY = 0
+
+
+def jj(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return command([*JJ, *args], check=check)
+
+
+def jj_inspect(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    operation = INSPECTION_OPERATION or "@"
+    return command([*JJ, f"--at-op={operation}", *args], check=check)
+
+
+def jj_output(*args: str) -> str:
+    return jj_inspect(*args).stdout
+
+
+def revision_ids(revset: str) -> list[str]:
+    return jj_output(
+        "log",
+        "--color=never",
+        "--no-graph",
+        "--reversed",
+        "-r",
+        revset,
+        "-T",
+        'commit_id ++ "\\n"',
+    ).splitlines()
+
+
+def revset_union(ids: Iterable[str]) -> str:
+    return "(" + " | ".join(ids) + ")"
+
+
+def parent_ids_for_commits(commit_ids: Iterable[str]) -> dict[str, tuple[str, ...]]:
+    requested = tuple(dict.fromkeys(commit_ids))
+    if not requested:
+        return {}
+    rows = jj_output(
+        "log",
+        "--color=never",
+        "--no-graph",
+        "-r",
+        revset_union(requested),
+        "-T",
+        'commit_id ++ "\\t" ++ parents.map(|p| p.commit_id()).join(",") ++ "\\n"',
+    ).splitlines()
+    result = {}
+    for row in rows:
+        fields = row.split("\t")
+        if len(fields) != 2 or fields[0] in result:
+            raise Error("could not read batched revision parents from jj")
+        result[fields[0]] = tuple(filter(None, fields[1].split(",")))
+    if set(result) != set(requested):
+        raise Error("batched revision parents did not match the requested revisions")
+    return result
+
+
+@dataclass(frozen=True)
+class Selection:
+    boundaries: tuple[str, ...]
+    commits: tuple[str, ...]
+    fork: str
+    tip: str
+
+
+def exactly_one(revset: str, what: str) -> str:
+    result = jj_inspect(
+        "log",
+        "--color=never",
+        "--no-graph",
+        "-r",
+        f"exactly({revset}, 1)",
+        "-T",
+        'commit_id ++ "\\n"',
+        check=False,
+    )
+    values = result.stdout.splitlines()
+    if result.returncode != 0 or len(values) != 1:
+        raise Error(f"requested history must have exactly one {what}")
+    return values[0]
+
+
+def validate_stack_commits(commits: list[str]) -> None:
+    selected = "(" + " | ".join(commits) + ")"
+    disallowed = revision_ids(f"{selected} & stack_disallowed()")
+    if not disallowed:
+        return
+    rendered = []
+    for commit_id in disallowed:
+        change_id = jj_output(
+            "log",
+            "--color=never",
+            "--no-graph",
+            "-r",
+            commit_id,
+            "-T",
+            'change_id.shortest(8) ++ "\\n"',
+        ).strip()
+        title = jj_output(
+            "log",
+            "--color=never",
+            "--no-graph",
+            "-r",
+            commit_id,
+            "-T",
+            'description.first_line() ++ "\\n"',
+        ).rstrip("\n")
+        rendered.append(f"  {change_id} {json.dumps(title or '<no description>')}")
+    raise Error(
+        "selected history contains commits disallowed by stack_disallowed():\n"
+        + "\n".join(rendered)
+        + "\nReword them with `jj describe`, or fold them with `jj squash`."
+    )
+
+
+def git_commit_exists(git_root: str, oid: str) -> bool:
+    return (
+        command(
+            [
+                "git",
+                "--no-replace-objects",
+                "-C",
+                git_root,
+                "cat-file",
+                "-e",
+                f"{oid}^{{commit}}",
+            ],
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def ensure_git_commit(git_root: str, remote: str, oid: str) -> None:
+    shallow = command(
+        ["git", "-C", git_root, "rev-parse", "--is-shallow-repository"]
+    ).stdout.strip()
+    if shallow == "true":
+        raise Error(
+            "shallow Git repositories are not supported because live-base ancestry "
+            "cannot be validated without changing shallow metadata"
+        )
+    if shallow != "false":
+        raise Error("could not determine whether the Git repository is shallow")
+    if git_commit_exists(git_root, oid):
+        return
+    fetched = command(
+        [
+            "git",
+            "-C",
+            git_root,
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            "--no-auto-maintenance",
+            "--no-write-commit-graph",
+            "--no-recurse-submodules",
+            remote,
+            oid,
+        ],
+        check=False,
+    )
+    if fetched.returncode != 0 or not git_commit_exists(git_root, oid):
+        detail = fetched.stderr.strip() or fetched.stdout.strip()
+        raise Error(
+            f"could not fetch exact live base commit {oid[:12]} without updating refs"
+            + (f":\n{detail}" if detail else "")
+        )
+
+
+def git_fork(git_root: str, tip: str, base_oid: str) -> str:
+    result = command(
+        [
+            "git",
+            "--no-replace-objects",
+            "-C",
+            git_root,
+            "merge-base",
+            "--all",
+            tip,
+            base_oid,
+        ],
+        check=False,
+    )
+    forks = result.stdout.splitlines()
+    if result.returncode != 0 or not forks:
+        raise Error("requested history has no common ancestor with the live base")
+    if len(forks) != 1:
+        raise Error(
+            "requested history has multiple merge bases with the live base; "
+            "restack it onto the current base"
+        )
+    return forks[0]
+
+
+def validate_boundaries(
+    boundaries: list[str],
+    base_oid: str,
+    git_root: str,
+    remote: str,
+    *,
+    reject_divergence: bool = True,
+) -> Selection:
+    if not boundaries:
+        raise Error("revset selects no PR boundaries")
+    selected = "(" + " | ".join(boundaries) + ")"
+    tip = exactly_one(f"heads({selected})", "selected tip")
+    ensure_git_commit(git_root, remote, base_oid)
+    fork = git_fork(git_root, tip, base_oid)
+    if revision_ids(fork) != [fork]:
+        raise Error(f"Git merge base {fork[:12]} is not available in jj")
+    if revision_ids(f"{fork} & root()"):
+        raise Error("requested history forks at the virtual root")
+    commits = revision_ids(f"{fork}..{tip}")
+    if not commits or not set(boundaries) <= set(commits):
+        raise Error("every selected PR boundary must be inside the fork-to-tip history")
+    if reject_divergence and revision_ids(f"({fork}..{tip}) & divergent()"):
+        raise Error("requested history contains divergent changes; resolve them first")
+    if revision_ids(f"{selected} & hidden()"):
+        raise Error("selected PR boundaries must be visible (not abandoned)")
+    parents_by_commit = parent_ids_for_commits(commits)
+    previous = fork
+    for commit_id in commits:
+        parents = parents_by_commit[commit_id]
+        if parents != (previous,):
+            raise Error(
+                "fork-to-tip history must be a linear parent chain without merges; "
+                f"{commit_id[:12]} does not directly follow {previous[:12]}"
+            )
+        previous = commit_id
+    validate_stack_commits(commits)
+    return Selection(tuple(boundaries), tuple(commits), fork, tip)
+
+
+@dataclass(frozen=True)
+class Revision:
+    commit_id: str
+    change_id: str
+    local_bookmarks: tuple[str, ...]
+    remote_bookmarks: tuple[str, ...]
+    title: str
+    body: str
+    generated_bookmark: str
+
+
+def _record_newline(state: StateInline, silent: bool) -> bool:
+    offset = state.pos
+    token_count = len(state.tokens)
+    matched = _parse_newline(state, silent)
+    if (
+        matched
+        and not silent
+        and len(state.tokens) > token_count
+        and state.tokens[-1].type == "softbreak"
+    ):
+        state.tokens[-1].meta["inline_offset"] = offset
+    return matched
+
+
+_MARKDOWN = MarkdownIt("commonmark").enable("table")
+_MARKDOWN.inline.ruler.at("newline", _record_newline)
+
+
+def reflow_markdown(body: str) -> str:
+    tokens = _MARKDOWN.parse(body)
+    line_endings = list(re.finditer(r"\r\n|\r|\n", body))
+    edits = []
+    for index, token in enumerate(tokens):
+        if token.type != "paragraph_open" or token.level != 0:
+            continue
+        inline = tokens[index + 1]
+        if inline.type != "inline" or inline.map is None:
+            raise Error("markdown parser returned an unexpected paragraph structure")
+        for child in inline.children or []:
+            if child.type != "softbreak":
+                continue
+            offset = child.meta.get("inline_offset")
+            if not isinstance(offset, int):
+                raise Error("markdown parser returned a soft break without an offset")
+            line = inline.map[0] + inline.content.count("\n", 0, offset)
+            if line >= len(line_endings):
+                raise Error("markdown parser returned an invalid soft-break offset")
+            edits.append(line_endings[line].span())
+    for start, end in reversed(edits):
+        body = body[:start] + " " + body[end:]
+    return body
+
+
+def revision_details(
+    revisions: list[str], remote: str, required_titles: set[str] | None = None
+) -> list[Revision]:
+    template = jj_inspect("config", "get", "templates.git_push_bookmark", check=False)
+    if template.returncode != 0 or not (push_template := template.stdout.rstrip("\n")):
+        raise Error("templates.git_push_bookmark is empty or unavailable")
+    remote_literal = json.dumps(remote)
+    record_template = (
+        "'{\"commit_id\":' ++ stringify(commit_id).escape_json()"
+        " ++ ',\"change_id\":' ++ stringify(change_id).escape_json()"
+        " ++ ',\"local_bookmarks\":' ++ json(local_bookmarks.map(|b| b.name()))"
+        " ++ ',\"remote_bookmarks\":' ++ json(remote_bookmarks"
+        f".filter(|b| b.remote() == {remote_literal}).map(|b| b.name()))"
+        " ++ ',\"local_conflicts\":' ++ json(local_bookmarks"
+        ".filter(|b| b.conflict()).map(|b| b.name()))"
+        " ++ ',\"remote_conflicts\":' ++ json(remote_bookmarks"
+        f".filter(|b| b.remote() == {remote_literal} && b.conflict())"
+        ".map(|b| b.name()))"
+        " ++ ',\"description\":' ++ description.escape_json()"
+        " ++ ',\"generated_bookmark\":' ++ stringify(("
+        + push_template
+        + ")).escape_json() ++ '}' ++ \"\\n\""
+    )
+    selected = "(" + " | ".join(revisions) + ")"
+    output = jj_output(
+        "log",
+        "--color=never",
+        "--no-graph",
+        "-r",
+        selected,
+        "-T",
+        record_template,
+    )
+    expected_fields = {
+        "commit_id",
+        "change_id",
+        "local_bookmarks",
+        "remote_bookmarks",
+        "local_conflicts",
+        "remote_conflicts",
+        "description",
+        "generated_bookmark",
+    }
+    records = {}
+    for line in output.splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise Error("could not read batched revision metadata from jj") from exc
+        if not isinstance(record, dict) or set(record) != expected_fields:
+            raise Error("could not read batched revision metadata from jj")
+        commit_id = record["commit_id"]
+        string_fields = (
+            "commit_id",
+            "change_id",
+            "description",
+            "generated_bookmark",
+        )
+        list_fields = (
+            "local_bookmarks",
+            "remote_bookmarks",
+            "local_conflicts",
+            "remote_conflicts",
+        )
+        if (
+            any(not isinstance(record[field], str) for field in string_fields)
+            or any(not isinstance(record[field], list) for field in list_fields)
+            or any(
+                not isinstance(value, str)
+                for field in list_fields
+                for value in record[field]
+            )
+            or not isinstance(commit_id, str)
+            or commit_id in records
+        ):
+            raise Error("could not read batched revision metadata from jj")
+        records[commit_id] = record
+    if set(records) != set(revisions) or len(records) != len(revisions):
+        raise Error("batched revision metadata did not match the requested revisions")
+
+    details = []
+    for commit_id in revisions:
+        record = records[commit_id]
+        change_id = record["change_id"]
+        local_bookmarks = record["local_bookmarks"]
+        remote_bookmarks = record["remote_bookmarks"]
+        conflicts = [*record["local_conflicts"], *record["remote_conflicts"]]
+        if conflicts:
+            raise Error(
+                f"revision {commit_id} has conflicted bookmark targets: "
+                + ", ".join(conflicts)
+            )
+        description = record["description"].rstrip("\n")
+        title, separator, body = description.partition("\n")
+        if not title and (required_titles is None or commit_id in required_titles):
+            raise Error(f"revision {commit_id} has no description title")
+        if separator:
+            body = reflow_markdown(body.removeprefix("\n"))
+        generated = record["generated_bookmark"]
+        if not generated or any(char in generated for char in "\r\n\0"):
+            raise Error(
+                "templates.git_push_bookmark must produce one nonempty line per revision"
+            )
+        details.append(
+            Revision(
+                commit_id,
+                change_id,
+                tuple(local_bookmarks),
+                tuple(remote_bookmarks),
+                title,
+                body,
+                generated,
+            )
+        )
+    return details
+
+
+def push_remote(override: str | None) -> str:
+    if override:
+        return override
+    configured = jj_inspect("config", "get", "git.push", check=False)
+    if configured.returncode == 0 and (remote := configured.stdout.strip()):
+        return remote
+    return "origin"
+
+
+@dataclass(frozen=True)
+class Repository:
+    git_root: str
+    name_with_owner: str
+    gh_repo: str
+    host: str
+    base: str
+    url: str
+
+
+def github_repository(remote: str, base_override: str | None) -> Repository:
+    git_root = jj_output("git", "root").strip()
+    if not git_root:
+        raise Error("could not find the jj Git store")
+    remote_url = command(
+        ["git", "-C", git_root, "remote", "get-url", "--push", remote]
+    ).stdout.strip()
+    view = command(
+        [
+            "gh",
+            "repo",
+            "view",
+            remote_url,
+            "--json",
+            "nameWithOwner,url,defaultBranchRef",
+        ],
+        cwd=git_root,
+    )
+    try:
+        metadata = json.loads(view.stdout)
+        name_with_owner = metadata["nameWithOwner"]
+        url = metadata["url"]
+        base = base_override or metadata["defaultBranchRef"]["name"]
+    except (KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise Error("could not read repository metadata from `gh repo view`") from exc
+    host = urlparse(url).hostname
+    if not host:
+        raise Error(f"could not determine GitHub host from {url}")
+    gh_repo = (
+        name_with_owner if host.lower() == "github.com" else f"{host}/{name_with_owner}"
+    )
+    return Repository(git_root, name_with_owner, gh_repo, host, base, url)
+
+
+@dataclass(frozen=True)
+class PullRequest:
+    node_id: str
+    number: int
+    url: str
+    state: str
+    merged: bool
+    draft: bool
+    title: str
+    body: str
+    head: str
+    head_oid: str
+    base: str
+    base_oid: str
+    commits: int
+    stack_id: str | None
+    stack_number: int | None
+    auto_merge: bool = False
+    merge_queue: bool = False
+    repository: str | None = None
+    head_repository: str | None = None
+    head_ref_oid: str | None = None
+
+
+@dataclass
+class StackSnapshot:
+    node_id: str | None
+    number: int | None
+    entries: list[PullRequest]
+    discovered: dict[str, PullRequest] = field(default_factory=dict)
+
+    @property
+    def merged(self) -> list[PullRequest]:
+        return [pr for pr in self.entries if pr.merged]
+
+    @property
+    def active(self) -> list[PullRequest]:
+        return [pr for pr in self.entries if pr.state == "OPEN"]
+
+    @property
+    def closed(self) -> list[PullRequest]:
+        return [pr for pr in self.entries if pr.state == "CLOSED" and not pr.merged]
+
+
+def open_suffix_root(stack: StackSnapshot, base_oid: str) -> str:
+    return stack.merged[-1].head_oid if stack.merged else base_oid
+
+
+def verify_stack_snapshot_unchanged(
+    before: StackSnapshot,
+    after: StackSnapshot,
+    expected_head_refs: dict[str, str] | None = None,
+    expected_base_refs: dict[str, str] | None = None,
+    *,
+    normalize_after: bool = False,
+) -> None:
+    def identity(
+        stack: StackSnapshot,
+        head_refs: dict[str, str] | None = None,
+        base_refs: dict[str, str] | None = None,
+    ) -> tuple[object, ...]:
+        def expected_oid(
+            pr: PullRequest,
+            refs: dict[str, str] | None,
+            name: str,
+            oid: str,
+        ) -> str:
+            if refs is not None and pr.state == "OPEN":
+                return refs.get(name, oid)
+            return oid
+
+        return (
+            stack.node_id,
+            stack.number,
+            tuple(
+                (
+                    pr.node_id,
+                    pr.number,
+                    pr.state,
+                    pr.merged,
+                    pr.draft,
+                    pr.title,
+                    pr.body,
+                    pr.head,
+                    expected_oid(pr, head_refs, pr.head, pr.head_oid),
+                    pr.base,
+                    expected_oid(pr, base_refs, pr.base, pr.base_oid),
+                    pr.auto_merge,
+                    pr.merge_queue,
+                    pr.repository,
+                    pr.head_repository,
+                )
+                for pr in stack.entries
+            ),
+        )
+
+    after_identity = (
+        identity(after, expected_head_refs, expected_base_refs)
+        if normalize_after
+        else identity(after)
+    )
+    if identity(before, expected_head_refs, expected_base_refs) != after_identity:
+        raise Error(
+            "GitHub stack membership, order, state, or refs changed during "
+            "reconciliation; replan and retry"
+        )
+
+
+def graphql(
+    query: str,
+    variables: dict[str, object],
+    gh_env: dict[str, str],
+    git_root: str,
+    failure: str,
+) -> dict[str, object]:
+    result = command(
+        ["gh", "api", "graphql", "--input", "-"],
+        cwd=git_root,
+        env=gh_env,
+        stdin_text=json.dumps({"query": query, "variables": variables}),
+        check=False,
+    )
+    try:
+        response = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise Error(
+            failure + (f": {result.stderr.strip()}" if result.stderr.strip() else "")
+        ) from exc
+    if not isinstance(response, dict):
+        raise Error(
+            failure + (f": {result.stderr.strip()}" if result.stderr.strip() else "")
+        )
+    errors = response.get("errors")
+    if result.returncode != 0 or errors:
+        detail = "; ".join(error.get("message", str(error)) for error in errors or [])
+        raise Error(
+            failure
+            + (
+                f": {detail or result.stderr.strip()}"
+                if detail or result.stderr.strip()
+                else ""
+            )
+        )
+    try:
+        return response["data"]
+    except (KeyError, TypeError) as exc:
+        raise Error(failure) from exc
+
+
+_PR_FIELDS = """
+  id number url state merged isDraft title body headRefName headRefOid
+  headRef { name target { oid } }
+  baseRefName baseRefOid commits { totalCount }
+  repository { nameWithOwner }
+  headRepository { nameWithOwner }
+  stack { id number }
+  autoMergeRequest { enabledAt }
+  mergeQueueEntry { id }
+"""
+
+_GRAPHQL_BATCH_SIZE = 25
+
+
+def discover_merged_selectors(
+    name_with_owner: str,
+    selected_oids: list[str],
+    base: str,
+    gh_env: dict[str, str],
+    git_root: str,
+) -> tuple[dict[str, tuple[PullRequest, ...]], str]:
+    """Return exact historical merged-stack PR matches for selected OIDs."""
+    owner, name = name_with_owner.split("/", 1)
+    result = {}
+    base_oid = None
+    unique_oids = list(dict.fromkeys(selected_oids))
+    for start in range(0, len(unique_oids), _GRAPHQL_BATCH_SIZE):
+        batch = unique_oids[start : start + _GRAPHQL_BATCH_SIZE]
+        declarations = ["$owner: String!", "$name: String!", "$base: String!"]
+        selections = ["baseRef: ref(qualifiedName: $base) { target { oid } }"]
+        variables: dict[str, object] = {
+            "owner": owner,
+            "name": name,
+            "base": f"refs/heads/{base}",
+        }
+        for index, oid in enumerate(batch):
+            variable = f"oid{index}"
+            declarations.append(f"${variable}: String!")
+            variables[variable] = oid
+            selections.append(
+                f"commit{index}: object(expression: ${variable}) {{"
+                " ... on Commit { associatedPullRequests(first: 100) { nodes {"
+                f" {_PR_FIELDS} historical: commits(last: 1) {{"
+                " nodes { commit { oid } } } } pageInfo { hasNextPage } } } }"
+            )
+        query = (
+            f"query({', '.join(declarations)}) {{"
+            f" repository(owner: $owner, name: $name) {{ {' '.join(selections)} }} }}"
+        )
+        data = graphql(
+            query,
+            variables,
+            gh_env,
+            git_root,
+            "could not verify historical pull request identities for selected commits",
+        )
+        try:
+            repository = data["repository"]
+            if repository is None:
+                raise KeyError("repository")
+            base_ref = repository["baseRef"]
+            if base_ref is None:
+                raise Error(f"remote branch does not exist: {base}")
+            current_base_oid = base_ref["target"]["oid"]
+            if not isinstance(current_base_oid, str):
+                raise KeyError("baseRef")
+            if base_oid is not None and current_base_oid != base_oid:
+                raise Error(f"remote base branch changed during discovery: {base}")
+            base_oid = current_base_oid
+            for index, oid in enumerate(batch):
+                commit = repository[f"commit{index}"]
+                if commit is None:
+                    continue
+                connection = commit["associatedPullRequests"]
+                if connection["pageInfo"]["hasNextPage"]:
+                    raise Error(
+                        f"more than 100 pull requests contain {oid[:12]}; "
+                        "historical identity is incomplete"
+                    )
+                matches = []
+                open_match = False
+                for node in connection["nodes"]:
+                    head_repository = node.get("headRepository")
+                    repository_local = bool(
+                        (node.get("repository") or {}).get("nameWithOwner", "").lower()
+                        == name_with_owner.lower()
+                        and head_repository
+                        and head_repository.get("nameWithOwner", "").lower()
+                        == name_with_owner.lower()
+                    )
+                    if (
+                        node["state"] == "OPEN"
+                        and node["headRefOid"] == oid
+                        and repository_local
+                    ):
+                        open_match = True
+                    historical = node["historical"]["nodes"]
+                    if not node["merged"]:
+                        continue
+                    if len(historical) != 1:
+                        raise Error(
+                            "could not establish the historical final commit of "
+                            f"PR #{node['number']}"
+                        )
+                    if historical[0]["commit"]["oid"] != oid:
+                        continue
+                    if not repository_local:
+                        raise Error(
+                            f"PR #{node['number']} matches {oid[:12]}, but its "
+                            "repository-local identity cannot be verified"
+                        )
+                    pr = parse_pr(node)
+                    if pr.stack_id is not None:
+                        matches.append(pr)
+                if matches and open_match:
+                    raise Error(
+                        f"selected OID {oid[:12]} is ambiguously both an open PR "
+                        "boundary and a merged selector"
+                    )
+                stack_ids = {pr.stack_id for pr in matches}
+                if len(stack_ids) > 1:
+                    rendered = ", ".join(f"#{pr.number}" for pr in matches)
+                    raise Error(
+                        f"merged selector {oid[:12]} identifies multiple GitHub "
+                        f"stacks through {rendered}"
+                    )
+                if matches:
+                    result[oid] = tuple(matches)
+        except Error:
+            raise
+        except (KeyError, TypeError) as exc:
+            raise Error(
+                "could not verify historical pull request identities for selected commits"
+            ) from exc
+    if base_oid is None:
+        raise Error(f"remote branch does not exist: {base}")
+    return result, base_oid
+
+
+def selector_stack(
+    selectors: dict[str, tuple[PullRequest, ...]],
+    gh_env: dict[str, str],
+    git_root: str,
+) -> StackSnapshot | None:
+    stack_ids = {pr.stack_id for matches in selectors.values() for pr in matches}
+    if not stack_ids:
+        return None
+    if len(stack_ids) != 1:
+        raise Error("selected merged commits identify multiple GitHub stacks")
+    stack_id = stack_ids.pop()
+    assert stack_id is not None
+    stack = fetch_stack(stack_id, gh_env, git_root)
+    positions = {pr.node_id: index for index, pr in enumerate(stack.entries)}
+    for oid, matches in selectors.items():
+        if any(pr.node_id not in positions for pr in matches):
+            raise Error(
+                f"merged selector {oid[:12]} is not present in its reported GitHub stack"
+            )
+        if any(not stack.entries[positions[pr.node_id]].merged for pr in matches):
+            raise Error(
+                f"merged selector {oid[:12]} is not in the immutable merged prefix"
+            )
+    selector_items = list(selectors.items())
+    for index, (lower_oid, lower_matches) in enumerate(selector_items):
+        lower_positions = [positions[pr.node_id] for pr in lower_matches]
+        for upper_oid, upper_matches in selector_items[index + 1 :]:
+            upper_positions = [positions[pr.node_id] for pr in upper_matches]
+            if revision_ids(f"{lower_oid} & ::{upper_oid}"):
+                before, after = lower_positions, upper_positions
+            elif revision_ids(f"{upper_oid} & ::{lower_oid}"):
+                before, after = upper_positions, lower_positions
+            else:
+                continue
+            if max(before) >= min(after):
+                raise Error(
+                    "locally comparable merged selectors contradict GitHub stack order: "
+                    f"{lower_oid[:12]} and {upper_oid[:12]}"
+                )
+    return stack
+
+
+def parse_pr(
+    node: dict[str, object], stack: dict[str, object] | None = None
+) -> PullRequest:
+    try:
+        pr_stack = stack or node.get("stack")
+        head_ref = node.get("headRef")
+        head_ref_oid = head_ref["target"]["oid"] if head_ref is not None else None
+        if head_ref is not None and (
+            head_ref["name"] != node["headRefName"]
+            or (node["state"] == "OPEN" and head_ref_oid != node["headRefOid"])
+        ):
+            raise KeyError("headRef")
+        return PullRequest(
+            node_id=node["id"],
+            number=node["number"],
+            url=node["url"],
+            state=node["state"],
+            merged=node["merged"],
+            draft=node["isDraft"],
+            title=node["title"],
+            body=node.get("body") or "",
+            head=node["headRefName"],
+            head_oid=node["headRefOid"],
+            base=node["baseRefName"],
+            base_oid=node["baseRefOid"],
+            commits=node["commits"]["totalCount"],
+            stack_id=pr_stack["id"] if pr_stack else None,
+            stack_number=pr_stack["number"] if pr_stack else None,
+            auto_merge=node.get("autoMergeRequest") is not None,
+            merge_queue=node.get("mergeQueueEntry") is not None,
+            repository=(node.get("repository") or {}).get("nameWithOwner"),
+            head_repository=(node.get("headRepository") or {}).get("nameWithOwner"),
+            head_ref_oid=head_ref_oid,
+        )
+    except (KeyError, TypeError) as exc:
+        raise Error("could not read pull request data from GitHub") from exc
+
+
+def discover_pull_requests(
+    name_with_owner: str,
+    bookmarks: list[str],
+    gh_env: dict[str, str],
+    git_root: str,
+) -> tuple[dict[str, PullRequest], dict[str, str]]:
+    if not bookmarks:
+        return {}, {}
+    owner, name = name_with_owner.split("/", 1)
+    result = {}
+    refs = {}
+    unique_bookmarks = list(dict.fromkeys(bookmarks))
+    for start in range(0, len(unique_bookmarks), _GRAPHQL_BATCH_SIZE):
+        batch = unique_bookmarks[start : start + _GRAPHQL_BATCH_SIZE]
+        declarations = ["$owner: String!", "$name: String!"]
+        selections = []
+        variables: dict[str, object] = {"owner": owner, "name": name}
+        for index, bookmark in enumerate(batch):
+            variable = f"head{index}"
+            qualified = f"qualified{index}"
+            declarations.append(f"${variable}: String!")
+            declarations.append(f"${qualified}: String!")
+            variables[variable] = bookmark
+            variables[qualified] = f"refs/heads/{bookmark}"
+            selections.append(
+                f"pr{index}: pullRequests(first: 100, states: OPEN, "
+                f"headRefName: ${variable}) {{ nodes {{ {_PR_FIELDS} }} "
+                "pageInfo { hasNextPage } }"
+            )
+            selections.append(
+                f"ref{index}: ref(qualifiedName: ${qualified}) {{ target {{ oid }} }}"
+            )
+        query = (
+            f"query({', '.join(declarations)}) {{"
+            f" repository(owner: $owner, name: $name) {{ {' '.join(selections)} }} }}"
+        )
+        data = graphql(
+            query,
+            variables,
+            gh_env,
+            git_root,
+            "could not look up pull requests on GitHub",
+        )
+        try:
+            repository = data["repository"]
+            if repository is None:
+                raise KeyError("repository")
+            for index, bookmark in enumerate(batch):
+                ref = repository[f"ref{index}"]
+                if ref is not None:
+                    oid = ref["target"]["oid"]
+                    if not isinstance(oid, str):
+                        raise KeyError(f"ref{index}")
+                    refs[bookmark] = oid
+                connection = repository[f"pr{index}"]
+                if connection["pageInfo"]["hasNextPage"]:
+                    raise Error(
+                        f"more than 100 open pull requests have head {bookmark}; "
+                        "cannot identify it safely"
+                    )
+                nodes = [
+                    node
+                    for node in connection["nodes"]
+                    if (node.get("headRepository") or {})
+                    .get("nameWithOwner", "")
+                    .lower()
+                    == name_with_owner.lower()
+                ]
+                if len(nodes) > 1:
+                    raise Error(f"multiple open pull requests have head {bookmark}")
+                if nodes:
+                    pr = parse_pr(nodes[0])
+                    if pr.head_ref_oid is None or pr.head_ref_oid != refs.get(bookmark):
+                        raise Error(
+                            f"open PR #{pr.number} branch changed during discovery"
+                        )
+                    result[bookmark] = pr
+        except Error:
+            raise
+        except (KeyError, TypeError) as exc:
+            raise Error("could not read pull requests from GitHub") from exc
+    return result, refs
+
+
+def fetch_stack(stack_id: str, gh_env: dict[str, str], git_root: str) -> StackSnapshot:
+    query = f"""query($id: ID!) {{
+      node(id: $id) {{
+        ... on PullRequestStack {{
+          id number entries(first: 100) {{
+            nodes {{ position pullRequest {{ {_PR_FIELDS} }} }}
+            pageInfo {{ hasNextPage }}
+          }}
+        }}
+      }}
+    }}"""
+    data = graphql(
+        query, {"id": stack_id}, gh_env, git_root, "could not read GitHub stack"
+    )
+    stack = data.get("node")
+    if stack is None:
+        return StackSnapshot(None, None, [])
+    try:
+        entries_data = stack["entries"]
+        if entries_data["pageInfo"]["hasNextPage"]:
+            raise Error("GitHub stacks with more than 100 PRs are not supported")
+        entries = [
+            parse_pr(entry["pullRequest"], stack)
+            for entry in sorted(
+                entries_data["nodes"], key=lambda item: item["position"]
+            )
+        ]
+        seen_unmerged = False
+        for pr in entries:
+            if pr.merged and seen_unmerged:
+                raise Error(
+                    "stack entries are not a merged prefix followed by unmerged PRs"
+                )
+            if not pr.merged:
+                seen_unmerged = True
+        return StackSnapshot(stack["id"], stack["number"], entries)
+    except Error:
+        raise
+    except (KeyError, TypeError) as exc:
+        raise Error("could not read GitHub stack") from exc
+
+
+@dataclass(frozen=True)
+class BaseTransition:
+    node_id: str
+    created_at: str
+    previous: str
+    current: str
+
+
+@dataclass(frozen=True)
+class RecoveryEvidence:
+    first_pr_id: str
+    transition: BaseTransition
+    boundary: PullRequest
+    stack_id: str
+    stack_number: int
+
+
+def pull_request_base_transitions(
+    pr: PullRequest, gh_env: dict[str, str], git_root: str
+) -> tuple[BaseTransition, ...]:
+    transitions = []
+    cursor = None
+    while True:
+        query = """query($id: ID!, $cursor: String) {
+          node(id: $id) {
+            ... on PullRequest {
+              timelineItems(
+                first: 100
+                after: $cursor
+                itemTypes: [BASE_REF_CHANGED_EVENT]
+              ) {
+                nodes {
+                  ... on BaseRefChangedEvent {
+                    id createdAt previousRefName currentRefName
+                  }
+                }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }"""
+        data = graphql(
+            query,
+            {"id": pr.node_id, "cursor": cursor},
+            gh_env,
+            git_root,
+            f"could not read base history for PR #{pr.number}",
+        )
+        try:
+            node = data["node"]
+            if node is None:
+                raise KeyError("node")
+            timeline = node["timelineItems"]
+            transitions.extend(
+                BaseTransition(
+                    event["id"],
+                    event["createdAt"],
+                    event["previousRefName"],
+                    event["currentRefName"],
+                )
+                for event in timeline["nodes"]
+            )
+            page = timeline["pageInfo"]
+            if not page["hasNextPage"]:
+                return tuple(transitions)
+            cursor = page["endCursor"]
+            if not cursor:
+                raise KeyError("endCursor")
+        except (KeyError, TypeError) as exc:
+            raise Error(f"could not read base history for PR #{pr.number}") from exc
+
+
+def merged_pull_request_by_head(
+    name_with_owner: str,
+    head: str,
+    gh_env: dict[str, str],
+    git_root: str,
+) -> PullRequest | None:
+    owner, name = name_with_owner.split("/", 1)
+    query = f"""query(
+      $owner: String!, $name: String!, $head: String!
+    ) {{
+      repository(owner: $owner, name: $name) {{
+        pullRequests(first: 2, states: [MERGED], headRefName: $head) {{
+          totalCount
+          nodes {{ {_PR_FIELDS} }}
+        }}
+      }}
+    }}"""
+    data = graphql(
+        query,
+        {"owner": owner, "name": name, "head": head},
+        gh_env,
+        git_root,
+        f"could not identify merged PR with historical head {head}",
+    )
+    try:
+        repository = data["repository"]
+        if repository is None:
+            raise KeyError("repository")
+        connection = repository["pullRequests"]
+        if connection["totalCount"] > 1:
+            raise Error(
+                f"historical branch {head} identifies multiple merged PRs; "
+                "cannot choose a surviving stack"
+            )
+        nodes = connection["nodes"]
+        if not nodes:
+            return None
+        if len(nodes) != 1:
+            raise KeyError("nodes")
+        pr = parse_pr(nodes[0])
+        if (
+            not pr.merged
+            or pr.repository is None
+            or pr.repository.lower() != name_with_owner.lower()
+        ):
+            raise Error(
+                f"historical branch {head} does not identify one repository-local merged PR"
+            )
+        return pr
+    except Error:
+        raise
+    except (KeyError, TypeError) as exc:
+        raise Error(
+            f"could not identify merged PR with historical head {head}"
+        ) from exc
+
+
+def recover_surviving_stack(
+    selected: list[PullRequest],
+    repo: Repository,
+    gh_env: dict[str, str],
+) -> tuple[StackSnapshot, RecoveryEvidence] | None:
+    if not selected:
+        return None
+    if any(
+        pr.state != "OPEN"
+        or pr.stack_id is not None
+        or pr.repository is None
+        or pr.repository.lower() != repo.name_with_owner.lower()
+        or pr.head_repository is None
+        or pr.head_repository.lower() != repo.name_with_owner.lower()
+        for pr in selected
+    ):
+        return None
+    first = selected[0]
+    transitions = pull_request_base_transitions(first, gh_env, repo.git_root)
+    if not transitions:
+        return None
+    if len(transitions) != 1:
+        raise Error(
+            f"PR #{first.number} has multiple recorded base changes; "
+            "cannot choose a surviving stack"
+        )
+    transition = transitions[0]
+    if transition.current != first.base:
+        raise Error(
+            f"PR #{first.number} base history changed while resolving its stack target"
+        )
+    endpoints = {transition.previous, transition.current}
+    candidates = endpoints - {repo.base}
+    if repo.base not in endpoints or len(candidates) != 1:
+        raise Error(
+            f"PR #{first.number} base history does not identify one historical "
+            "boundary branch"
+        )
+    candidate = candidates.pop()
+    boundary = merged_pull_request_by_head(
+        repo.name_with_owner, candidate, gh_env, repo.git_root
+    )
+    if boundary is None or boundary.stack_id is None:
+        return None
+    stack = fetch_stack(boundary.stack_id, gh_env, repo.git_root)
+    if stack.node_id is None or stack.number is None:
+        return None
+    if not stack.entries or stack.entries[-1].node_id != boundary.node_id:
+        raise Error(
+            f"merged PR #{boundary.number} is not the final member of its surviving stack"
+        )
+    if any(not pr.merged for pr in stack.entries):
+        raise Error(
+            f"surviving stack {stack.number} has unexpected unmerged entries; "
+            "cannot attach the selected PRs safely"
+        )
+    return stack, RecoveryEvidence(
+        first.node_id,
+        transition,
+        boundary,
+        stack.node_id,
+        stack.number,
+    )
+
+
+def verify_recovery_suffix(
+    evidence: RecoveryEvidence,
+    stack: StackSnapshot,
+    states: tuple["BoundaryState", ...],
+    counts: tuple[int, ...],
+    current_base_oid: str,
+    repo: Repository,
+    remote: str,
+) -> None:
+    if (
+        stack.node_id != evidence.stack_id
+        or stack.number != evidence.stack_number
+        or not stack.merged
+        or stack.merged[-1].node_id != evidence.boundary.node_id
+    ):
+        raise Error("surviving stack target changed during recovery planning")
+    if any(state.tracked_oid is None for state in states):
+        raise Error(
+            "historical stack recovery requires a tracked baseline for every PR"
+        )
+    if any(state.live_oid != state.tracked_oid for state in states):
+        verify_mechanical_restack(
+            states,
+            open_suffix_root(stack, ""),
+            counts,
+            repo.git_root,
+            remote,
+            allow_restacked_first=True,
+            alternative_first_parent=current_base_oid,
+        )
+    else:
+        verify_live_suffix(
+            states,
+            open_suffix_root(stack, ""),
+            counts,
+            repo.git_root,
+            remote,
+            allow_restacked_first=True,
+            alternative_first_parent=current_base_oid,
+        )
+
+
+def change_ids_for_commits(commit_ids: Iterable[str]) -> dict[str, str]:
+    requested = tuple(dict.fromkeys(commit_ids))
+    if not requested:
+        return {}
+    rows = jj_output(
+        "log",
+        "--color=never",
+        "--no-graph",
+        "-r",
+        revset_union(requested),
+        "-T",
+        'commit_id ++ "\\t" ++ change_id ++ "\\n"',
+    ).splitlines()
+    result = {}
+    for row in rows:
+        fields = row.split("\t")
+        if len(fields) != 2 or not all(fields) or fields[0] in result:
+            raise Error("could not read batched commit identities from jj")
+        result[fields[0]] = fields[1]
+    if set(result) != set(requested):
+        missing = next((oid for oid in requested if oid not in result), requested[0])
+        raise Error(f"could not identify jj change at {missing[:12]}")
+    return result
+
+
+def commit_ids_for_changes(change_ids: Iterable[str]) -> dict[str, str]:
+    requested = tuple(dict.fromkeys(change_ids))
+    if not requested:
+        return {}
+    rows = jj_output(
+        "log",
+        "--color=never",
+        "--no-graph",
+        "-r",
+        revset_union(requested),
+        "-T",
+        'change_id ++ "\\t" ++ commit_id ++ "\\n"',
+    ).splitlines()
+    matches = {change_id: [] for change_id in requested}
+    for row in rows:
+        fields = row.split("\t")
+        if len(fields) != 2 or not all(fields) or fields[0] not in matches:
+            raise Error("could not read batched change identities from jj")
+        matches[fields[0]].append(fields[1])
+    result = {}
+    for change_id in requested:
+        if len(matches[change_id]) != 1:
+            raise Error(f"could not resolve rewritten jj change {change_id[:12]}")
+        result[change_id] = matches[change_id][0]
+    return result
+
+
+def resolve_heads(
+    revisions: list[Revision],
+    discovered: dict[str, PullRequest],
+) -> tuple[list[str], dict[str, PullRequest]]:
+    heads = []
+    prs = {}
+    for revision in revisions:
+        candidates = (
+            set(revision.local_bookmarks)
+            | set(revision.remote_bookmarks)
+            | {revision.generated_bookmark}
+        )
+        matches = {name: discovered[name] for name in candidates if name in discovered}
+        unique_prs = {pr.node_id for pr in matches.values()}
+        if len(unique_prs) > 1:
+            rendered = ", ".join(
+                f"{name} ({pr.url})" for name, pr in sorted(matches.items())
+            )
+            raise Error(
+                f"revision {revision.commit_id} matches multiple open PRs: {rendered}"
+            )
+        if matches:
+            head, pr = next(iter(matches.items()))
+            head = pr.head
+            prs[head] = pr
+        elif len(revision.local_bookmarks) == 1:
+            head = revision.local_bookmarks[0]
+        elif len(revision.local_bookmarks) > 1:
+            raise Error(
+                f"revision {revision.commit_id} has ambiguous local bookmarks: "
+                + ", ".join(revision.local_bookmarks)
+            )
+        elif len(revision.remote_bookmarks) == 1:
+            head = revision.remote_bookmarks[0]
+        elif len(revision.remote_bookmarks) > 1:
+            raise Error(
+                f"revision {revision.commit_id} has ambiguous selected-remote bookmarks: "
+                + ", ".join(revision.remote_bookmarks)
+            )
+        else:
+            head = revision.generated_bookmark
+        if head.isdecimal():
+            raise Error(f"bookmark is all-numeric and ambiguous to gh-stack: {head}")
+        heads.append(head)
+    duplicates = sorted({head for head in heads if heads.count(head) > 1})
+    if duplicates:
+        raise Error(
+            "multiple selected revisions resolve to bookmark: " + ", ".join(duplicates)
+        )
+    return heads, prs
+
+
+def inspect_existing_stack(
+    discovered: dict[str, PullRequest],
+    range_revisions: list[Revision],
+    boundary_ids: tuple[str, ...],
+    gh_env: dict[str, str],
+    git_root: str,
+    identified_stack: StackSnapshot | None = None,
+) -> tuple[list[str], StackSnapshot]:
+    by_id = {revision.commit_id: revision for revision in range_revisions}
+    boundaries = [by_id[commit_id] for commit_id in boundary_ids]
+    heads, selected_prs = resolve_heads(boundaries, discovered)
+
+    selected_changes = {revision.change_id for revision in boundaries}
+    boundary_indexes = {
+        index
+        for index, revision in enumerate(range_revisions)
+        if revision.commit_id in boundary_ids
+    }
+    for index, revision in enumerate(range_revisions):
+        candidates = (
+            set(revision.local_bookmarks)
+            | set(revision.remote_bookmarks)
+            | {revision.generated_bookmark}
+        )
+        existing = {
+            discovered[name].node_id: discovered[name]
+            for name in candidates
+            if name in discovered
+        }
+        if len(existing) > 1:
+            raise Error(
+                f"revision {revision.commit_id} is associated with multiple open PRs"
+            )
+        if existing and revision.change_id not in selected_changes:
+            pr = next(iter(existing.values()))
+            before = [candidate for candidate in boundary_indexes if candidate < index]
+            after = [candidate for candidate in boundary_indexes if candidate > index]
+            location = ""
+            if before and after:
+                lower = range_revisions[max(before)].change_id[:8]
+                upper = range_revisions[min(after)].change_id[:8]
+                location = f"\nIt lies between selected boundaries {lower} and {upper}."
+            elif after:
+                upper = range_revisions[min(after)].change_id[:8]
+                location = f"\nIt lies before selected boundary {upper}."
+            elif before:
+                lower = range_revisions[max(before)].change_id[:8]
+                location = f"\nIt lies after selected boundary {lower}."
+            change = revision.change_id[:8]
+            raise Error(
+                f"open PR #{pr.number} is on change {change} ({json.dumps(revision.title)}),\n"
+                f"but that change is not selected as a PR boundary:\n{pr.url}\n"
+                f"{location}\nInclude {change} in the revset, or close PR #{pr.number} before retrying."
+            )
+    stack_ids = {pr.stack_id for pr in selected_prs.values() if pr.stack_id is not None}
+    if identified_stack is not None:
+        stack_ids.add(identified_stack.node_id)
+    if len(stack_ids) > 1:
+        raise Error(
+            "selected open PRs and merged selectors identify different GitHub stacks"
+        )
+    if not stack_ids:
+        return heads, StackSnapshot(None, None, [], selected_prs)
+    stack_id = stack_ids.pop()
+    assert stack_id is not None
+    snapshot = (
+        identified_stack
+        if identified_stack is not None and identified_stack.node_id == stack_id
+        else fetch_stack(stack_id, gh_env, git_root)
+    )
+    snapshot.discovered = selected_prs
+    return heads, snapshot
+
+
+def remote_refs(git_root: str, remote: str) -> dict[str, str]:
+    output = command(["git", "-C", git_root, "ls-remote", "--heads", remote]).stdout
+    refs = {}
+    for line in output.splitlines():
+        oid, ref = line.split("\t", 1)
+        refs[ref.removeprefix("refs/heads/")] = oid
+    return refs
+
+
+def verify_live_base(
+    git_root: str,
+    remote: str,
+    base: str,
+    previous_oid: str,
+    live_refs: dict[str, str],
+    *,
+    pinned: bool,
+) -> str:
+    current_oid = live_refs.get(base)
+    if current_oid is None:
+        raise Error(f"remote base branch {base} disappeared during reconciliation")
+    if current_oid == previous_oid:
+        return current_oid
+    if pinned:
+        raise Error(
+            f"remote base {base} changed during reconciliation; replan and retry"
+        )
+    ensure_git_commit(git_root, remote, current_oid)
+    if not git_is_ancestor(git_root, previous_oid, current_oid):
+        raise Error(
+            f"remote base {base} did not advance linearly during reconciliation; "
+            "replan and retry"
+        )
+    return current_oid
+
+
+def fetched_remote_refs(git_root: str, remote: str) -> dict[str, str]:
+    output = command(
+        [
+            "git",
+            "-C",
+            git_root,
+            "for-each-ref",
+            "--format=%(refname:strip=3)%09%(objectname)",
+            f"refs/remotes/{remote}",
+        ]
+    ).stdout
+    result = {}
+    for line in output.splitlines():
+        name, oid = line.split("\t", 1)
+        if name != "HEAD":
+            result[name] = oid
+    return result
+
+
+def jj_commit_exists(oid: str) -> bool:
+    result = jj_inspect(
+        "log",
+        "--color=never",
+        "--no-graph",
+        "-r",
+        oid,
+        "-T",
+        'commit_id ++ "\\n"',
+        check=False,
+    )
+    return result.returncode == 0 and result.stdout.splitlines() == [oid]
+
+
+def import_live_base(git_root: str, remote: str, base: str, expected_oid: str) -> None:
+    if jj_commit_exists(expected_oid):
+        return
+    jj("git", "fetch", "--remote", remote, "--branch", base)
+    begin_inspection_phase()
+    imported_oid = fetched_remote_refs(git_root, remote).get(base)
+    if imported_oid != expected_oid or not jj_commit_exists(expected_oid):
+        raise Error(
+            f"live base {base} changed while importing it into jj; replan and retry"
+        )
+
+
+def verify_planned_bookmarks(revisions: list[Revision], heads: list[str]) -> None:
+    for revision, head in zip(revisions, heads, strict=True):
+        if head not in revision.local_bookmarks:
+            continue
+        current = jj_output(
+            "log",
+            "--color=never",
+            "--no-graph",
+            "-r",
+            revision.commit_id,
+            "-T",
+            'local_bookmarks.map(|b| b.name()).join("\\n")',
+        ).splitlines()
+        if head not in current:
+            raise Error(
+                f"local bookmark {head} changed while importing the live base; "
+                "replan and retry"
+            )
+
+
+def boundary_commands(
+    boundary: str,
+    base_oid: str,
+    remote: str,
+    git_root: str,
+    live_oid: str | None,
+) -> list[list[str]]:
+    local = jj_inspect(
+        "bookmark",
+        "list",
+        f"exact:{json.dumps(boundary)}",
+        "-T",
+        'name ++ "\\n"',
+    ).stdout.splitlines()
+    commands = [
+        atomic_push_command(
+            git_root, remote, (RefUpdate(boundary, live_oid, base_oid),)
+        )
+    ]
+    if local:
+        commands.append(
+            [*JJ, "bookmark", "set", "--allow-backwards", "-r", base_oid, boundary]
+        )
+    return commands
+
+
+@dataclass(frozen=True)
+class BoundaryState:
+    branch: str
+    local_oid: str
+    tracked_oid: str | None
+    live_oid: str
+    pr: PullRequest
+
+
+class ReconciliationKind(Enum):
+    NORMAL_PUBLISH = "publish local stack"
+    ALREADY_CONVERGED = "already converged"
+    REMOTE_ADOPT = "adopt GitHub restack; no remote push"
+    LOCAL_AUTHORITY = "preserve local stack; rebase and atomic-push"
+
+
+@dataclass(frozen=True)
+class RefUpdate:
+    branch: str
+    old_oid: str | None
+    new_oid: str
+
+
+@dataclass(frozen=True)
+class RefPublicationPlan:
+    kind: ReconciliationKind
+    updates: tuple[RefUpdate, ...]
+
+
+@dataclass(frozen=True)
+class ClosureSnapshot:
+    root: str
+    commits: tuple[str, ...]
+    change_ids: tuple[str, ...]
+    mutable: frozenset[tuple[str, str]] | None
+    workspaces: tuple[tuple[str, str], ...]
+    bookmarks: tuple[tuple[str, str], ...]
+
+
+def git_commit_change_id(git_root: str, oid: str) -> str:
+    commit = command(
+        ["git", "--no-replace-objects", "-C", git_root, "cat-file", "-p", oid]
+    ).stdout
+    headers = commit.partition("\n\n")[0]
+    matches = [
+        line.removeprefix("change-id ")
+        for line in headers.splitlines()
+        if line.startswith("change-id ")
+    ]
+    if len(matches) != 1:
+        raise Error(f"commit {oid[:12]} does not have exactly one jj change ID")
+    return matches[0]
+
+
+def git_linear_segment(git_root: str, base: str, tip: str) -> tuple[str, ...]:
+    result = command(
+        [
+            "git",
+            "--no-replace-objects",
+            "-C",
+            git_root,
+            "rev-list",
+            "--reverse",
+            "--ancestry-path",
+            f"{base}..{tip}",
+        ],
+        check=False,
+    )
+    commits = result.stdout.splitlines()
+    if result.returncode != 0 or not commits:
+        raise Error(
+            f"live GitHub suffix does not descend from expected base {base[:12]}"
+        )
+    previous = base
+    for oid in commits:
+        row = command(
+            [
+                "git",
+                "--no-replace-objects",
+                "-C",
+                git_root,
+                "rev-list",
+                "--parents",
+                "-n",
+                "1",
+                oid,
+            ]
+        ).stdout.split()
+        if row != [oid, previous]:
+            raise Error(
+                "live GitHub suffix must be a complete linear chain without merges; "
+                f"{oid[:12]} does not directly follow {previous[:12]}"
+            )
+        previous = oid
+    if commits[-1] != tip:
+        raise Error(f"could not validate live GitHub head {tip[:12]}")
+    return tuple(commits)
+
+
+def git_last_linear_commits(git_root: str, tip: str, count: int) -> tuple[str, ...]:
+    commits = command(
+        [
+            "git",
+            "--no-replace-objects",
+            "-C",
+            git_root,
+            "rev-list",
+            "--first-parent",
+            f"--max-count={count}",
+            tip,
+        ]
+    ).stdout.splitlines()
+    if len(commits) != count:
+        raise Error(f"tracked segment ending at {tip[:12]} is incomplete")
+    commits.reverse()
+    for oid in commits:
+        parents = command(
+            [
+                "git",
+                "--no-replace-objects",
+                "-C",
+                git_root,
+                "rev-list",
+                "--parents",
+                "-n",
+                "1",
+                oid,
+            ]
+        ).stdout.split()
+        if len(parents) != 2:
+            raise Error(f"tracked segment contains merge commit {oid[:12]}")
+    return tuple(commits)
+
+
+def git_commit_parent(git_root: str, oid: str) -> str:
+    row = command(
+        [
+            "git",
+            "--no-replace-objects",
+            "-C",
+            git_root,
+            "rev-list",
+            "--parents",
+            "-n",
+            "1",
+            oid,
+        ]
+    ).stdout.split()
+    if len(row) != 2 or row[0] != oid:
+        raise Error(f"live segment starts with non-linear commit {oid[:12]}")
+    return row[1]
+
+
+def git_is_ancestor(git_root: str, ancestor: str, descendant: str) -> bool:
+    result = command(
+        [
+            "git",
+            "--no-replace-objects",
+            "-C",
+            git_root,
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ],
+        check=False,
+    )
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    detail = result.stderr.strip() or result.stdout.strip()
+    raise Error(
+        f"could not compare live base ancestry for {ancestor[:12]} and "
+        f"{descendant[:12]}" + (f":\n{detail}" if detail else "")
+    )
+
+
+def git_patch_id(git_root: str, oid: str) -> str | None:
+    patch = command(
+        [
+            "git",
+            "--no-replace-objects",
+            "-C",
+            git_root,
+            "show",
+            "--pretty=format:",
+            "--binary",
+            "--no-ext-diff",
+            "--no-textconv",
+            oid,
+        ]
+    ).stdout
+    result = command(["git", "patch-id", "--stable"], stdin_text=patch)
+    fields = result.stdout.split()
+    if not fields:
+        return None
+    if len(fields) != 2:
+        raise Error(f"could not calculate stable patch ID for {oid[:12]}")
+    return fields[0]
+
+
+class RemoteCheck(Enum):
+    EXACT = "live head matches tracked baseline"
+    RESTACKED = "jj change IDs and stable patch IDs match"
+
+
+@dataclass(frozen=True)
+class ExistingBoundary:
+    pr: PullRequest
+    tracked_oid: str
+    live_oid: str
+    check: RemoteCheck
+
+
+def validate_existing_suffix(
+    stack: StackSnapshot,
+    name_with_owner: str,
+    tracked_refs: dict[str, str],
+    live_refs: dict[str, str],
+    git_root: str,
+    remote: str,
+) -> tuple[ExistingBoundary, ...]:
+    if not stack.active:
+        return ()
+    first = stack.active[0]
+    if first.base not in live_refs:
+        raise Error(f"PR #{first.number} has no live base branch {first.base}")
+    suffix_root = stack.merged[-1].head_oid if stack.merged else None
+    if suffix_root is not None:
+        ensure_git_commit(git_root, remote, suffix_root)
+    previous_tracked = suffix_root
+    previous_live = suffix_root
+    previous_head = None
+    result = []
+    for pr in stack.active:
+        first_open = previous_head is None
+        if (
+            pr.repository is None
+            or pr.head_repository is None
+            or pr.repository.lower() != name_with_owner.lower()
+            or pr.head_repository.lower() != name_with_owner.lower()
+        ):
+            raise Error(
+                f"PR #{pr.number} does not have a verified repository-local head"
+            )
+        if previous_head is not None and pr.base != previous_head:
+            raise Error(f"PR #{pr.number} has base {pr.base}; expected {previous_head}")
+        tracked_oid = tracked_refs.get(pr.head)
+        live_oid = live_refs.get(pr.head)
+        if tracked_oid is None:
+            raise Error(f"PR #{pr.number} has no tracked restack baseline")
+        if live_oid is None:
+            raise Error(f"open PR #{pr.number} has no live branch {pr.head}")
+        if live_oid != pr.head_oid:
+            raise Error(
+                f"PR #{pr.number} head does not match its live remote branch {pr.head}"
+            )
+        ensure_git_commit(git_root, remote, tracked_oid)
+        ensure_git_commit(git_root, remote, live_oid)
+        tracked_segment = (
+            git_last_linear_commits(git_root, tracked_oid, pr.commits)
+            if first_open
+            else git_linear_segment(git_root, previous_tracked, tracked_oid)
+        )
+        live_segment = (
+            git_last_linear_commits(git_root, live_oid, pr.commits)
+            if first_open
+            else git_linear_segment(git_root, previous_live, live_oid)
+        )
+        if len(tracked_segment) != pr.commits or len(live_segment) != pr.commits:
+            raise Error(
+                f"PR #{pr.number} tracked/live segment does not match its "
+                f"reported {pr.commits} commits"
+            )
+        exact = tracked_oid == live_oid
+        if not exact:
+            for old_oid, new_oid in zip(tracked_segment, live_segment, strict=True):
+                if git_commit_change_id(git_root, old_oid) != git_commit_change_id(
+                    git_root, new_oid
+                ) or git_patch_id(git_root, old_oid) != git_patch_id(git_root, new_oid):
+                    raise Error(
+                        f"PR #{pr.number} contains remote-only edits; the live suffix "
+                        "is not a mechanical GitHub restack"
+                    )
+        result.append(
+            ExistingBoundary(
+                pr,
+                tracked_oid,
+                live_oid,
+                RemoteCheck.EXACT if exact else RemoteCheck.RESTACKED,
+            )
+        )
+        previous_tracked = tracked_oid
+        previous_live = live_oid
+        previous_head = pr.head
+    return tuple(result)
+
+
+def verify_existing_refs_unchanged(
+    evidence: tuple[ExistingBoundary, ...], live_refs: dict[str, str]
+) -> None:
+    changed = [
+        item.pr.head
+        for item in evidence
+        if live_refs.get(item.pr.head) != item.live_oid
+    ]
+    if changed:
+        raise Error(
+            "existing PR refs changed during reconciliation for "
+            + ", ".join(changed)
+            + "; replan and retry"
+        )
+
+
+def verify_live_suffix(
+    states: tuple[BoundaryState, ...],
+    base_oid: str,
+    segment_commits: tuple[int, ...],
+    git_root: str,
+    remote: str,
+    *,
+    allow_restacked_first: bool = False,
+    alternative_first_parent: str | None = None,
+    first_parent_ancestor_of: str | None = None,
+) -> tuple[tuple[str, ...], ...]:
+    if len(states) != len(segment_commits):
+        raise Error("live GitHub evidence does not cover the complete open suffix")
+    previous = base_oid
+    segments = []
+    for index, (state, expected_count) in enumerate(
+        zip(states, segment_commits, strict=True)
+    ):
+        if state.pr.head != state.branch or state.pr.head_oid != state.live_oid:
+            raise Error(
+                f"PR #{state.pr.number} does not match live branch {state.branch}"
+            )
+        ensure_git_commit(git_root, remote, state.live_oid)
+        if index == 0 and allow_restacked_first:
+            try:
+                segment = git_linear_segment(git_root, previous, state.live_oid)
+            except Error:
+                segment = git_last_linear_commits(
+                    git_root, state.live_oid, expected_count
+                )
+                allowed_parents = set()
+                if alternative_first_parent is not None:
+                    allowed_parents.add(alternative_first_parent)
+                first_parent = git_commit_parent(git_root, segment[0])
+                if first_parent_ancestor_of is not None:
+                    valid_parent = git_is_ancestor(
+                        git_root, first_parent, first_parent_ancestor_of
+                    )
+                else:
+                    valid_parent = first_parent in allowed_parents
+                if not valid_parent:
+                    raise Error(
+                        f"PR #{state.pr.number} has an unexpected live base; "
+                        "GitHub restack is incoherent"
+                    )
+        else:
+            segment = git_linear_segment(git_root, previous, state.live_oid)
+        if len(segment) != expected_count:
+            raise Error(
+                f"PR #{state.pr.number} contains {len(segment)} live commits; "
+                f"expected {expected_count}"
+            )
+        segments.append(segment)
+        previous = state.live_oid
+    return tuple(segments)
+
+
+def verify_mechanical_restack(
+    states: tuple[BoundaryState, ...],
+    base_oid: str,
+    segment_commits: tuple[int, ...],
+    git_root: str,
+    remote: str,
+    *,
+    allow_restacked_first: bool = False,
+    alternative_first_parent: str | None = None,
+    first_parent_ancestor_of: str | None = None,
+) -> None:
+    segments = verify_live_suffix(
+        states,
+        base_oid,
+        segment_commits,
+        git_root,
+        remote,
+        allow_restacked_first=allow_restacked_first,
+        alternative_first_parent=alternative_first_parent,
+        first_parent_ancestor_of=first_parent_ancestor_of,
+    )
+    for state, expected_count, segment in zip(
+        states, segment_commits, segments, strict=True
+    ):
+        if state.tracked_oid is None:
+            raise Error(f"PR #{state.pr.number} has no tracked restack baseline")
+        tracked = git_last_linear_commits(git_root, state.tracked_oid, expected_count)
+        for old_oid, new_oid in zip(tracked, segment, strict=True):
+            if git_commit_change_id(git_root, old_oid) != git_commit_change_id(
+                git_root, new_oid
+            ) or git_patch_id(git_root, old_oid) != git_patch_id(git_root, new_oid):
+                raise Error(
+                    f"PR #{state.pr.number} contains remote-only edits; "
+                    "the live suffix is not a mechanical GitHub restack"
+                )
+
+
+def verify_reconciliation_suffix(
+    kind: ReconciliationKind,
+    states: tuple[BoundaryState, ...],
+    base_oid: str,
+    desired_counts: tuple[int, ...],
+    git_root: str,
+    remote: str,
+    *,
+    allow_restacked_first: bool = False,
+    allow_stale_local_base: bool = False,
+    current_base_oid: str | None = None,
+) -> None:
+    if kind is ReconciliationKind.LOCAL_AUTHORITY:
+        live_counts = tuple(state.pr.commits for state in states)
+        flexible_first = (
+            allow_restacked_first
+            or allow_stale_local_base
+            or current_base_oid is not None
+        )
+        if any(state.live_oid != state.tracked_oid for state in states):
+            verify_mechanical_restack(
+                states,
+                base_oid,
+                live_counts,
+                git_root,
+                remote,
+                allow_restacked_first=flexible_first,
+                first_parent_ancestor_of=current_base_oid,
+            )
+        else:
+            verify_live_suffix(
+                states,
+                base_oid,
+                live_counts,
+                git_root,
+                remote,
+                allow_restacked_first=flexible_first,
+                first_parent_ancestor_of=current_base_oid,
+            )
+    elif kind is ReconciliationKind.REMOTE_ADOPT:
+        verify_mechanical_restack(
+            states,
+            base_oid,
+            desired_counts,
+            git_root,
+            remote,
+            allow_restacked_first=allow_restacked_first or current_base_oid is not None,
+            first_parent_ancestor_of=current_base_oid,
+        )
+    elif kind is ReconciliationKind.ALREADY_CONVERGED:
+        verify_live_suffix(
+            states,
+            base_oid,
+            desired_counts,
+            git_root,
+            remote,
+            allow_restacked_first=allow_restacked_first or current_base_oid is not None,
+            first_parent_ancestor_of=current_base_oid,
+        )
+
+
+def classify_reconciliation(
+    states: tuple[BoundaryState, ...],
+    *,
+    has_new_boundaries: bool,
+    topology_changed: bool = False,
+) -> ReconciliationKind:
+    if topology_changed:
+        return (
+            ReconciliationKind.LOCAL_AUTHORITY
+            if any(state.local_oid != state.live_oid for state in states)
+            else ReconciliationKind.NORMAL_PUBLISH
+        )
+    if not states:
+        return ReconciliationKind.NORMAL_PUBLISH
+    missing = [state.branch for state in states if state.tracked_oid is None]
+    if missing:
+        if has_new_boundaries or any(
+            state.local_oid != state.live_oid for state in states
+        ):
+            raise Error(
+                "no usable pre-fetch tracking baseline for "
+                + ", ".join(missing)
+                + "; only an already-synchronized fresh clone is safe"
+            )
+        return ReconciliationKind.ALREADY_CONVERGED
+    if all(state.local_oid == state.live_oid for state in states):
+        return (
+            ReconciliationKind.NORMAL_PUBLISH
+            if has_new_boundaries
+            else ReconciliationKind.ALREADY_CONVERGED
+        )
+    if all(state.local_oid == state.tracked_oid for state in states):
+        return ReconciliationKind.REMOTE_ADOPT
+    return ReconciliationKind.LOCAL_AUTHORITY
+
+
+def has_topology_delta(heads: list[str], stack: StackSnapshot) -> bool:
+    selected_pr_ids = [
+        stack.discovered[head].node_id for head in heads if head in stack.discovered
+    ]
+    selected_pr_id_set = set(selected_pr_ids)
+    retained_old_ids = [
+        pr.node_id for pr in stack.active if pr.node_id in selected_pr_id_set
+    ]
+    return (
+        len(selected_pr_ids) != len(heads)
+        or len(retained_old_ids) != len(stack.active)
+        or selected_pr_ids != retained_old_ids
+    )
+
+
+def boundary_states(
+    revisions: list[Revision],
+    heads: list[str],
+    stack: StackSnapshot,
+    fetched: dict[str, str],
+    live: dict[str, str],
+) -> tuple[BoundaryState, ...]:
+    result = []
+    for revision, head in zip(revisions, heads, strict=True):
+        pr = stack.discovered.get(head)
+        if pr is None:
+            continue
+        live_oid = live.get(head)
+        if live_oid is None:
+            raise Error(f"open PR #{pr.number} has no live branch {head}")
+        result.append(
+            BoundaryState(head, revision.commit_id, fetched.get(head), live_oid, pr)
+        )
+    return tuple(result)
+
+
+def verify_live_boundary_refs_unchanged(
+    states: tuple[BoundaryState, ...], live: dict[str, str]
+) -> None:
+    changed = [
+        state.branch for state in states if live.get(state.branch) != state.live_oid
+    ]
+    if changed:
+        raise Error(
+            "live PR refs changed after authority classification for "
+            + ", ".join(changed)
+            + "; replan and retry"
+        )
+
+
+def local_bookmark_oid(name: str) -> str | None:
+    result = jj_inspect(
+        "log",
+        "--color=never",
+        "--no-graph",
+        "-r",
+        f"bookmarks(exact:{json.dumps(name)})",
+        "-T",
+        'commit_id ++ "\\n"',
+        check=False,
+    )
+    values = result.stdout.splitlines()
+    if result.returncode != 0:
+        raise Error(
+            f"could not inspect the local bookmark target for open PR branch {name}"
+        )
+    if not values:
+        return None
+    if len(values) != 1:
+        raise Error(f"open PR branch {name} has ambiguous local bookmark targets")
+    return values[0]
+
+
+def atomic_push_command(
+    git_root: str, remote: str, updates: tuple[RefUpdate, ...], *, dry_run: bool = False
+) -> list[str]:
+    args = ["git", "-C", git_root, "push", remote, "--atomic"]
+    if dry_run:
+        args.extend(["--dry-run", "--no-verify"])
+    for update in updates:
+        expected = update.old_oid or ""
+        ref = f"refs/heads/{update.branch}"
+        args.append(f"--force-with-lease={ref}:{expected}")
+    for update in updates:
+        ref = f"refs/heads/{update.branch}"
+        args.append(f"{update.new_oid}:{ref}")
+    return args
+
+
+def make_ref_publication_plan(
+    kind: ReconciliationKind,
+    revisions: list[Revision],
+    heads: list[str],
+    live: dict[str, str],
+) -> RefPublicationPlan:
+    if kind in {ReconciliationKind.REMOTE_ADOPT, ReconciliationKind.ALREADY_CONVERGED}:
+        return RefPublicationPlan(kind, ())
+    updates = tuple(
+        RefUpdate(head, live.get(head), revision.commit_id)
+        for revision, head in zip(revisions, heads, strict=True)
+        if live.get(head) != revision.commit_id
+    )
+    return RefPublicationPlan(kind, updates)
+
+
+def workspace_targets() -> tuple[tuple[str, str], ...]:
+    rows = jj_output(
+        "workspace", "list", "-T", 'name ++ "\\t" ++ target.commit_id() ++ "\\n"'
+    ).splitlines()
+    return tuple(tuple(row.split("\t", 1)) for row in rows)  # type: ignore[return-value]
+
+
+def mutable_identities() -> frozenset[tuple[str, str]]:
+    rows = jj_output(
+        "log",
+        "--color=never",
+        "--no-graph",
+        "-r",
+        "mutable()",
+        "-T",
+        'change_id ++ "\\t" ++ commit_id ++ "\\n"',
+    ).splitlines()
+    return frozenset(tuple(row.split("\t", 1)) for row in rows)  # type: ignore[arg-type]
+
+
+def local_bookmark_targets() -> tuple[tuple[str, str], ...]:
+    rows = jj_output(
+        "log",
+        "--color=never",
+        "--no-graph",
+        "-r",
+        "bookmarks()",
+        "-T",
+        'local_bookmarks.map(|b| b.name() ++ "\\t" ++ commit_id ++ "\\n").join("")',
+    ).splitlines()
+    return tuple(sorted(tuple(row.split("\t", 1)) for row in rows))  # type: ignore[arg-type]
+
+
+def capture_closure(root: str) -> ClosureSnapshot:
+    rows = jj_output(
+        "log",
+        "--color=never",
+        "--no-graph",
+        "--reversed",
+        "-r",
+        f"{root}::",
+        "-T",
+        'commit_id ++ "\\t" ++ change_id ++ "\\n"',
+    ).splitlines()
+    identities = []
+    for row in rows:
+        fields = row.split("\t")
+        if len(fields) != 2 or not all(fields):
+            raise Error("could not capture the complete local descendant closure")
+        identities.append(tuple(fields))
+    commits = tuple(commit_id for commit_id, _change_id in identities)
+    if not commits or commits[0] != root:
+        raise Error("could not capture the complete local descendant closure")
+    change_ids = tuple(change_id for _commit_id, change_id in identities)
+    if len(set(change_ids)) != len(change_ids):
+        raise Error("local descendant closure contains divergent jj changes")
+    return ClosureSnapshot(
+        root,
+        commits,
+        change_ids,
+        None,
+        workspace_targets(),
+        local_bookmark_targets(),
+    )
+
+
+def refresh_closure_baseline(
+    before: ClosureSnapshot, base_name: str, base_oid: str
+) -> ClosureSnapshot:
+    visible = revision_ids(f"{revset_union(before.commits)} & visible()")
+    if set(visible) != set(before.commits) or len(visible) != len(before.commits):
+        raise Error("selective base import changed the planned local closure")
+    if revision_ids(base_oid) != [base_oid]:
+        raise Error("selective base import did not import the live base commit")
+    workspaces = workspace_targets()
+    if workspaces != before.workspaces:
+        raise Error("selective base import changed a workspace target")
+    bookmarks = local_bookmark_targets()
+    before_bookmarks = dict(before.bookmarks)
+    after_bookmarks = dict(bookmarks)
+    if before_bookmarks.keys() != after_bookmarks.keys() or any(
+        old_oid != after_bookmarks[name]
+        and (name != base_name or after_bookmarks[name] != base_oid)
+        for name, old_oid in before_bookmarks.items()
+    ):
+        raise Error("selective base import changed a local bookmark target")
+    return ClosureSnapshot(
+        before.root,
+        before.commits,
+        before.change_ids,
+        mutable_identities(),
+        workspaces,
+        bookmarks,
+    )
+
+
+def operation_id() -> str:
+    values = command(
+        [
+            *JJ,
+            "--at-op=@",
+            "op",
+            "log",
+            "--no-graph",
+            "-n",
+            "1",
+            "-T",
+            'id ++ "\\n"',
+        ]
+    ).stdout.splitlines()
+    if len(values) != 1:
+        raise Error("could not capture the current jj operation")
+    return values[0]
+
+
+def begin_inspection_phase() -> str:
+    global INSPECTION_OPERATION
+    INSPECTION_OPERATION = operation_id()
+    return INSPECTION_OPERATION
+
+
+def verify_rewritten_closure(
+    before: ClosureSnapshot,
+    selected_change_ids: tuple[str, ...],
+) -> dict[str, str]:
+    rewritten = commit_ids_for_changes(before.change_ids)
+    if before.mutable is None:
+        raise Error("mutable baseline was not captured before local rebase")
+    after_mutable = mutable_identities()
+    changed_ids = {change_id for change_id, _oid in before.mutable ^ after_mutable}
+    unexpected = changed_ids - set(before.change_ids)
+    if unexpected:
+        raise Error(
+            "mutable changes outside the planned descendant closure changed during rebase: "
+            + ", ".join(sorted(change_id[:12] for change_id in unexpected))
+        )
+    rewritten_set = "(" + " | ".join(rewritten.values()) + ")"
+    conflicted_oids = set(revision_ids(f"{rewritten_set} & conflicts()"))
+    selected_oids = {rewritten[change_id] for change_id in selected_change_ids}
+    if conflicted_oids & selected_oids:
+        raise Error(
+            "local reconciliation produced conflicts in selected stack commits; "
+            "resolve them before publishing"
+        )
+    conflicted_changes = sorted(
+        change_id for change_id, oid in rewritten.items() if oid in conflicted_oids
+    )
+    old_oids = tuple(
+        dict.fromkeys(
+            [oid for _name, oid in before.workspaces]
+            + [oid for _name, oid in before.bookmarks]
+        )
+    )
+    old_changes = change_ids_for_commits(old_oids)
+    for name, old_oid in before.workspaces:
+        current = dict(workspace_targets()).get(name)
+        old_change = old_changes[old_oid]
+        expected = rewritten.get(old_change, old_oid)
+        if current != expected:
+            raise Error(
+                f"workspace {name} did not remain attached to its planned change"
+            )
+    expected_bookmarks = tuple(
+        sorted(
+            (name, rewritten.get(old_changes[old_oid], old_oid))
+            for name, old_oid in before.bookmarks
+        )
+    )
+    if local_bookmark_targets() != expected_bookmarks:
+        raise Error("rebase did not preserve the planned local bookmark mapping")
+    if conflicted_changes:
+        count = len(conflicted_changes)
+        noun = "descendant remains" if count == 1 else "descendants remain"
+        print(
+            f"Warning: {count} unselected {noun} conflicted.",
+            file=sys.stderr,
+        )
+        if VERBOSITY >= 1:
+            print(
+                "  Changes: "
+                + ", ".join(change_id[:12] for change_id in conflicted_changes),
+                file=sys.stderr,
+            )
+    return rewritten
+
+
+def fetch_exact_branches(
+    repo: Repository, remote: str, expected: dict[str, str]
+) -> None:
+    if not expected:
+        return
+    args = ["git", "fetch", "--remote", remote]
+    for branch in expected:
+        args.extend(["--branch", branch])
+    jj(*args)
+    fetched = fetched_remote_refs(repo.git_root, remote)
+    changed = [name for name, oid in expected.items() if fetched.get(name) != oid]
+    if changed:
+        raise Error(
+            "remote refs changed while importing "
+            + ", ".join(changed)
+            + "; replan and retry"
+        )
+
+
+def track_published_branches(remote: str, expected: dict[str, str]) -> None:
+    if not expected:
+        return
+    local_targets: dict[str, set[str]] = {}
+    for name, oid in local_bookmark_targets():
+        local_targets.setdefault(name, set()).add(oid)
+    divergent = [
+        name
+        for name, oid in expected.items()
+        if name in local_targets and local_targets[name] != {oid}
+    ]
+    if divergent:
+        raise Error(
+            "publication completed, but local bookmarks diverged before remote "
+            "tracking could be established for " + ", ".join(divergent)
+        )
+    result = jj(
+        "bookmark",
+        "track",
+        *(f"{name}@{remote}" for name in expected),
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise Error(
+            "publication completed, but jj remote-bookmark tracking could not be "
+            "established" + (f":\n{detail}" if detail else "")
+        )
+
+
+def verify_published_branch_tracking(remote: str, expected: dict[str, str]) -> None:
+    if not expected:
+        return
+    names = set(expected)
+    tracked = set(
+        filter(
+            None,
+            jj_output(
+                "bookmark",
+                "list",
+                "--tracked",
+                "--remote",
+                f"exact:{remote}",
+                "-T",
+                'if(remote, name ++ "\\n")',
+                *(f"exact:{name}" for name in expected),
+            ).splitlines(),
+        )
+    )
+    local_targets: dict[str, set[str]] = {}
+    for name, oid in local_bookmark_targets():
+        if name in names:
+            local_targets.setdefault(name, set()).add(oid)
+    invalid = [
+        name
+        for name, oid in expected.items()
+        if name not in tracked or local_targets.get(name) != {oid}
+    ]
+    if invalid:
+        raise Error(
+            "publication completed, but canonical bookmarks are not locally tracked "
+            "at the published revisions: " + ", ".join(invalid)
+        )
+
+
+class TopologyKind(Enum):
+    NEW = "new stack"
+    METADATA_ONLY = "metadata/update only"
+    APPEND = "append"
+    FULLY_OPEN_REBUILD = "fully open insertion/reorder"
+    MERGED_PREFIX_REBUILD = "merged-prefix insertion/reorder"
+
+
+@dataclass(frozen=True)
+class Plan:
+    kind: TopologyKind
+    heads: list[str]
+    omitted: list[PullRequest]
+    link_heads: list[str]
+    stack_number: int | None
+    boundary: PullRequest | None
+    refresh_base: bool
+    segment_commits: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class QueueCause:
+    pr: PullRequest
+    proposed_oid: str
+
+
+@dataclass(frozen=True)
+class QueueRemoval:
+    causes: tuple[QueueCause, ...]
+    affected: tuple[PullRequest, ...]
+    targets: tuple[PullRequest, ...]
+    expected_removed: tuple[PullRequest, ...]
+    expected_retained: tuple[PullRequest, ...]
+
+
+def plan_queue_removal(
+    plan: Plan,
+    stack: StackSnapshot,
+    proposed_heads: dict[str, str],
+    updated_heads: set[str],
+) -> QueueRemoval | None:
+    changed_ids = {pr.node_id for pr in plan.omitted}
+    changed_heads = {*plan.link_heads, *updated_heads}
+    changed_ids.update(
+        pr.node_id for head, pr in stack.discovered.items() if head in changed_heads
+    )
+
+    entry_positions = {pr.node_id: index for index, pr in enumerate(stack.entries)}
+    changed_positions = [
+        entry_positions[node_id]
+        for node_id in changed_ids
+        if node_id in entry_positions
+    ]
+    stacked = ()
+    retained = ()
+    targets = []
+    if changed_positions:
+        first_changed = min(changed_positions)
+        stacked = tuple(pr for pr in stack.entries[first_changed:] if pr.merge_queue)
+        if stacked:
+            targets.append(stacked[0])
+            target_position = entry_positions[stacked[0].node_id]
+            retained = tuple(
+                pr for pr in stack.entries[:target_position] if pr.merge_queue
+            )
+
+    independent = tuple(
+        sorted(
+            (
+                pr
+                for pr in stack.discovered.values()
+                if pr.node_id in changed_ids
+                and pr.node_id not in entry_positions
+                and pr.merge_queue
+            ),
+            key=lambda pr: pr.number,
+        )
+    )
+    targets.extend(independent)
+    affected = tuple(
+        sorted(
+            {pr.node_id: pr for pr in (*stacked, *independent)}.values(),
+            key=lambda pr: pr.number,
+        )
+    )
+    if not affected:
+        return None
+    by_id = {pr.node_id: pr for pr in (*stack.entries, *stack.discovered.values())}
+    cause_ids = {pr.node_id for pr in independent}
+    if stacked:
+        last_affected = max(entry_positions[pr.node_id] for pr in stacked)
+        cause_ids.update(
+            node_id
+            for node_id in changed_ids
+            if node_id in entry_positions and entry_positions[node_id] <= last_affected
+        )
+    causes = tuple(
+        QueueCause(pr, proposed_heads.get(pr.head, pr.head_oid))
+        for pr in sorted(
+            (by_id[node_id] for node_id in cause_ids if node_id in by_id),
+            key=lambda pr: (
+                entry_positions.get(pr.node_id, len(stack.entries)),
+                pr.number,
+            ),
+        )
+    )
+    return QueueRemoval(
+        causes,
+        affected,
+        tuple(targets),
+        (*stacked, *independent),
+        retained,
+    )
+
+
+def verify_unstackable(plan: Plan, stack: StackSnapshot) -> None:
+    disappearing = (
+        stack.active
+        if plan.kind
+        in {
+            TopologyKind.FULLY_OPEN_REBUILD,
+            TopologyKind.MERGED_PREFIX_REBUILD,
+        }
+        else plan.omitted
+    )
+    blocked = [pr for pr in disappearing if pr.auto_merge or pr.merge_queue]
+    if blocked:
+        raise Error(
+            "PRs that will be unstacked must leave auto-merge or merge queue first: "
+            + ", ".join(f"#{pr.number}" for pr in blocked)
+        )
+
+
+def make_plan(
+    revisions: list[Revision],
+    heads: list[str],
+    stack: StackSnapshot,
+    base_oid: str,
+    segment_commits: tuple[int, ...] = (),
+) -> Plan:
+    existing = [pr.head for pr in stack.active]
+    selected = set(heads)
+    omitted = [pr for pr in stack.active if pr.head not in selected]
+    needs_boundary_refresh = bool(
+        stack.merged
+        and stack.active
+        and stack.active[0].base == stack.merged[-1].head
+        and stack.merged[-1].head_ref_oid is not None
+        and stack.merged[-1].head_ref_oid != base_oid
+    )
+    if not heads:
+        kind = (
+            TopologyKind.MERGED_PREFIX_REBUILD
+            if stack.active or stack.closed
+            else TopologyKind.METADATA_ONLY
+        )
+        link_heads = []
+    elif stack.closed:
+        kind = (
+            TopologyKind.MERGED_PREFIX_REBUILD
+            if stack.merged
+            else TopologyKind.FULLY_OPEN_REBUILD
+        )
+        link_heads = heads
+    elif stack.number is None:
+        kind = TopologyKind.NEW
+        link_heads = heads
+    elif needs_boundary_refresh:
+        # GitHub does not allow changing the base of a PR while it belongs to a
+        # stack. Rebuild the open suffix so the first PR can be refreshed after
+        # the merged boundary moves, then relink every selected head.
+        kind = TopologyKind.MERGED_PREFIX_REBUILD
+        link_heads = heads
+    elif existing == heads:
+        kind = TopologyKind.METADATA_ONLY
+        link_heads = []
+    elif not omitted and existing == heads[: len(existing)]:
+        kind = TopologyKind.APPEND
+        link_heads = heads[len(existing) :]
+    elif stack.merged:
+        kind = TopologyKind.MERGED_PREFIX_REBUILD
+        link_heads = heads
+    else:
+        kind = TopologyKind.FULLY_OPEN_REBUILD
+        link_heads = heads
+    boundary = (
+        stack.merged[-1]
+        if heads
+        and (
+            kind is TopologyKind.MERGED_PREFIX_REBUILD
+            or (kind is TopologyKind.APPEND and not stack.active and stack.merged)
+            or needs_boundary_refresh
+        )
+        else None
+    )
+    refresh_base = needs_boundary_refresh
+    return Plan(
+        kind,
+        heads,
+        omitted,
+        link_heads,
+        stack.number,
+        boundary,
+        refresh_base,
+        segment_commits,
+    )
+
+
+def segment_counts(selection: Selection) -> tuple[int, ...]:
+    positions = {commit_id: index for index, commit_id in enumerate(selection.commits)}
+    counts = []
+    previous = -1
+    for boundary in selection.boundaries:
+        current = positions[boundary]
+        counts.append(current - previous)
+        previous = current
+    return tuple(counts)
+
+
+def expected_first_open_base(plan: Plan, stack: StackSnapshot, base: str) -> str:
+    if plan.kind in {TopologyKind.NEW, TopologyKind.FULLY_OPEN_REBUILD}:
+        return base
+    if plan.boundary and (
+        not stack.active or plan.kind is TopologyKind.MERGED_PREFIX_REBUILD
+    ):
+        return plan.boundary.head
+    if stack.active:
+        return stack.active[0].base
+    return base
+
+
+def terminal_text(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)[1:-1]
+
+
+def terminal_hyperlink(label: str, url: str) -> str:
+    safe_label = "".join(
+        character if character >= " " and character != "\x7f" else " "
+        for character in label
+    )
+    if sys.stdout.isatty():
+        return f"\x1b]8;;{url}\x1b\\{safe_label}\x1b]8;;\x1b\\"
+    return f"{safe_label} ({url})"
+
+
+def validate_close_targets(plan: Plan, close_numbers: frozenset[int]) -> None:
+    omitted = {pr.number for pr in plan.omitted}
+    invalid = sorted(close_numbers - omitted)
+    if invalid:
+        rendered = ", ".join(f"#{number}" for number in invalid)
+        raise Error(
+            f"--close-omitted target is not an omitted open PR in this plan: {rendered}"
+        )
+
+
+def counted(count: int, noun: str) -> str:
+    if count == 1:
+        return f"{count} {noun}"
+    suffix = "es" if noun.endswith(("ch", "sh", "s", "x", "z")) else "s"
+    return f"{count} {noun + suffix}"
+
+
+def planned_metadata(
+    revisions: list[Revision],
+    heads: list[str],
+    stack: StackSnapshot,
+    segment_commits: tuple[int, ...],
+) -> dict[str, tuple[str, str]]:
+    return {
+        head: (
+            (stack.discovered[head].title, stack.discovered[head].body)
+            if head in stack.discovered and segment_commits[index] > 1
+            else (revision.title, revision.body)
+        )
+        for index, (revision, head) in enumerate(zip(revisions, heads, strict=True))
+    }
+
+
+def metadata_update_heads(
+    heads: list[str],
+    stack: StackSnapshot,
+    metadata: dict[str, tuple[str, str]],
+) -> tuple[str, ...]:
+    return tuple(
+        head
+        for head in heads
+        if head in stack.discovered
+        and (stack.discovered[head].title, stack.discovered[head].body)
+        != metadata[head]
+    )
+
+
+def print_plan(
+    plan: Plan,
+    revisions: list[Revision],
+    stack: StackSnapshot,
+    repo: Repository,
+    remote: str,
+    selection: Selection | None,
+    base_oid: str,
+    selectors: dict[str, tuple[PullRequest, ...]],
+    *,
+    reconciliation: ReconciliationKind = ReconciliationKind.NORMAL_PUBLISH,
+    states: tuple[BoundaryState, ...] = (),
+    closure: ClosureSnapshot | None = None,
+    recovery: RecoveryEvidence | None = None,
+    verbosity: int = 0,
+    existing_evidence: tuple[ExistingBoundary, ...] = (),
+    close_numbers: frozenset[int] = frozenset(),
+    metadata_updates: tuple[str, ...] = (),
+) -> None:
+    existing = sum(head in stack.discovered for head in plan.heads)
+    created = len(plan.heads) - existing
+    if (
+        reconciliation is ReconciliationKind.ALREADY_CONVERGED
+        and not plan.omitted
+        and not metadata_updates
+    ):
+        title = f"stack #{stack.number} is already converged"
+    elif recovery is not None:
+        title = (
+            f"attach {counted(len(plan.heads), 'existing PR')} to surviving "
+            f"stack #{stack.number}"
+        )
+    elif plan.kind is TopologyKind.NEW:
+        title = f"create a stack with {counted(len(plan.heads), 'PR')}"
+    elif plan.kind is TopologyKind.APPEND:
+        title = f"append {counted(len(plan.link_heads), 'PR')} to stack #{stack.number}"
+    elif plan.kind is TopologyKind.METADATA_ONLY:
+        title = f"update stack #{stack.number}"
+    else:
+        title = f"rebuild the open suffix of stack #{stack.number}"
+    print(f"Plan: {title}", file=sys.stderr)
+
+    if (
+        reconciliation is ReconciliationKind.ALREADY_CONVERGED
+        and not plan.omitted
+        and not metadata_updates
+    ):
+        print("  No local, remote, or GitHub changes.", file=sys.stderr)
+    rebase_hint = bool(
+        closure is None
+        and selection is not None
+        and selection.fork != base_oid
+        and reconciliation
+        in {
+            ReconciliationKind.NORMAL_PUBLISH,
+            ReconciliationKind.ALREADY_CONVERGED,
+        }
+    )
+    if closure is not None:
+        workspaces = len(closure.workspaces)
+        print(
+            f"  Rebase {counted(len(closure.commits), 'local commit')} onto "
+            f"{remote}/{repo.base}; move {counted(workspaces, 'workspace')} with them.",
+            file=sys.stderr,
+        )
+    elif reconciliation is ReconciliationKind.REMOTE_ADOPT:
+        print(
+            "  Adopt GitHub's mechanically verified restack locally; do not publish refs.",
+            file=sys.stderr,
+        )
+
+    if plan.heads and reconciliation not in {
+        ReconciliationKind.ALREADY_CONVERGED,
+        ReconciliationKind.REMOTE_ADOPT,
+    }:
+        print(
+            f"  Publish {counted(len(plan.heads), 'branch')} atomically.",
+            file=sys.stderr,
+        )
+    if plan.boundary:
+        print(
+            f"  Move merged boundary {plan.boundary.head} to {repo.base}.",
+            file=sys.stderr,
+        )
+    if existing:
+        print(
+            f"  Reuse {counted(existing, 'existing PR')} in the selected order; "
+            "preserve readiness.",
+            file=sys.stderr,
+        )
+    if metadata_updates:
+        numbers = ", ".join(
+            f"#{stack.discovered[head].number}" for head in metadata_updates
+        )
+        print(f"  Update title/body for {numbers}.", file=sys.stderr)
+    if created:
+        print(f"  Create {counted(created, 'draft PR')}.", file=sys.stderr)
+    if plan.kind in {
+        TopologyKind.FULLY_OPEN_REBUILD,
+        TopologyKind.MERGED_PREFIX_REBUILD,
+    }:
+        print("  Unstack and relink the open suffix.", file=sys.stderr)
+    elif recovery is not None:
+        print(
+            f"  Link the selected PRs after merged PR #{recovery.boundary.number}.",
+            file=sys.stderr,
+        )
+    if plan.omitted:
+        detached = ", ".join(f"#{pr.number}" for pr in plan.omitted)
+        print(f"  Detach {detached}; retain their branches.", file=sys.stderr)
+    if close_numbers:
+        print(
+            "  Close "
+            + ", ".join(f"#{number}" for number in sorted(close_numbers))
+            + " after successful publication.",
+            file=sys.stderr,
+        )
+    if recovery is not None:
+        print(
+            "  History identifies this as the unique surviving stack consistent "
+            "with the selected PRs; GitHub does not retain former stack membership.",
+            file=sys.stderr,
+        )
+    elif plan.kind is TopologyKind.NEW and stack.discovered:
+        print(
+            "  No surviving stack was identified; any former stack number is unavailable.",
+            file=sys.stderr,
+        )
+
+    if rebase_hint:
+        print(file=sys.stderr)
+        print(
+            f"Hint: stack base is behind {remote}/{repo.base}; use --rebase to refresh it.",
+            file=sys.stderr,
+        )
+
+    if verbosity < 1:
+        return
+    print(f"Evidence: {reconciliation.value}", file=sys.stderr)
+    if selection is not None:
+        print(
+            f"  base {repo.base}={base_oid[:12]}; fork={selection.fork[:12]}; "
+            f"segments={','.join(map(str, plan.segment_commits))}",
+            file=sys.stderr,
+        )
+    for state in states:
+        tracked = state.tracked_oid[:12] if state.tracked_oid else "missing"
+        print(
+            f"  {state.branch}: local={state.local_oid[:12]} "
+            f"tracked={tracked} remote={state.live_oid[:12]}",
+            file=sys.stderr,
+        )
+    if recovery is not None:
+        event = recovery.transition
+        print(
+            f"  PR base event {event.node_id}: {event.previous} → {event.current} "
+            f"at {event.created_at}",
+            file=sys.stderr,
+        )
+    for oid, matches in selectors.items():
+        prs = ", ".join(f"#{pr.number}" for pr in matches)
+        print(f"  merged selector {oid[:12]}: {prs}", file=sys.stderr)
+    for index, (revision, head) in enumerate(
+        zip(revisions, plan.heads, strict=True), 1
+    ):
+        pr = stack.discovered.get(head)
+        identity = f"reuse PR #{pr.number}" if pr else "create draft PR"
+        readiness = "unchanged" if pr else "draft"
+        commits = plan.segment_commits[index - 1]
+        if pr and commits > 1:
+            metadata = "preserve existing title/body; review after multi-commit content changes"
+        elif pr and pr.commits > 1:
+            metadata = (
+                f"sync title/body; segment changed {pr.commits} → {commits} commits, "
+                "so local title/body becomes authoritative"
+            )
+        else:
+            metadata = "sync title/body"
+        print(
+            f"  {index}. {head}: {identity}; readiness {readiness}; "
+            f"{commits} commit(s); {metadata}",
+            file=sys.stderr,
+        )
+    if plan.omitted:
+        evidence = {item.pr.node_id: item for item in existing_evidence}
+        noun = "this open PR" if len(plan.omitted) == 1 else "these open PRs"
+        print(f"  desired stack omits {noun}:", file=sys.stderr)
+        for pr in plan.omitted:
+            item = evidence.get(pr.node_id)
+            print(
+                f"    #{pr.number} {terminal_text(pr.title)}\n"
+                f"      {pr.url}\n"
+                "      action: detach from stack; "
+                + (
+                    "close after successful publication"
+                    if pr.number in close_numbers
+                    else "leave open"
+                ),
+                file=sys.stderr,
+            )
+            if item is not None:
+                print(
+                    f"      branch: retain {pr.head} @ {item.live_oid[:8]}",
+                    file=sys.stderr,
+                )
+                if item.check is RemoteCheck.EXACT:
+                    check = item.check.value
+                else:
+                    check = (
+                        f"restacked since tracked {item.tracked_oid[:8]}; "
+                        f"{item.check.value}"
+                    )
+                print(f"      remote check: {check}", file=sys.stderr)
+        print(
+            "  omission checks compare each PR with its tracked remote baseline; "
+            "they do not prove its changes are present in the desired stack",
+            file=sys.stderr,
+        )
+
+
+def requires_confirmation(
+    plan: Plan,
+    stack: StackSnapshot,
+    recovery: RecoveryEvidence | None,
+    *,
+    local_rewrite: bool,
+) -> bool:
+    return bool(
+        local_rewrite
+        or plan.boundary
+        or plan.kind
+        in {
+            TopologyKind.FULLY_OPEN_REBUILD,
+            TopologyKind.MERGED_PREFIX_REBUILD,
+        }
+        or plan.omitted
+        or recovery is not None
+        or (plan.kind is TopologyKind.NEW and stack.discovered)
+    )
+
+
+def needs_local_rewrite(
+    reconciliation: ReconciliationKind,
+    selection: Selection | None,
+    base_oid: str,
+) -> bool:
+    return bool(
+        reconciliation is ReconciliationKind.LOCAL_AUTHORITY
+        and selection is not None
+        and selection.fork != base_oid
+    )
+
+
+def apply_rebase_request(
+    reconciliation: ReconciliationKind,
+    selection: Selection | None,
+    base_oid: str,
+    *,
+    requested: bool,
+) -> ReconciliationKind:
+    if requested and selection is not None and selection.fork != base_oid:
+        return ReconciliationKind.LOCAL_AUTHORITY
+    return reconciliation
+
+
+def authorize_plan(*, required: bool, plan_only: bool, yes: bool) -> None:
+    if not required or plan_only or yes:
+        return
+    if not sys.stdin.isatty():
+        raise Error("this plan requires confirmation; rerun with --yes")
+    print(file=sys.stderr)
+    print("Continue? [y/N] ", end="", file=sys.stderr, flush=True)
+    try:
+        answer = input()
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() not in {"y", "yes"}:
+        raise Error("publication cancelled")
+
+
+def gh_plan(repo: Repository, args: list[str]) -> str:
+    return f"(cd {shlex.quote(repo.git_root)} && GH_REPO={shlex.quote(repo.gh_repo)} {shlex.join(args)})"
+
+
+def verify_unstacked(
+    stack: StackSnapshot,
+    name_with_owner: str,
+    gh_env: dict[str, str],
+    git_root: str,
+) -> None:
+    if stack.merged:
+        if stack.node_id is None:
+            raise Error("existing stack has no GraphQL node ID")
+        remaining = fetch_stack(stack.node_id, gh_env, git_root)
+        if [pr.node_id for pr in remaining.entries] == [
+            pr.node_id for pr in stack.merged
+        ]:
+            return
+        found = ", ".join(f"#{pr.number}" for pr in remaining.entries) or "none"
+        raise Error(f"stack was only partially unstacked; remaining entries: {found}")
+
+    if stack.number is None:
+        raise Error("existing stack has no stack number")
+    response = command(
+        [
+            "gh",
+            "api",
+            "--include",
+            f"repos/{name_with_owner}/stacks/{stack.number}",
+        ],
+        cwd=git_root,
+        env=gh_env,
+        check=False,
+    )
+    first_line = response.stdout.splitlines()[0] if response.stdout else ""
+    match = re.match(r"HTTP/\S+ (\d{3})\b", first_line)
+    status = int(match.group(1)) if match else None
+    if status == 404:
+        return
+    if status == 200:
+        raise Error(f"stack {stack.number} still exists after unstacking")
+    raise Error(
+        f"could not verify whether stack {stack.number} was dissolved; "
+        "stop and inspect it before rerunning"
+    )
+
+
+def link_command(
+    plan: Plan, stack: StackSnapshot, repo: Repository, remote: str
+) -> list[str] | None:
+    if not plan.link_heads:
+        return None
+    args = ["gh", "stack", "link", "--remote", remote]
+    if plan.kind in {TopologyKind.NEW, TopologyKind.FULLY_OPEN_REBUILD}:
+        args.extend(["--base", repo.base])
+    elif plan.stack_number is not None:
+        args.append(str(plan.stack_number))
+    args.extend(
+        [
+            "--",
+            *[
+                stack.discovered[head].url if head in stack.discovered else head
+                for head in plan.link_heads
+            ],
+        ]
+    )
+    return args
+
+
+def run_stack_link(
+    args: list[str],
+    git_root: str,
+    gh_env: dict[str, str],
+    temporary_heads: dict[str, str],
+) -> subprocess.CompletedProcess[str]:
+    originals: dict[str, str | None] = {}
+    changed: list[str] = []
+    try:
+        for branch, oid in temporary_heads.items():
+            ref = f"refs/heads/{branch}"
+            current = command(
+                ["git", "-C", git_root, "rev-parse", "--verify", ref],
+                check=False,
+            )
+            old_oid = current.stdout.strip() if current.returncode == 0 else None
+            originals[branch] = old_oid
+            if old_oid == oid:
+                continue
+            command(
+                [
+                    "git",
+                    "-C",
+                    git_root,
+                    "update-ref",
+                    ref,
+                    oid,
+                    old_oid or "0" * 40,
+                ]
+            )
+            changed.append(branch)
+        return command(args, cwd=git_root, env=gh_env, check=False)
+    finally:
+        for branch in reversed(changed):
+            ref = f"refs/heads/{branch}"
+            old_oid = originals[branch]
+            if old_oid is None:
+                command(
+                    [
+                        "git",
+                        "-C",
+                        git_root,
+                        "update-ref",
+                        "-d",
+                        ref,
+                        temporary_heads[branch],
+                    ]
+                )
+            else:
+                command(
+                    [
+                        "git",
+                        "-C",
+                        git_root,
+                        "update-ref",
+                        ref,
+                        old_oid,
+                        temporary_heads[branch],
+                    ]
+                )
+
+
+def synchronize_pull_requests(
+    heads: list[str],
+    prs: dict[str, PullRequest],
+    metadata: dict[str, tuple[str, str]],
+    gh_env: dict[str, str],
+    git_root: str,
+) -> None:
+    declarations = []
+    selections = []
+    variables: dict[str, object] = {}
+    for index, head in enumerate(heads):
+        pr = prs[head]
+        title, body = metadata[head]
+        if (title, body) != (pr.title, pr.body):
+            key = f"edit{index}"
+            declarations.append(f"${key}: UpdatePullRequestInput!")
+            variables[key] = {
+                "pullRequestId": pr.node_id,
+                "title": title,
+                "body": body,
+            }
+            selections.append(
+                f"{key}: updatePullRequest(input: ${key}) {{ pullRequest {{ url }} }}"
+            )
+    if selections:
+        graphql(
+            f"mutation({', '.join(declarations)}) {{ {' '.join(selections)} }}",
+            variables,
+            gh_env,
+            git_root,
+            "stack was updated, but synchronizing pull request metadata failed; some updates may have succeeded",
+        )
+
+
+def fetch_pull_request(
+    node_id: str, gh_env: dict[str, str], git_root: str
+) -> PullRequest:
+    query = f"""query($id: ID!) {{
+      node(id: $id) {{
+        ... on PullRequest {{ {_PR_FIELDS} }}
+      }}
+    }}"""
+    data = graphql(
+        query,
+        {"id": node_id},
+        gh_env,
+        git_root,
+        "could not revalidate pull request",
+    )
+    node = data.get("node")
+    if node is None:
+        raise Error("pull request no longer exists")
+    return parse_pr(node)
+
+
+def git_commit_description(git_root: str, oid: str) -> str:
+    return command(
+        [
+            "git",
+            "--no-replace-objects",
+            "-C",
+            git_root,
+            "show",
+            "-s",
+            "--format=%B",
+            oid,
+        ]
+    ).stdout.rstrip("\n")
+
+
+def print_queue_cause(cause: QueueCause, git_root: str) -> None:
+    before = git_commit_description(git_root, cause.pr.head_oid)
+    after = git_commit_description(git_root, cause.proposed_oid)
+    print(
+        f"Change requiring queue removal: PR #{cause.pr.number} {cause.pr.url}",
+        file=sys.stderr,
+    )
+    if before == after:
+        print("  Commit description: unchanged", file=sys.stderr)
+    else:
+        print("  Commit description:", file=sys.stderr)
+        for line in difflib.unified_diff(
+            before.splitlines(),
+            after.splitlines(),
+            fromfile="queued",
+            tofile="local",
+            lineterm="",
+        ):
+            print(f"    {terminal_text(line)}", file=sys.stderr)
+    stat = command(
+        [
+            "git",
+            "--no-replace-objects",
+            "-C",
+            git_root,
+            "diff",
+            "--no-color",
+            "--stat",
+            "--no-ext-diff",
+            "--no-textconv",
+            cause.pr.head_oid,
+            cause.proposed_oid,
+            "--",
+        ]
+    ).stdout.rstrip("\n")
+    if stat:
+        print("  Code:", file=sys.stderr)
+        for line in stat.splitlines():
+            print(f"    {terminal_text(line)}", file=sys.stderr)
+    else:
+        print("  Code: unchanged", file=sys.stderr)
+
+
+def handle_queue_removal(
+    removal: QueueRemoval,
+    git_root: str,
+    *,
+    plan_only: bool,
+) -> None:
+    for cause in removal.causes:
+        print_queue_cause(cause, git_root)
+    numbers = ", ".join(f"#{pr.number}" for pr in removal.affected)
+    print(
+        f"Queued {counted(len(removal.affected), 'PR')} would be changed directly or "
+        f"through a lower stack member: {numbers}",
+        file=sys.stderr,
+    )
+    for pr in removal.affected:
+        print(f"  #{pr.number}: {pr.url}", file=sys.stderr)
+    for target in removal.targets:
+        cascaded = [
+            pr
+            for pr in removal.expected_removed
+            if target.stack_id is not None
+            and pr.stack_id == target.stack_id
+            and pr.node_id != target.node_id
+        ]
+        if cascaded:
+            rendered = ", ".join(f"#{pr.number}" for pr in cascaded)
+            noun = "PR" if len(cascaded) == 1 else "PRs"
+            print(
+                f"Removing queued PR #{target.number} will also remove queued {noun} "
+                f"{rendered} above it.",
+                file=sys.stderr,
+            )
+        print(
+            f"Open PR #{target.number} and choose Remove from queue: {target.url}",
+            file=sys.stderr,
+        )
+    if removal.expected_retained:
+        retained = ", ".join(f"#{pr.number}" for pr in removal.expected_retained)
+        print(f"Queued PRs below it should remain queued: {retained}.", file=sys.stderr)
+
+    if plan_only:
+        raise Error(
+            "queued PRs must leave the merge queue before publication; no changes made"
+        )
+    raise Error(
+        "queued PRs must be removed manually using the links above; rerun afterward; "
+        "--yes does not remove them; no changes made"
+    )
+
+
+def verify_detached_omissions(
+    evidence: tuple[ExistingBoundary, ...],
+    repo: Repository,
+    remote: str,
+    gh_env: dict[str, str],
+) -> dict[int, PullRequest]:
+    live = remote_refs(repo.git_root, remote)
+    verify_existing_refs_unchanged(evidence, live)
+    result = {}
+    for item in evidence:
+        before = item.pr
+        current = fetch_pull_request(before.node_id, gh_env, repo.git_root)
+        if (
+            current.node_id != before.node_id
+            or current.number != before.number
+            or current.repository != before.repository
+            or current.head_repository != before.head_repository
+            or current.head != before.head
+            or current.head_oid != item.live_oid
+        ):
+            raise Error(
+                f"omitted PR #{before.number} identity or branch changed after publication"
+            )
+        if current.state != "OPEN":
+            raise Error(f"omitted PR #{before.number} is no longer open")
+        if current.stack_id is not None:
+            raise Error(f"omitted PR #{before.number} is still attached to a stack")
+        if current.auto_merge or current.merge_queue:
+            raise Error(
+                f"omitted PR #{before.number} entered auto-merge or merge queue"
+            )
+        result[current.number] = current
+    return result
+
+
+def close_omitted_pull_request(
+    pr: PullRequest, gh_env: dict[str, str], git_root: str
+) -> None:
+    graphql(
+        """mutation($input: ClosePullRequestInput!) {
+          closePullRequest(input: $input) { pullRequest { id state } }
+        }""",
+        {"input": {"pullRequestId": pr.node_id}},
+        gh_env,
+        git_root,
+        f"could not close omitted PR #{pr.number}",
+    )
+    closed = fetch_pull_request(pr.node_id, gh_env, git_root)
+    if (
+        closed.state != "CLOSED"
+        or closed.head != pr.head
+        or closed.head_oid != pr.head_oid
+        or closed.stack_id is not None
+    ):
+        raise Error(f"could not verify closure of omitted PR #{pr.number}")
+
+
+def verify_final(
+    repo: Repository,
+    remote: str,
+    revisions: list[Revision],
+    heads: list[str],
+    metadata: dict[str, tuple[str, str]],
+    expected_drafts: dict[str, bool],
+    expected_first_base: str,
+    inherited: list[PullRequest],
+    expected_stack_id: str | None,
+    base_oid: str,
+    segment_commits: tuple[int, ...],
+    gh_env: dict[str, str],
+) -> StackSnapshot:
+    if not heads:
+        if expected_stack_id is None:
+            raise Error(
+                "cannot verify an empty open suffix without an identified stack"
+            )
+        final = fetch_stack(expected_stack_id, gh_env, repo.git_root)
+        if [pr.node_id for pr in final.merged] != [pr.node_id for pr in inherited]:
+            raise Error("final merged prefix differs from the inherited merged prefix")
+        if final.active:
+            raise Error("final stack still contains open pull requests")
+        return final
+    discovered, live_refs = discover_pull_requests(
+        repo.name_with_owner, heads, gh_env, repo.git_root
+    )
+    if set(discovered) != set(heads):
+        missing = [head for head in heads if head not in discovered]
+        raise Error(
+            "publication completed partially; missing PRs for: " + ", ".join(missing)
+        )
+    stack_ids = {pr.stack_id for pr in discovered.values()}
+    if None in stack_ids or len(stack_ids) != 1:
+        raise Error(
+            "publication completed partially; selected PRs are not together in one stack"
+        )
+    final = fetch_stack(stack_ids.pop(), gh_env, repo.git_root)
+    if expected_stack_id is not None and final.node_id != expected_stack_id:
+        raise Error(
+            "publication moved the immutable merged prefix to a different stack"
+        )
+    if [pr.node_id for pr in final.merged] != [pr.node_id for pr in inherited]:
+        raise Error("final merged prefix differs from the inherited merged prefix")
+    if [pr.head for pr in final.active] != heads:
+        raise Error("final open stack order does not match the selected revset")
+    for index, (revision, pr) in enumerate(zip(revisions, final.active, strict=True)):
+        expected_base_name = expected_first_base if index == 0 else heads[index - 1]
+        if (pr.title, pr.body) != metadata[pr.head]:
+            raise Error(f"PR #{pr.number} metadata does not match the publication plan")
+        if pr.draft != expected_drafts[pr.head]:
+            state = "draft" if expected_drafts[pr.head] else "ready"
+            raise Error(f"PR #{pr.number} is not {state} as planned")
+        if pr.head_oid != revision.commit_id:
+            raise Error(
+                f"PR #{pr.number} has unexpected head OID; expected "
+                f"{revision.commit_id[:12]}"
+            )
+        if pr.base != expected_base_name:
+            raise Error(
+                f"PR #{pr.number} has base {pr.base}, expected {expected_base_name}"
+            )
+        if pr.commits != segment_commits[index]:
+            raise Error(
+                f"PR #{pr.number} contains {pr.commits} commits; "
+                f"expected {segment_commits[index]}"
+            )
+    states = tuple(
+        BoundaryState(head, revision.commit_id, None, live_refs[head], pr)
+        for revision, head, pr in zip(revisions, heads, final.active, strict=True)
+    )
+    verify_live_suffix(
+        states,
+        open_suffix_root(final, base_oid),
+        segment_commits,
+        repo.git_root,
+        remote,
+        allow_restacked_first=True,
+        first_parent_ancestor_of=base_oid,
+    )
+    return final
+
+
+@dataclass(frozen=True)
+class Discovery:
+    selection: Selection | None
+    range_revisions: list[Revision]
+    revisions: list[Revision]
+    heads: list[str]
+    stack: StackSnapshot
+    candidate_names: list[str]
+    live_refs: dict[str, str] = field(default_factory=dict)
+
+
+def validate_head_ref_collisions(
+    revisions: list[Revision],
+    heads: list[str],
+    selected_prs: dict[str, PullRequest],
+    live_refs: dict[str, str],
+    base: str,
+) -> None:
+    for revision, head in zip(revisions, heads, strict=True):
+        if head == base:
+            raise Error(f"selected PR head collides with the base branch: {head}")
+        live_oid = live_refs.get(head)
+        if (
+            head not in selected_prs
+            and live_oid is not None
+            and live_oid != revision.commit_id
+        ):
+            raise Error(
+                f"selected PR head collides with an unrelated remote branch: {head}"
+            )
+
+
+def verify_selected_pr_change_identity(
+    revisions: list[Revision],
+    heads: list[str],
+    selected_prs: dict[str, PullRequest],
+    tracked_refs: dict[str, str],
+) -> None:
+    tracked_changes = change_ids_for_commits(
+        tracked_refs[head]
+        for head in heads
+        if head in selected_prs and head in tracked_refs
+    )
+    for revision, head in zip(revisions, heads, strict=True):
+        pr = selected_prs.get(head)
+        if pr is None:
+            continue
+        tracked_oid = tracked_refs.get(head)
+        if tracked_oid is None:
+            matches = revision.commit_id == pr.head_oid
+            old_change = "unavailable"
+        else:
+            old_change = tracked_changes[tracked_oid]
+            matches = old_change == revision.change_id
+        if not matches:
+            raise Error(
+                f"bookmark {head} is the head of PR #{pr.number}, but moved from "
+                f"change {old_change[:12]} to change {revision.change_id[:12]}\n\n"
+                "Reusing an existing PR for a different jj change is not currently supported."
+            )
+
+
+def publication_identity(
+    discovery: Discovery,
+) -> tuple[tuple[str, str, str | None], ...]:
+    return tuple(
+        (
+            revision.change_id,
+            head,
+            discovery.stack.discovered[head].node_id
+            if head in discovery.stack.discovered
+            else None,
+        )
+        for revision, head in zip(discovery.revisions, discovery.heads, strict=True)
+    )
+
+
+def verify_planned_head_refs_unchanged(
+    planned: dict[str, str | None], current: dict[str, str]
+) -> None:
+    changed = [name for name, oid in planned.items() if current.get(name) != oid]
+    if changed:
+        raise Error(
+            "selected remote refs changed during reconciliation for "
+            + ", ".join(changed)
+            + "; replan and retry"
+        )
+
+
+def expand_open_suffix(open_oids: list[str], discovered: Discovery) -> list[str]:
+    if not open_oids:
+        return open_oids
+    selected_range = {revision.commit_id for revision in discovered.range_revisions}
+    selected_heads = set(discovered.heads)
+    missing_prs = [
+        pr for pr in discovered.stack.active if pr.head not in selected_heads
+    ]
+    if not missing_prs:
+        return open_oids
+    expandable = []
+    for pr in missing_prs:
+        oid = local_bookmark_oid(pr.head)
+        if oid is not None and oid in selected_range:
+            expandable.append(oid)
+    if not expandable:
+        return open_oids
+    return revision_ids("(" + " | ".join([*open_oids, *expandable]) + ")")
+
+
+def discover_publication(
+    open_oids: list[str],
+    base_oid: str,
+    repo: Repository,
+    remote: str,
+    gh_env: dict[str, str],
+    identified_stack: StackSnapshot | None,
+    *,
+    reject_divergence: bool,
+) -> Discovery:
+    selection = (
+        validate_boundaries(
+            open_oids,
+            base_oid,
+            repo.git_root,
+            remote,
+            reject_divergence=reject_divergence,
+        )
+        if open_oids
+        else None
+    )
+    range_revisions = (
+        revision_details(list(selection.commits), remote, set(selection.boundaries))
+        if selection
+        else []
+    )
+    candidate_names = sorted(
+        {
+            name
+            for revision in range_revisions
+            for name in (
+                *revision.local_bookmarks,
+                *revision.remote_bookmarks,
+                revision.generated_bookmark,
+            )
+        }
+    )
+    discovered, live_refs = discover_pull_requests(
+        repo.name_with_owner, candidate_names, gh_env, repo.git_root
+    )
+    requested = set(selection.boundaries) if selection else set()
+    # Existing PR boundaries inside a selected sparse range are part of the
+    # managed suffix even when REVSET did not name them explicitly.
+    boundary_ids = []
+    for revision in range_revisions:
+        names = {
+            *revision.local_bookmarks,
+            *revision.remote_bookmarks,
+            revision.generated_bookmark,
+        }
+        if revision.commit_id in requested or names & set(discovered):
+            boundary_ids.append(revision.commit_id)
+    if selection and tuple(boundary_ids) != selection.boundaries:
+        selection = validate_boundaries(
+            boundary_ids,
+            base_oid,
+            repo.git_root,
+            remote,
+            reject_divergence=reject_divergence,
+        )
+    by_id = {revision.commit_id: revision for revision in range_revisions}
+    revisions = [by_id[commit_id] for commit_id in boundary_ids]
+    missing_titles = [
+        revision.commit_id for revision in revisions if not revision.title
+    ]
+    if missing_titles:
+        raise Error(f"revision {missing_titles[0]} has no description title")
+    heads, stack = inspect_existing_stack(
+        discovered,
+        range_revisions,
+        tuple(boundary_ids),
+        gh_env,
+        repo.git_root,
+        identified_stack,
+    )
+    return Discovery(
+        selection, range_revisions, revisions, heads, stack, candidate_names, live_refs
+    )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="jj stack",
+        allow_abbrev=False,
+        description=(
+            "Publish jj PR boundaries as the authoritative GitHub PR stack. "
+            "Existing PRs are reused, missing PRs are created, and PR metadata, "
+            "membership, and order are reconciled. Any merged prefix is retained."
+        ),
+        epilog=(
+            "Stack push reasons about commit ancestry and jj change identity. It does not "
+            "detect patch-equivalent changes already applied to the base through squash, "
+            "cherry-pick, or independently authored commits."
+        ),
+    )
+    commands = parser.add_subparsers(dest="command", required=True)
+    push = commands.add_parser("push", allow_abbrev=False)
+    push.add_argument(
+        "--remote", help="Git remote to push (default: git.push, then origin)"
+    )
+    push.add_argument(
+        "--base", help="trunk branch (default: repository default branch)"
+    )
+    push.add_argument(
+        "--close-omitted",
+        action="append",
+        type=int,
+        default=[],
+        metavar="PR_NUMBER",
+        help=(
+            "detach and close this exact omitted PR after successful publication; "
+            "repeat for multiple PRs"
+        ),
+    )
+    execution = push.add_mutually_exclusive_group()
+    execution.add_argument(
+        "--plan",
+        action="store_true",
+        help=(
+            "validate current inputs and describe planned actions without publishing; "
+            "only missing Git objects may be downloaded locally"
+        ),
+    )
+    execution.add_argument(
+        "--yes",
+        action="store_true",
+        help="accept a consequential plan without an interactive prompt",
+    )
+    push.add_argument(
+        "--create-separate-stack",
+        action="store_true",
+        help="do not recover a surviving historical stack for unstacked existing PRs",
+    )
+    push.add_argument(
+        "--rebase",
+        action="store_true",
+        help="rebase the selected closure onto the current base before publishing",
+    )
+    push.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="show evidence; repeat once to also show commands and child output",
+    )
+    push.add_argument("revset")
+    args = parser.parse_args(argv)
+    if args.verbose > 2:
+        parser.error("at most -vv is supported")
+    return args
+
+
+def main() -> None:
+    global VERBOSITY
+    args = parse_args()
+    VERBOSITY = args.verbose
+    # Pin every inspection to one operation. `--at-op` implies
+    # `--ignore-working-copy` and avoids reconciling divergent operation heads.
+    planned_operation = begin_inspection_phase()
+    remote = push_remote(args.remote)
+    repo = github_repository(remote, args.base)
+    fetched_refs = fetched_remote_refs(repo.git_root, remote)
+
+    selected_oids = revision_ids(f"({args.revset})")
+    if not selected_oids:
+        raise Error("revset selects no PR boundaries")
+    gh_env = os.environ.copy()
+    gh_env.update(GH_REPO=repo.gh_repo, GH_HOST=repo.host)
+    selectors, base_oid = discover_merged_selectors(
+        repo.name_with_owner, selected_oids, repo.base, gh_env, repo.git_root
+    )
+    identified_stack = selector_stack(selectors, gh_env, repo.git_root)
+    open_oids = [oid for oid in selected_oids if oid not in selectors]
+    discovered = discover_publication(
+        open_oids,
+        base_oid,
+        repo,
+        remote,
+        gh_env,
+        identified_stack,
+        reject_divergence=False,
+    )
+    expanded_oids = expand_open_suffix(open_oids, discovered)
+    if expanded_oids != open_oids:
+        discovered = discover_publication(
+            expanded_oids,
+            base_oid,
+            repo,
+            remote,
+            gh_env,
+            identified_stack,
+            reject_divergence=False,
+        )
+    recovery_evidence = None
+    selection = discovered.selection
+    if selection is not None:
+        open_oids = list(selection.boundaries)
+        republished = set(selectors) & set(selection.commits)
+        if republished:
+            rendered = ", ".join(oid[:12] for oid in sorted(republished))
+            raise Error(
+                "merged selectors lie inside the publishable open range: "
+                f"{rendered}; rebase or restack the open suffix onto {repo.base}"
+            )
+    revisions = discovered.revisions
+    heads = discovered.heads
+    stack = discovered.stack
+    if (
+        not args.create_separate_stack
+        and identified_stack is None
+        and stack.number is None
+        and heads
+        and len(stack.discovered) == len(heads)
+    ):
+        recovery = recover_surviving_stack(
+            [stack.discovered[head] for head in heads], repo, gh_env
+        )
+        if recovery is not None:
+            identified_stack, recovery_evidence = recovery
+            discovered = discover_publication(
+                open_oids,
+                base_oid,
+                repo,
+                remote,
+                gh_env,
+                identified_stack,
+                reject_divergence=False,
+            )
+            selection = discovered.selection
+            revisions = discovered.revisions
+            heads = discovered.heads
+            stack = discovered.stack
+    actual_refs = {repo.base: base_oid, **discovered.live_refs}
+    for pr in stack.entries:
+        if pr.head_ref_oid is None:
+            continue
+        existing = actual_refs.get(pr.head)
+        if existing is not None and existing != pr.head_ref_oid:
+            raise Error(f"branch {pr.head} changed during GitHub discovery")
+        actual_refs[pr.head] = pr.head_ref_oid
+    validate_head_ref_collisions(
+        revisions, heads, stack.discovered, actual_refs, repo.base
+    )
+    verify_selected_pr_change_identity(revisions, heads, stack.discovered, fetched_refs)
+    authorized_publication = publication_identity(discovered)
+    planned_head_refs = {head: actual_refs.get(head) for head in heads}
+    if (
+        len(revisions) == 1
+        and not selectors
+        and not (stack.number is not None and heads[0] in stack.discovered)
+    ):
+        raise Error(
+            "a single PR boundary is only valid when it already has an open PR in a stack"
+        )
+    counts = segment_counts(selection) if selection else ()
+    states = boundary_states(revisions, heads, stack, fetched_refs, actual_refs)
+    has_new_boundaries = len(states) != len(revisions)
+    initial_plan = make_plan(revisions, heads, stack, base_oid, counts)
+    topology_delta = has_topology_delta(heads, stack)
+    existing_evidence = (
+        validate_existing_suffix(
+            stack,
+            repo.name_with_owner,
+            fetched_refs,
+            actual_refs,
+            repo.git_root,
+            remote,
+        )
+        if topology_delta
+        else ()
+    )
+    omitted_ids = {pr.node_id for pr in initial_plan.omitted}
+    omitted_evidence = tuple(
+        item for item in existing_evidence if item.pr.node_id in omitted_ids
+    )
+    reconciliation = classify_reconciliation(
+        states,
+        has_new_boundaries=has_new_boundaries,
+        topology_changed=topology_delta,
+    )
+    reconciliation = apply_rebase_request(
+        reconciliation, selection, base_oid, requested=args.rebase
+    )
+    base_pinned = reconciliation not in {
+        ReconciliationKind.REMOTE_ADOPT,
+        ReconciliationKind.ALREADY_CONVERGED,
+    }
+    observed_base_oid = base_oid
+    local_rewrite = needs_local_rewrite(reconciliation, selection, base_oid)
+    if recovery_evidence is not None:
+        verify_recovery_suffix(
+            recovery_evidence, stack, states, counts, base_oid, repo, remote
+        )
+    if not topology_delta:
+        verify_reconciliation_suffix(
+            reconciliation,
+            states,
+            open_suffix_root(stack, base_oid),
+            counts,
+            repo.git_root,
+            remote,
+            allow_restacked_first=bool(stack.merged),
+            allow_stale_local_base=local_rewrite,
+            current_base_oid=base_oid,
+        )
+    if reconciliation is ReconciliationKind.LOCAL_AUTHORITY:
+        imported_divergence = [
+            state.branch
+            for state in states
+            if state.live_oid != state.local_oid
+            and jj_commit_exists(state.live_oid)
+            and revision_ids(f"{state.live_oid} & divergent()")
+        ]
+        if imported_divergence:
+            raise Error(
+                "GitHub restack variants were already imported and are ambiguous for "
+                + ", ".join(imported_divergence)
+                + "; inspect and resolve them explicitly"
+            )
+
+    close_numbers = frozenset(args.close_omitted)
+    validate_close_targets(initial_plan, close_numbers)
+    if reconciliation in {
+        ReconciliationKind.REMOTE_ADOPT,
+        ReconciliationKind.ALREADY_CONVERGED,
+    }:
+        updated_heads = set()
+    elif local_rewrite:
+        updated_heads = set(heads)
+    else:
+        updated_heads = {
+            head
+            for revision, head in zip(revisions, heads, strict=True)
+            if actual_refs.get(head) != revision.commit_id
+        }
+    proposed_heads = {
+        head: revision.commit_id
+        for revision, head in zip(revisions, heads, strict=True)
+    }
+    queue_removal = plan_queue_removal(
+        initial_plan, stack, proposed_heads, updated_heads
+    )
+    if queue_removal is None:
+        verify_unstackable(initial_plan, stack)
+    closure = None
+    selected_change_ids = tuple(
+        revision.change_id for revision in discovered.range_revisions
+    )
+    if local_rewrite:
+        assert selection is not None
+        closure = capture_closure(selection.commits[0])
+    initial_metadata = planned_metadata(revisions, heads, stack, counts)
+    print_plan(
+        initial_plan,
+        revisions,
+        stack,
+        repo,
+        remote,
+        selection,
+        base_oid,
+        selectors,
+        reconciliation=reconciliation,
+        states=states,
+        closure=closure,
+        recovery=recovery_evidence,
+        verbosity=args.verbose,
+        existing_evidence=existing_evidence,
+        close_numbers=close_numbers,
+        metadata_updates=metadata_update_heads(heads, stack, initial_metadata),
+    )
+    if queue_removal is not None:
+        handle_queue_removal(
+            queue_removal,
+            repo.git_root,
+            plan_only=args.plan,
+        )
+    confirmation_required = requires_confirmation(
+        initial_plan, stack, recovery_evidence, local_rewrite=local_rewrite
+    )
+    authorize_plan(
+        required=confirmation_required,
+        plan_only=args.plan,
+        yes=args.yes,
+    )
+
+    if args.plan:
+        if args.verbose >= 2:
+            print("Commands:", file=sys.stderr)
+        if reconciliation is ReconciliationKind.REMOTE_ADOPT:
+            if args.verbose >= 2:
+                print(
+                    f"  {shlex.join([*JJ, 'git', 'fetch', '--remote', remote])}",
+                    file=sys.stderr,
+                )
+        elif (
+            reconciliation is ReconciliationKind.LOCAL_AUTHORITY and closure is not None
+        ):
+            assert closure is not None
+            if args.verbose >= 2:
+                print(
+                    f"  {shlex.join([*JJ, 'git', 'fetch', '--remote', remote, '--branch', repo.base])}",
+                    file=sys.stderr,
+                )
+                print(
+                    f"  {shlex.join([*JJ, '--ignore-immutable', 'rebase', '-s', closure.root, '-o', base_oid])}",
+                    file=sys.stderr,
+                )
+        else:
+            ref_plan = make_ref_publication_plan(
+                reconciliation, revisions, heads, actual_refs
+            )
+            if ref_plan.updates and args.verbose >= 2:
+                print(
+                    f"  {shlex.join(atomic_push_command(repo.git_root, remote, ref_plan.updates))}",
+                    file=sys.stderr,
+                )
+        if initial_plan.boundary and args.verbose >= 2:
+            for boundary_command in boundary_commands(
+                initial_plan.boundary.head,
+                base_oid,
+                remote,
+                repo.git_root,
+                actual_refs.get(initial_plan.boundary.head),
+            ):
+                print(f"  {shlex.join(boundary_command)}", file=sys.stderr)
+        if args.verbose >= 2 and initial_plan.kind in {
+            TopologyKind.FULLY_OPEN_REBUILD,
+            TopologyKind.MERGED_PREFIX_REBUILD,
+        }:
+            print(
+                f"  {gh_plan(repo, ['gh', 'stack', 'unstack', str(initial_plan.stack_number)])}",
+                file=sys.stderr,
+            )
+        if args.verbose >= 2 and (
+            link := link_command(initial_plan, stack, repo, remote)
+        ):
+            print(f"  {gh_plan(repo, link)}", file=sys.stderr)
+        if operation_id() != planned_operation:
+            raise Error("jj operation changed during planning; replan and retry")
+        if confirmation_required:
+            print("A live run will require confirmation.", file=sys.stderr)
+        print("No changes made.", file=sys.stderr)
+        return
+
+    if recovery_evidence is not None:
+        current_recovery = recover_surviving_stack(
+            [stack.discovered[head] for head in heads], repo, gh_env
+        )
+        if current_recovery is None or current_recovery[1] != recovery_evidence:
+            raise Error("historical stack evidence changed after confirmation; replan")
+    if operation_id() != planned_operation:
+        raise Error("jj operation changed during planning; replan and retry")
+
+    old_stack = stack
+    old_states = states
+    boundary_change_ids = [revision.change_id for revision in revisions]
+    if operation_id() != planned_operation:
+        raise Error("jj operation changed during planning; replan and retry")
+    if reconciliation is ReconciliationKind.REMOTE_ADOPT:
+        jj("git", "fetch", "--remote", remote)
+        planned_operation = begin_inspection_phase()
+        after_fetch = remote_refs(repo.git_root, remote)
+        expected = {state.branch: state.live_oid for state in states}
+        observed_base_oid = verify_live_base(
+            repo.git_root,
+            remote,
+            repo.base,
+            observed_base_oid,
+            after_fetch,
+            pinned=base_pinned,
+        )
+        if any(after_fetch.get(name) != oid for name, oid in expected.items()):
+            raise Error(
+                "remote refs changed during adoption; inspect the fetched state and retry"
+            )
+        fetched_after = fetched_remote_refs(repo.git_root, remote)
+        if any(fetched_after.get(name) != oid for name, oid in expected.items()):
+            raise Error("jj fetch did not import the complete planned GitHub suffix")
+        open_oids = [state.live_oid for state in states]
+    elif reconciliation is ReconciliationKind.LOCAL_AUTHORITY and closure is not None:
+        assert closure is not None
+        fetch_exact_branches(repo, remote, {repo.base: base_oid})
+        planned_operation = begin_inspection_phase()
+        before_rebase = remote_refs(repo.git_root, remote)
+        verify_existing_refs_unchanged(existing_evidence, before_rebase)
+        observed_base_oid = verify_live_base(
+            repo.git_root,
+            remote,
+            repo.base,
+            observed_base_oid,
+            before_rebase,
+            pinned=True,
+        )
+        if any(before_rebase.get(state.branch) != state.live_oid for state in states):
+            raise Error("remote refs changed before local rebase; replan and retry")
+        closure = refresh_closure_baseline(closure, repo.base, base_oid)
+        jj("--ignore-immutable", "rebase", "-s", closure.root, "-o", base_oid)
+        planned_operation = begin_inspection_phase()
+        rewritten = verify_rewritten_closure(closure, selected_change_ids)
+        open_oids = [rewritten[change_id] for change_id in boundary_change_ids]
+
+    fresh_stack = (
+        fetch_stack(identified_stack.node_id, gh_env, repo.git_root)
+        if identified_stack is not None and identified_stack.node_id is not None
+        else None
+    )
+    discovered = discover_publication(
+        open_oids,
+        base_oid,
+        repo,
+        remote,
+        gh_env,
+        fresh_stack,
+        reject_divergence=True,
+    )
+    selection = discovered.selection
+    revisions = discovered.revisions
+    heads = discovered.heads
+    stack = discovered.stack
+    if publication_identity(discovered) != authorized_publication:
+        raise Error(
+            "selected PR boundaries or identities changed during reconciliation; "
+            "replan and retry"
+        )
+    counts = segment_counts(selection) if selection else ()
+    verify_stack_snapshot_unchanged(
+        old_stack, stack, actual_refs, actual_refs, normalize_after=True
+    )
+    plan = make_plan(revisions, heads, stack, base_oid, counts)
+    if [pr.node_id for pr in plan.omitted] != [
+        pr.node_id for pr in initial_plan.omitted
+    ]:
+        raise Error("omitted PR plan changed during reconciliation; replan and retry")
+    validate_close_targets(plan, close_numbers)
+    metadata = planned_metadata(revisions, heads, stack, counts)
+    expected_drafts = {
+        head: stack.discovered[head].draft if head in stack.discovered else True
+        for head in heads
+    }
+    expected_first_base = expected_first_open_base(plan, stack, repo.base)
+    if plan.boundary and plan.boundary.head in heads:
+        raise Error("selected PR head collides with the inherited merged boundary")
+    verify_unstackable(plan, stack)
+    current_live = remote_refs(repo.git_root, remote)
+    observed_base_oid = verify_live_base(
+        repo.git_root,
+        remote,
+        repo.base,
+        observed_base_oid,
+        current_live,
+        pinned=base_pinned,
+    )
+    verify_existing_refs_unchanged(existing_evidence, current_live)
+    verify_live_boundary_refs_unchanged(old_states, current_live)
+    verify_planned_head_refs_unchanged(planned_head_refs, current_live)
+    ref_plan = make_ref_publication_plan(reconciliation, revisions, heads, current_live)
+    if ref_plan.updates:
+        preflight = atomic_push_command(
+            repo.git_root, remote, ref_plan.updates, dry_run=True
+        )
+        preflight_result = command(preflight, check=False)
+        if preflight_result.returncode != 0:
+            detail = preflight_result.stderr.strip() or preflight_result.stdout.strip()
+            local_state = (
+                "; the local stack remains rebased" if closure is not None else ""
+            )
+            raise Error(
+                "preflight atomic push failed; no remote refs were changed"
+                + local_state
+                + (f":\n{detail}" if detail else "")
+            )
+    live_after_preflight = remote_refs(repo.git_root, remote)
+    verify_existing_refs_unchanged(existing_evidence, live_after_preflight)
+    observed_base_oid = verify_live_base(
+        repo.git_root,
+        remote,
+        repo.base,
+        observed_base_oid,
+        live_after_preflight,
+        pinned=base_pinned,
+    )
+    expected_before_publication = {head: current_live.get(head) for head in heads}
+    if any(
+        live_after_preflight.get(name) != oid
+        for name, oid in expected_before_publication.items()
+    ):
+        raise Error("remote refs changed during planning; replan and retry")
+    if operation_id() != planned_operation:
+        raise Error("jj operation changed before publication; replan and retry")
+
+    if ref_plan.updates:
+        pushed = command(
+            atomic_push_command(repo.git_root, remote, ref_plan.updates), check=False
+        )
+        if pushed.returncode != 0:
+            detail = pushed.stderr.strip() or pushed.stdout.strip()
+            local_state = (
+                "; the local stack remains rebased" if closure is not None else ""
+            )
+            raise Error(
+                "atomic push failed; inspect live refs before retrying"
+                + local_state
+                + (f":\n{detail}" if detail else "")
+            )
+        expected_heads = {update.branch: update.new_oid for update in ref_plan.updates}
+        after_push = remote_refs(repo.git_root, remote)
+        try:
+            observed_base_oid = verify_live_base(
+                repo.git_root,
+                remote,
+                repo.base,
+                observed_base_oid,
+                after_push,
+                pinned=True,
+            )
+        except Error:
+            raise Error(
+                "publication completed, but the base advanced concurrently; "
+                "no GitHub metadata was changed"
+            ) from None
+        if any(after_push.get(name) != oid for name, oid in expected_heads.items()):
+            raise Error("publication completed partially; remote heads are unexpected")
+        verify_existing_refs_unchanged(omitted_evidence, after_push)
+        fetch_exact_branches(repo, remote, expected_heads)
+        track_published_branches(remote, expected_heads)
+        planned_operation = begin_inspection_phase()
+        verify_published_branch_tracking(remote, expected_heads)
+
+    if plan.boundary:
+        import_live_base(repo.git_root, remote, repo.base, base_oid)
+        planned_operation = begin_inspection_phase()
+        verify_planned_bookmarks(revisions, heads)
+        for boundary_command in boundary_commands(
+            plan.boundary.head,
+            base_oid,
+            remote,
+            repo.git_root,
+            current_live.get(plan.boundary.head),
+        ):
+            if command(boundary_command, check=False).returncode != 0:
+                raise Error(
+                    "could not complete the merged-boundary advance; GitHub stack "
+                    "metadata was not changed, but published remote or local refs may remain"
+                )
+        planned_operation = begin_inspection_phase()
+        refreshed = remote_refs(repo.git_root, remote)
+        if (
+            refreshed.get(plan.boundary.head) != base_oid
+            or refreshed.get(repo.base) != base_oid
+        ):
+            raise Error(
+                "remote merged boundary and base OIDs do not match after boundary "
+                "publication; GitHub stack metadata was not changed, but published "
+                "remote or local refs may remain"
+            )
+        fetch_exact_branches(repo, remote, {plan.boundary.head: base_oid})
+        track_published_branches(remote, {plan.boundary.head: base_oid})
+        planned_operation = begin_inspection_phase()
+        verify_published_branch_tracking(remote, {plan.boundary.head: base_oid})
+
+    expected_refs = {
+        repo.base: observed_base_oid,
+        **{
+            head: revision.commit_id
+            for revision, head in zip(revisions, heads, strict=True)
+        },
+    }
+    if plan.boundary:
+        expected_refs[plan.boundary.head] = base_oid
+    live_before_github = remote_refs(repo.git_root, remote)
+    verify_existing_refs_unchanged(omitted_evidence, live_before_github)
+    observed_base_oid = verify_live_base(
+        repo.git_root,
+        remote,
+        repo.base,
+        observed_base_oid,
+        live_before_github,
+        pinned=base_pinned,
+    )
+    expected_refs[repo.base] = observed_base_oid
+    if any(live_before_github.get(name) != oid for name, oid in expected_refs.items()):
+        raise Error("remote refs changed before GitHub mutation; inspect and retry")
+    if operation_id() != planned_operation:
+        raise Error("jj operation changed before GitHub mutation; replan and retry")
+    if old_stack.node_id is not None:
+        expected_base_refs = dict(expected_refs)
+        if plan.refresh_base and plan.boundary:
+            expected_base_refs.pop(plan.boundary.head, None)
+        verify_stack_snapshot_unchanged(
+            old_stack,
+            fetch_stack(old_stack.node_id, gh_env, repo.git_root),
+            expected_refs,
+            expected_base_refs,
+            normalize_after=True,
+        )
+
+    if plan.kind in {
+        TopologyKind.FULLY_OPEN_REBUILD,
+        TopologyKind.MERGED_PREFIX_REBUILD,
+    }:
+        unstack = ["gh", "stack", "unstack", str(plan.stack_number)]
+        if command(unstack, cwd=repo.git_root, env=gh_env, check=False).returncode != 0:
+            raise Error(
+                "could not unstack GitHub stack; the stack may be partially changed"
+            )
+        verify_unstacked(stack, repo.name_with_owner, gh_env, repo.git_root)
+
+    if plan.refresh_base and plan.boundary:
+        first = stack.discovered[heads[0]]
+        for base in (repo.base, plan.boundary.head):
+            result = command(
+                ["gh", "pr", "edit", first.url, "--base", base],
+                cwd=repo.git_root,
+                env=gh_env,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise Error(
+                    f"could not refresh base of {first.url}; stack remains unstacked"
+                )
+
+    if link := link_command(plan, stack, repo, remote):
+        temporary_heads = {
+            head: revision.commit_id
+            for revision, head in zip(revisions, heads, strict=True)
+            if head in plan.link_heads and head not in stack.discovered
+        }
+        if run_stack_link(link, repo.git_root, gh_env, temporary_heads).returncode != 0:
+            raise Error(
+                "gh stack link failed; pushed bookmarks remain and PRs may be unstacked"
+            )
+
+    discovered, _live_refs = discover_pull_requests(
+        repo.name_with_owner, heads, gh_env, repo.git_root
+    )
+    if set(discovered) != set(heads):
+        raise Error(
+            "stack was updated, but not all selected pull requests could be found"
+        )
+    synchronize_pull_requests(heads, discovered, metadata, gh_env, repo.git_root)
+    final = verify_final(
+        repo,
+        remote,
+        revisions,
+        heads,
+        metadata,
+        expected_drafts,
+        expected_first_base,
+        stack.merged,
+        stack.node_id if stack.merged else None,
+        observed_base_oid,
+        counts,
+        gh_env,
+    )
+    time.sleep(1)
+    stable_refs = remote_refs(repo.git_root, remote)
+    verify_existing_refs_unchanged(omitted_evidence, stable_refs)
+    observed_base_oid = verify_live_base(
+        repo.git_root,
+        remote,
+        repo.base,
+        observed_base_oid,
+        stable_refs,
+        pinned=base_pinned,
+    )
+    if any(
+        stable_refs.get(head) != revision.commit_id
+        for revision, head in zip(revisions, heads, strict=True)
+    ):
+        raise Error(
+            "GitHub restacked again after publication; inspect the managed suffix"
+        )
+    final = verify_final(
+        repo,
+        remote,
+        revisions,
+        heads,
+        metadata,
+        expected_drafts,
+        expected_first_base,
+        stack.merged,
+        stack.node_id if stack.merged else None,
+        observed_base_oid,
+        counts,
+        gh_env,
+    )
+    verify_detached_omissions(omitted_evidence, repo, remote, gh_env)
+    evidence_by_number = {item.pr.number: item for item in omitted_evidence}
+    for number in sorted(close_numbers):
+        item = evidence_by_number[number]
+        current = verify_detached_omissions((item,), repo, remote, gh_env)[number]
+        try:
+            close_omitted_pull_request(current, gh_env, repo.git_root)
+        except Error as error:
+            raise Error(
+                f"stack publication succeeded, but closing PR #{number} could not be "
+                "completed or verified; it remains detached and branch "
+                f"{item.pr.head} was retained; inspect whether the PR is open or closed: "
+                f"{error}"
+            ) from error
+        verify_existing_refs_unchanged((item,), remote_refs(repo.git_root, remote))
+    # Keep stdout focused on the success result; diagnostics and secondary outcomes
+    # belong on stderr.
+    next_pr = final.active[0] if final.active else final.entries[-1]
+    link = terminal_hyperlink(f"#{next_pr.number} {next_pr.title}", next_pr.url)
+    print(f"Published stack #{final.number}; next PR:\n  {link}")
+    for item in omitted_evidence:
+        if item.pr.number in close_numbers:
+            action = "closed"
+        else:
+            action = "left open"
+        print(
+            f"Omitted PR #{item.pr.number} detached and {action}; "
+            f"branch {item.pr.head} retained at {item.live_oid[:8]}",
+            file=sys.stderr,
+        )
+    if stack.number is not None and final.number != stack.number:
+        print(
+            f"Replaced stack {stack.number} with stack {final.number}", file=sys.stderr
+        )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Error as error:
+        print(f"jj stack: {error}", file=sys.stderr)
+        raise SystemExit(1)

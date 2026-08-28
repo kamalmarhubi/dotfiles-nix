@@ -25,6 +25,7 @@ try = ["util", "exec", "--", "jj-try"]
 sprout = ["grove", "sprout"]
 grove = ["util", "exec", "--", "jj-grove"]
 gh-fork = ["util", "exec", "--", "jj-gh-fork"]
+stack = ["util", "exec", "--", "jj-stack"]
 squash-fixups = ["util", "exec", "--", "jj-squash-fixups"]
 fixup = ["util", "exec", "--", "jj-fixup"]
 
@@ -46,6 +47,10 @@ fixup = ["util", "exec", "--", "jj-fixup"]
 '''
 'with_fixups(r)' = '''r | fixups(r)'''
 'with_fixups(r, to)' = '''r | fixups(r, to)'''
+
+# Commits matching this revset must be reworded or squashed before stack
+# publication. Repositories can override the alias to enforce additional policy.
+'stack_disallowed()' = '''incomplete() | fixups()'''
 
 # A "grove" is a cluster of related work marked by an empty orphan commit. It's
 # the unit the default log is organised around, and lives entirely under
