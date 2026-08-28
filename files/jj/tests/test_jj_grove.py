@@ -18,7 +18,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 JJ_CONFIG = REPO_ROOT / "files" / "jj" / "config.toml"
-JJ_GROVE = REPO_ROOT / "files" / "jj" / "jj-grove"
+JJ_GROVE = REPO_ROOT / "files" / "bin" / "jj-grove"
 Cwd = Optional[Union[Path, str]]
 
 

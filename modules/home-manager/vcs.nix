@@ -1,12 +1,20 @@
 {
   config,
+  dotFilesNixHomeManagerInstallationType,
   pkgs,
   ...
-}: {
+}: let
+  dotFilesNixDirName =
+    if dotFilesNixHomeManagerInstallationType == "standalone"
+    then "home-manager"
+    else "dotfiles-nix";
+in {
   home = {
     shellAliases = {
       git = "git-branchless wrap --";
     };
+
+    sessionPath = ["${config.home.homeDirectory}/.local/bin/.dotfiles-nix"];
 
     packages =
       with pkgs; [
@@ -22,12 +30,8 @@
         # git-filter-repo
         lazygit
       ];
-    file.".local/bin/jj-gh-fork".source =
-      config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/jj/jj-gh-fork";
-    file.".local/bin/jj-try".source =
-      config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/jj/jj-try";
-    file.".local/bin/jj-grove".source =
-      config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/jj/jj-grove";
+    file.".local/bin/.dotfiles-nix".source =
+      config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/${dotFilesNixDirName}/files/bin";
   };
 
   xdg.configFile."fish/completions/jj.fish".source =
