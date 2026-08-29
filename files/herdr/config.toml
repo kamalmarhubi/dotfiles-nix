@@ -9,6 +9,9 @@ rows = [
 [ui.sound]
 enabled = false
 
+[ui.toast]
+delivery = "system"
+
 [theme]
 # TODO(herdrdev/herdr#1307): Set to `terminal` if light terminal handling is fixed.
 name = "tokyo-night-day"
