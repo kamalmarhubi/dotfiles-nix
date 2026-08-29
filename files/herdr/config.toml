@@ -9,6 +9,14 @@ rows = [
 [ui.sound]
 enabled = false
 
+[ui.toast]
+delivery = "system"
+
+# The binary comes from nix, so self-update checks are just noise.
+[update]
+version_check = false
+manifest_check = false
+
 [theme]
 # TODO(herdrdev/herdr#1307): Set to `terminal` if light terminal handling is fixed.
 name = "tokyo-night-day"

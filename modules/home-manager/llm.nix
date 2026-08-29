@@ -11,6 +11,7 @@
       unstable.tuicr
       zig
       brewCasks.voiceink
+      terminal-notifier # for herdr system notifications
     ])
     ++ (with pkgs.llm-agents; [
       amp
