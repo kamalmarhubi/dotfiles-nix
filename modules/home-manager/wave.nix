@@ -1,5 +1,6 @@
 {
   config,
+  dotfilesNixDir,
   pkgs,
   lib,
   ...
@@ -33,8 +34,8 @@ in {
     vault-bin
   ];
 
-  xdg.configFile."git/config.local".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/git/config.wave";
-  xdg.configFile."jj/conf.d/wave.toml".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/jj/conf.d/wave.toml";
+  xdg.configFile."git/config.local".source = config.lib.file.mkOutOfStoreSymlink "${dotfilesNixDir}/files/git/config.wave";
+  xdg.configFile."jj/conf.d/wave.toml".source = config.lib.file.mkOutOfStoreSymlink "${dotfilesNixDir}/files/jj/conf.d/wave.toml";
   home.file.".terraformrc".text = ''
     # Temporarily disabled because of bad interaction with lock files.
     # Related: https://github.com/hashicorp/terraform/issues/29958#issuecomment-1190245494

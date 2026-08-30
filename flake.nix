@@ -193,10 +193,7 @@
         inherit pkgs;
 
         # Make inputs and system available to all modules.
-        extraSpecialArgs = {
-          inherit inputs system;
-          dotFilesNixHomeManagerInstallationType = "standalone";
-        };
+        extraSpecialArgs = {inherit inputs system;};
         modules =
           commonModules
           ++ [
