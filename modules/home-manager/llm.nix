@@ -1,5 +1,6 @@
 {
   config,
+  dotfilesNixDir,
   pkgs,
   ...
 }: {
@@ -28,6 +29,6 @@
     claude-code
   ];
 
-  xdg.configFile."amp/settings.json".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/amp/settings.json";
-  xdg.configFile."herdr/config.toml".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/herdr/config.toml";
+  xdg.configFile."amp/settings.json".source = config.lib.file.mkOutOfStoreSymlink "${dotfilesNixDir}/files/amp/settings.json";
+  xdg.configFile."herdr/config.toml".source = config.lib.file.mkOutOfStoreSymlink "${dotfilesNixDir}/files/herdr/config.toml";
 }

@@ -1,15 +1,9 @@
 {
-  config,
+  dotfilesNixDir,
   pkgs,
   lib,
-  dotFilesNixHomeManagerInstallationType,
   ...
 }: let
-  targetDirName =
-    if dotFilesNixHomeManagerInstallationType == "standalone"
-    then "home-manager"
-    else "dotfiles-nix";
-  targetDir = "${config.xdg.configHome}/${targetDirName}";
   repoUrl = "https://github.com/kamalmarhubi/dotfiles-nix.git";
   checkGitRepoOriginIfPresent = pkgs.writeShellApplication {
     name = "check-git-repo-origin-if-present";
@@ -19,14 +13,16 @@
         echo "$@" >&2
         exit 1
       }
-      target_dir="${targetDir}"
+      target_dir="${dotfilesNixDir}"
       git_origin="${repoUrl}"
+
+      test ! -L "$target_dir" || die "$target_dir is a symlink; expected the canonical checkout directory"
 
       $VERBOSE_ECHO "Checking if $target_dir exists"
       test ! -e "$target_dir" && $VERBOSE_ECHO "$target_dir does not exist" && exit 0
 
       $VERBOSE_ECHO "Checking if $target_dir is a directory"
-      test -d "$target_dir" -a ! -L "$target_dir" || die "$target_dir exists but is not a directory"
+      test -d "$target_dir" || die "$target_dir exists but is not a directory"
       $VERBOSE_ECHO "$target_dir is a directory"
 
       $VERBOSE_ECHO "Checking if $target_dir is a git repo"
@@ -45,7 +41,7 @@
     name = "clone-git-repo-if-needed";
     runtimeInputs = [pkgs.git];
     text = ''
-      target_dir="${targetDir}"
+      target_dir="${dotfilesNixDir}"
       git_origin="${repoUrl}"
       if [ -e "$target_dir" ]; then
         $VERBOSE_ECHO "$target_dir exists; skipping clone"

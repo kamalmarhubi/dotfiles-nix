@@ -1,5 +1,6 @@
 {
   config,
+  dotfilesNixDir,
   pkgs,
   inputs,
   system,
@@ -16,6 +17,6 @@
       tree-sitter
     ];
   };
-  xdg.configFile."nvim".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/nvim";
-  xdg.configFile."lazyvim".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/lazyvim";
+  xdg.configFile."nvim".source = config.lib.file.mkOutOfStoreSymlink "${dotfilesNixDir}/files/nvim";
+  xdg.configFile."lazyvim".source = config.lib.file.mkOutOfStoreSymlink "${dotfilesNixDir}/files/lazyvim";
 }

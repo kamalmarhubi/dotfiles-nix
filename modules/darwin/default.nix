@@ -41,6 +41,5 @@
   home-manager.users.kamal = import ../home-manager {extraModules = extraHomeModules;};
   home-manager.extraSpecialArgs = {
     inherit inputs system;
-    dotFilesNixHomeManagerInstallationType = "nix-darwin";
   };
 }

@@ -1,5 +1,6 @@
 {
   config,
+  dotfilesNixDir,
   pkgs,
   ...
 }: {
@@ -10,5 +11,5 @@
     enableTransience = true;
   };
 
-  xdg.configFile."starship.toml".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/starship.toml";
+  xdg.configFile."starship.toml".source = config.lib.file.mkOutOfStoreSymlink "${dotfilesNixDir}/files/starship.toml";
 }

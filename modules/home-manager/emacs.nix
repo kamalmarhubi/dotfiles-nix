@@ -1,5 +1,6 @@
 {
   config,
+  dotfilesNixDir,
   pkgs,
   ...
 }: let
@@ -13,5 +14,5 @@ in {
       epkgs.treesit-grammars.with-all-grammars
     ]))
   ];
-  xdg.configFile."emacs".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/emacs";
+  xdg.configFile."emacs".source = config.lib.file.mkOutOfStoreSymlink "${dotfilesNixDir}/files/emacs";
 }

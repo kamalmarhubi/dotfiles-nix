@@ -20,7 +20,7 @@ environment, which is disallowed by default when using flakes.
 
 Finally add an entry to the `homeConfigurations` output so that
 
-    home-manager switch
+    home-manager switch --flake ~/.config/dotfiles-nix
 
 works.
 

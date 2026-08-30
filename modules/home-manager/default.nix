@@ -1,6 +1,9 @@
 {extraModules ? [], ...}: {
   imports =
     [
+      ({config, ...}: {
+        _module.args.dotfilesNixDir = "${config.xdg.configHome}/dotfiles-nix";
+      })
       ../unfree.nix
       ./base.nix
       ./dotfiles-nix.nix

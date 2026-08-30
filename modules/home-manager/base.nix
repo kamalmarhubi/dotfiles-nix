@@ -2,6 +2,7 @@
   pkgs,
   inputs,
   config,
+  dotfilesNixDir,
   ...
 }: {
   home.packages = with pkgs; [
@@ -46,5 +47,5 @@
   xdg.enable = true;
 
   # Kanata config
-  xdg.configFile."kanata/kanata.kbd".source = config.lib.file.mkOutOfStoreSymlink "${config.xdg.configHome}/home-manager/files/kanata/kanata.kbd";
+  xdg.configFile."kanata/kanata.kbd".source = config.lib.file.mkOutOfStoreSymlink "${dotfilesNixDir}/files/kanata/kanata.kbd";
 }
