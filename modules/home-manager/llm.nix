@@ -9,7 +9,6 @@
       unstable.codex
       # zig and e2fsprogs for https://github.com/earendil-works/gondolin
       e2fsprogs
-      unstable.tuicr
       zig
       brewCasks.voiceink
       terminal-notifier # for herdr system notifications
@@ -23,6 +22,7 @@
       mcporter
       opencode
       pi
+      tuicr
     ]);
 
   nixpkgs.allowUnfreePackages = with pkgs.llm-agents; [
