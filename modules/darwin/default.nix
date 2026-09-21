@@ -30,6 +30,10 @@
   environment.etc."sudoers.d/10-timestamp_timeout".text = ''
     Defaults        timestamp_timeout=0
   '';
+  nix.gc = {
+    automatic = true;
+    options = "--delete-older-than 60d";
+  };
   nix.settings.experimental-features = "nix-command flakes";
   environment.shells = [pkgs.fish];
   programs.fish.enable = true;
