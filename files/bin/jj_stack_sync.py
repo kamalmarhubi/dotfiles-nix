@@ -1,17 +1,23 @@
-"""Read-only local observation foundation for ``jj stack sync``.
+"""Read-only observation and state coordination for ``jj stack sync``.
 
 This module intentionally has no command-line entry point and no remote mutation.
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import subprocess
-from collections.abc import Sequence
-from dataclasses import dataclass
-from enum import StrEnum
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from enum import Enum, StrEnum
 from pathlib import Path
+
+
+STATE_REF = "refs/jj-stack/state"
+OPERATION_REF = "refs/jj-stack/operation"
 
 
 class Error(Exception):
@@ -217,6 +223,40 @@ def resolve_remote(local: LocalObservation, explicit: str | None = None) -> str:
 def operation_config(local: LocalObservation) -> tuple[tuple[str, str], ...]:
     """Exclude remote-selection config once the destination has been frozen."""
     return tuple(item for item in local.effective_config if item[0] != "git.push")
+
+
+@dataclass(frozen=True)
+class LastPublishedHead:
+    """Last commit this tool published and verified for one exact branch."""
+
+    pr: PullRequestId
+    ref: RemoteBranchRef
+    verified_commit_id: str
+
+
+@dataclass(frozen=True)
+class TrackedStack:
+    repository: GitHubRepositoryId
+    base_branch: str
+    ordered_prs: tuple[PullRequestId, ...]
+
+
+@dataclass(frozen=True)
+class TrackedState:
+    stacks: tuple[TrackedStack, ...]
+    last_published_heads: tuple[LastPublishedHead, ...]
+
+
+EMPTY_STATE = TrackedState((), ())
+
+
+@dataclass(frozen=True)
+class ToolStateRead:
+    """Decoded tool state bound to the exact local blob ref observations."""
+
+    state_blob_oid: str | None
+    state: TrackedState
+    operation_blob_oid: str | None
 
 
 def _run(
@@ -509,3 +549,209 @@ def observe_local(
         os.fspath(common),
         tuple(sorted(git_remotes)),
     )
+
+
+def state_to_json(state: TrackedState) -> str:
+    _validate_state(state)
+    return json.dumps(asdict(state), sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def parse_state(data: str) -> TrackedState:
+    def record(value: object, context: str) -> dict[str, object]:
+        if not isinstance(value, dict):
+            raise ValueError(f"{context} must be an object")
+        return value
+
+    def fields(
+        value: dict[str, object], expected: set[str], context: str
+    ) -> dict[str, object]:
+        if set(value) != expected:
+            raise ValueError(f"{context} has unexpected fields")
+        return value
+
+    def array(value: object, context: str) -> list[object]:
+        if not isinstance(value, list):
+            raise ValueError(f"{context} must be an array")
+        return value
+
+    def text(value: object, context: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{context} must be a nonempty string")
+        return value
+
+    def repository(value: object, context: str) -> GitHubRepositoryId:
+        raw = fields(record(value, context), {"host", "node_id"}, context)
+        return GitHubRepositoryId(
+            text(raw.get("host"), f"{context}.host"),
+            text(raw.get("node_id"), f"{context}.node_id"),
+        )
+
+    def pull_request(value: object, context: str) -> PullRequestId:
+        raw = fields(record(value, context), {"repository", "node_id"}, context)
+        return PullRequestId(
+            repository(raw.get("repository"), f"{context}.repository"),
+            text(raw.get("node_id"), f"{context}.node_id"),
+        )
+
+    def tracked_stack(value: object, index: int) -> TrackedStack:
+        context = f"stacks[{index}]"
+        raw = fields(
+            record(value, context),
+            {"repository", "base_branch", "ordered_prs"},
+            context,
+        )
+        return TrackedStack(
+            repository(raw.get("repository"), f"{context}.repository"),
+            text(raw.get("base_branch"), f"{context}.base_branch"),
+            tuple(
+                pull_request(pr, f"{context}.ordered_prs[{pr_index}]")
+                for pr_index, pr in enumerate(
+                    array(raw.get("ordered_prs"), f"{context}.ordered_prs")
+                )
+            ),
+        )
+
+    def last_published_head(value: object, index: int) -> LastPublishedHead:
+        context = f"last_published_heads[{index}]"
+        raw = fields(
+            record(value, context),
+            {"pr", "ref", "verified_commit_id"},
+            context,
+        )
+        ref_context = f"{context}.ref"
+        ref = fields(
+            record(raw.get("ref"), ref_context),
+            {"repository", "full_name"},
+            ref_context,
+        )
+        return LastPublishedHead(
+            pull_request(raw.get("pr"), f"{context}.pr"),
+            RemoteBranchRef(
+                repository(ref.get("repository"), f"{ref_context}.repository"),
+                text(ref.get("full_name"), f"{ref_context}.full_name"),
+            ),
+            text(raw.get("verified_commit_id"), f"{context}.verified_commit_id"),
+        )
+
+    try:
+        raw = fields(
+            record(json.loads(data), "root"),
+            {"stacks", "last_published_heads"},
+            "root",
+        )
+        stacks = tuple(
+            tracked_stack(value, index)
+            for index, value in enumerate(array(raw.get("stacks"), "stacks"))
+        )
+        publications = tuple(
+            last_published_head(value, index)
+            for index, value in enumerate(
+                array(raw.get("last_published_heads"), "last_published_heads")
+            )
+        )
+        state = TrackedState(stacks, publications)
+        _validate_state(state)
+        return state
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise Error(f"invalid refs/jj-stack/state payload: {exc}") from exc
+
+
+def _validate_state(state: TrackedState) -> None:
+    def require_text(*values: object) -> None:
+        if any(not isinstance(value, str) or not value for value in values):
+            raise ValueError("state identity fields must be nonempty strings")
+
+    publication_keys: set[tuple[GitHubRepositoryId, PullRequestId, str]] = set()
+    memberships: set[tuple[GitHubRepositoryId, PullRequestId]] = set()
+    for stack in state.stacks:
+        require_text(
+            stack.base_branch,
+            stack.repository.host,
+            stack.repository.node_id,
+        )
+        if not stack.ordered_prs:
+            raise ValueError("invalid tracked stack")
+        for pr in stack.ordered_prs:
+            require_text(pr.repository.host, pr.repository.node_id, pr.node_id)
+            if pr.repository != stack.repository:
+                raise ValueError("stack contains a PR from another repository")
+            membership = (stack.repository, pr)
+            if membership in memberships:
+                raise ValueError("overlapping tracked stack membership")
+            memberships.add(membership)
+    for publication in state.last_published_heads:
+        require_text(
+            publication.pr.repository.host,
+            publication.pr.repository.node_id,
+            publication.pr.node_id,
+            publication.ref.repository.host,
+            publication.ref.repository.node_id,
+            publication.ref.full_name,
+            publication.verified_commit_id,
+        )
+        if (
+            publication.pr.repository != publication.ref.repository
+            or not publication.ref.full_name.startswith("refs/heads/")
+        ):
+            raise ValueError("invalid last-published head")
+        key = (publication.ref.repository, publication.pr, publication.ref.full_name)
+        if key in publication_keys:
+            raise ValueError("ambiguous last-published head")
+        publication_keys.add(key)
+
+
+def read_state(workspace: str | Path) -> tuple[str | None, TrackedState]:
+    observed_oid = read_ref_oid(workspace, STATE_REF)
+    if observed_oid is None:
+        return None, EMPTY_STATE
+    common = git_common_dir(workspace)
+    payload = _run(["git", f"--git-dir={common}", "cat-file", "blob", observed_oid])
+    return observed_oid, parse_state(payload)
+
+
+def observe_tool_state(workspace: str | Path) -> ToolStateRead:
+    state_oid, state = read_state(workspace)
+    return ToolStateRead(
+        state_oid,
+        state,
+        read_ref_oid(workspace, OPERATION_REF),
+    )
+
+
+def cas_write_state(
+    workspace: str | Path, expected_oid: str | None, state: TrackedState
+) -> str:
+    common = git_common_dir(workspace)
+    new_oid = _run(
+        ["git", f"--git-dir={common}", "hash-object", "-w", "--stdin"],
+        stdin=state_to_json(state),
+    ).strip()
+    expected = expected_oid or ("0" * len(new_oid))
+    result = subprocess.run(
+        ["git", f"--git-dir={common}", "update-ref", STATE_REF, new_oid, expected],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        if read_ref_oid(workspace, STATE_REF) != expected_oid:
+            raise ConcurrentUpdate("state ref changed during compare-and-swap")
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise Error("could not update state ref" + (f": {detail}" if detail else ""))
+    return new_oid
+
+
+@contextmanager
+def repository_lock(workspace: str | Path) -> Iterator[None]:
+    path = git_common_dir(workspace) / "jj-stack.lock"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise LockBusy(
+                "another jj-stack process holds the repository lock"
+            ) from exc
+        yield
+    finally:
+        os.close(descriptor)

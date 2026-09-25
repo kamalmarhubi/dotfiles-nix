@@ -4,6 +4,8 @@
 # ///
 from __future__ import annotations
 
+import dataclasses
+import json
 import os
 import subprocess
 import sys
@@ -172,8 +174,11 @@ def test_observation_and_state_work_with_non_colocated_bare_store(
     jj(repo, "bookmark", "create", "topic", "-r", "@")
 
     observed = sync.observe_local(repo, revision="topic", config_keys=("git.push",))
+    state_oid = sync.cas_write_state(repo, None, sync.EMPTY_STATE)
+
     assert Path(observed.git_common_dir).is_dir()
     assert not (repo / ".git").exists()
+    assert sync.read_state(repo) == (state_oid, sync.EMPTY_STATE)
 
 
 def test_real_jj_observation_distinguishes_bookmark_and_tracking_sources(
@@ -274,6 +279,144 @@ def test_real_jj_observation_parses_conflicted_local_bookmark(jj_repo: Path) -> 
     assert isinstance(topic.target, sync.BookmarkConflict)
     assert topic.target.removed_commit_ids == (original,)
     assert set(topic.target.added_commit_ids) == {second, third}
+
+
+def test_private_state_cas_and_operation_fence_work_from_linked_workspace(
+    jj_repo: Path, tmp_path: Path
+) -> None:
+    workspace = tmp_path / "second"
+    jj(jj_repo, "workspace", "add", workspace, "--name", "second")
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    pr = sync.PullRequestId(repository, "PR_node")
+    ref = sync.RemoteBranchRef(repository, "refs/heads/topic")
+    state = sync.TrackedState(
+        (sync.TrackedStack(repository, "main", (pr,)),),
+        (sync.LastPublishedHead(pr, ref, "a" * 40),),
+    )
+    serialized_stack = json.loads(sync.state_to_json(state))["stacks"][0]
+    assert set(serialized_stack) == {"repository", "base_branch", "ordered_prs"}
+    assert serialized_stack["base_branch"] == "main"
+
+    first_oid = sync.cas_write_state(workspace, None, state)
+    observed_ref, observed_state = sync.read_state(jj_repo)
+
+    assert observed_ref == first_oid
+    assert observed_state == state
+    assert sync.git_common_dir(workspace) == sync.git_common_dir(jj_repo)
+
+    second_oid = sync.cas_write_state(jj_repo, first_oid, sync.EMPTY_STATE)
+    with pytest.raises(sync.ConcurrentUpdate):
+        sync.cas_write_state(jj_repo, first_oid, state)
+    assert sync.read_state(jj_repo) == (second_oid, sync.EMPTY_STATE)
+
+    common = sync.git_common_dir(jj_repo)
+    operation_blob = run(
+        "git", f"--git-dir={common}", "hash-object", "-w", "--stdin", cwd=jj_repo
+    )
+    # hash-object above hashes empty stdin; only presence matters at this stage.
+    run("git", f"--git-dir={common}", "update-ref", sync.OPERATION_REF, operation_blob)
+    tool_state = sync.observe_tool_state(jj_repo)
+    assert tool_state.operation_blob_oid == operation_blob
+    assert tool_state.state_blob_oid == second_oid
+    assert tool_state.state == sync.EMPTY_STATE
+
+
+def test_state_cas_distinguishes_storage_failure_from_stale_ref(
+    jj_repo: Path, monkeypatch
+) -> None:
+    original_run = subprocess.run
+
+    def fail_update_ref(args, **kwargs):
+        if "update-ref" in args:
+            return subprocess.CompletedProcess(
+                args, 128, stdout="", stderr="cannot lock ref: permission denied"
+            )
+        return original_run(args, **kwargs)
+
+    monkeypatch.setattr(sync.subprocess, "run", fail_update_ref)
+
+    with pytest.raises(
+        sync.Error, match="could not update state ref.*permission denied"
+    ):
+        sync.cas_write_state(jj_repo, None, sync.EMPTY_STATE)
+
+
+def test_repository_lock_is_shared_by_workspaces(jj_repo: Path, tmp_path: Path) -> None:
+    workspace = tmp_path / "second"
+    jj(jj_repo, "workspace", "add", workspace, "--name", "second")
+    with sync.repository_lock(jj_repo):
+        with pytest.raises(sync.LockBusy):
+            with sync.repository_lock(workspace):
+                pytest.fail("second workspace acquired the shared-store lock")
+        lock_path = sync.git_common_dir(workspace) / "jj-stack.lock"
+        child = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import fcntl, os, sys; "
+                    "fd=os.open(sys.argv[1], os.O_RDWR); "
+                    "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)"
+                ),
+                os.fspath(lock_path),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert child.returncode != 0
+    with sync.repository_lock(workspace):
+        pass
+
+
+def test_state_round_trip_uses_unversioned_shape() -> None:
+    payload = sync.state_to_json(sync.EMPTY_STATE)
+    assert json.loads(payload) == {"last_published_heads": [], "stacks": []}
+    assert sync.parse_state(payload) == sync.EMPTY_STATE
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
+        "[]",
+        '{"schema_version":true,"stacks":[],"last_published_heads":[]}',
+        '{"schema_version":1.0,"stacks":[],"last_published_heads":[]}',
+        '{"stacks":"","last_published_heads":[]}',
+        '{"stacks":[],"last_published_heads":""}',
+        (
+            '{"stacks":[{"repository":{"host":"github.com","node_id":"R"},'
+            '"base_branch":"main","ordered_prs":""}],'
+            '"last_published_heads":[]}'
+        ),
+        (
+            '{"stacks":[],"last_published_heads":[{"pr":{"repository":'
+            '{"host":"github.com","node_id":"R"},"node_id":"PR"},"ref":'
+            '{"repository":{"host":"github.com","node_id":"R"},"full_name":7},'
+            '"verified_commit_id":"abc"}]}'
+        ),
+    ),
+)
+def test_parse_state_rejects_malformed_shapes(payload: str) -> None:
+    with pytest.raises(sync.Error, match="invalid refs/jj-stack/state payload"):
+        sync.parse_state(payload)
+
+
+def test_state_rejects_malformed_scalars_and_duplicate_publication_authority() -> None:
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    pr = sync.PullRequestId(repository, "PR_node")
+    publication = sync.LastPublishedHead(
+        pr, sync.RemoteBranchRef(repository, "refs/heads/topic"), "a" * 40
+    )
+    duplicate = sync.TrackedState((), (publication, publication))
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        sync.state_to_json(duplicate)
+    with pytest.raises(sync.Error, match="invalid .*state"):
+        sync.parse_state(json.dumps(dataclasses.asdict(duplicate)))
+
+    malformed = dataclasses.replace(publication, verified_commit_id=7)
+    with pytest.raises(ValueError, match="nonempty strings"):
+        sync.state_to_json(sync.TrackedState((), (malformed,)))
 
 
 def test_membership_variants_reject_contradictory_server_stack_results() -> None:
