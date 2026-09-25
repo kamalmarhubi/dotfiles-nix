@@ -8,16 +8,16 @@
 }:
 rustPlatform.buildRustPackage rec {
   pname = "jj-hunk";
-  version = "0.4.1";
+  version = "0.5.1";
 
   src = fetchFromGitHub {
     owner = "laulauland";
     repo = "jj-hunk";
     rev = "v${version}";
-    hash = "sha256-lFuYTg6TW/Lsz4wwaaWFi37F2aGKpLwQgq40VTdDUKE=";
+    hash = "sha256-Pe0rLEUMXmq+8eUMmjuu5KvFJ/aN53bTQ6/1rE2YcT0=";
   };
 
-  cargoHash = "sha256-7yCA4a2NM20o7z757lbMtyvFC+72ScTd+N7AKWCH1KU=";
+  cargoHash = "sha256-tO4oGY92AieYb1SY3ylWSkOlcIKadbZLKOY6nTzXo48=";
 
   nativeCheckInputs = [
     git
