@@ -42,8 +42,9 @@ def test_create_session_rejects_hash_mismatch_and_root_reuse(tmp_path):
             github_repo="owner/repo",
         )
     )
-    assert (root / "jj-stack-source").read_bytes() == source.read_bytes()
-    assert json.loads((root / "session.json").read_text())["source_sha256"] == digest
+    metadata = json.loads((root / "session.json").read_text())
+    assert (root / metadata["retained_source"]).read_bytes() == source.read_bytes()
+    assert metadata["source_sha256"] == digest
 
     with pytest.raises(SystemExit, match="refusing to reuse"):
         create_session(

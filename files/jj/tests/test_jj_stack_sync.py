@@ -101,12 +101,33 @@ def test_remote_resolution_fails_closed_without_falling_through(
         sync.resolve_remote(local, explicit)
 
 
+def test_push_url_resolution_rejects_multiple_destinations(monkeypatch) -> None:
+    def multiple_push_urls(command: list[str]) -> str:
+        assert command == [
+            "git",
+            "--git-dir=/git",
+            "remote",
+            "get-url",
+            "--push",
+            "--all",
+            "origin",
+        ]
+        return "ssh://github.com/owner/one.git\nssh://github.com/owner/two.git\n"
+
+    monkeypatch.setattr(sync, "_run", multiple_push_urls)
+
+    with pytest.raises(sync.SourceMismatch, match="one unambiguous push URL"):
+        sync.resolve_push_url(local_with_remotes(("origin",)), "origin")
+
+
 def test_json_lines_preserves_unicode_line_and_paragraph_separators() -> None:
     records = (
         {"description": "before\u2028middle\u2029after"},
         {"description": "next"},
     )
-    output = "\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n"
+    output = (
+        "\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n"
+    )
 
     assert sync._json_lines(output, "jj log") == records
 
@@ -454,6 +475,198 @@ def test_remote_branch_ref_requires_heads_namespace() -> None:
         sync.RemoteBranchRef(repository, "refs/heads/")
 
 
+def pr_source_record(**changes: object) -> dict[str, object]:
+    record: dict[str, object] = {
+        "id": "PR_node",
+        "number": 7,
+        "state": "OPEN",
+        "isDraft": False,
+        "headRepository": {"id": "R_repo"},
+        "headRefName": "topic",
+        "headRefOid": "1" * 40,
+        "baseRefName": "main",
+        "baseRefOid": "0" * 40,
+        "autoMergeRequest": None,
+        "mergeQueueEntry": None,
+        "title": "Title",
+        "body": None,
+        "stack": None,
+    }
+    record.update(changes)
+    return record
+
+
+def test_github_source_parsing_distinguishes_confirmed_null_and_stack_membership() -> (
+    None
+):
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+
+    standalone = sync._parse_pr_source(pr_source_record(), repository, 7)
+    stacked = sync._parse_pr_source(
+        pr_source_record(stack={"id": "STACK_node", "baseRefName": "main"}),
+        repository,
+        7,
+    )
+
+    assert standalone.stack_id is None
+    assert standalone.stack_base_branch is None
+    assert standalone.pr.body == ""
+    assert stacked.stack_id == "STACK_node"
+    assert stacked.stack_base_branch == "main"
+
+
+@pytest.mark.parametrize(
+    ("changes", "error"),
+    (
+        ({"headRepository": None}, sync.IncompleteSource),
+        ({"number": 8}, sync.SourceMismatch),
+        ({"isDraft": 0}, sync.MalformedSource),
+        ({"state": "UNKNOWN"}, sync.MalformedSource),
+        ({"stack": {"id": "STACK_node"}}, sync.MalformedSource),
+    ),
+)
+def test_github_source_rejects_incomplete_mismatched_and_malformed_records(
+    changes: dict[str, object], error: type[Exception]
+) -> None:
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    with pytest.raises(error):
+        sync._parse_pr_source(pr_source_record(**changes), repository, 7)
+
+
+def test_github_json_transport_preserves_exact_strings_and_separates_status() -> None:
+    title = "control:\u2028 paragraph:\u2029 replacement:\ufffd"
+    body = json.dumps({"title": title}, ensure_ascii=False).encode()
+
+    assert sync._github_json_response(
+        sync.GitHubResponse(200, (("X-Test", "yes"),), body), "test"
+    ) == {"title": title}
+    with pytest.raises(sync.SourceUnavailable, match="HTTP 422"):
+        sync._github_json_response(sync.GitHubResponse(422, (), body), "test")
+    with pytest.raises(sync.MalformedSource, match="invalid JSON"):
+        sync._github_json_response(sync.GitHubResponse(200, (), b"{"), "test")
+
+
+def test_github_token_is_secret_safe_and_noninteractive(monkeypatch) -> None:
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured.update(args=args, kwargs=kwargs)
+        return subprocess.CompletedProcess(args, 0, "secret-token\n", "")
+
+    monkeypatch.setenv("GH_DEBUG", "api")
+    monkeypatch.setenv("DEBUG", "1")
+    monkeypatch.setattr(sync.subprocess, "run", fake_run)
+
+    assert sync._github_token("github.com") == "secret-token"
+    assert captured["args"] == ["gh", "auth", "token", "--hostname", "github.com"]
+    assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert captured["kwargs"]["env"]["GH_PROMPT_DISABLED"] == "1"
+    assert "GH_DEBUG" not in captured["kwargs"]["env"]
+    assert "DEBUG" not in captured["kwargs"]["env"]
+    assert "secret-token" not in captured["args"]
+
+
+def test_github_routing_accepts_canonical_ssh_aliases_only(monkeypatch) -> None:
+    def fake_run(args, **_kwargs):
+        host = args[-1]
+        output = {
+            "work-github": "hostname github.com\nport 22\n",
+            "github-443": "hostname ssh.github.com\nport 443\n",
+            "enterprise": "hostname github.example.com\nport 22\n",
+        }[host]
+        return subprocess.CompletedProcess(args, 0, output, "")
+
+    monkeypatch.setattr(sync.subprocess, "run", fake_run)
+
+    assert sync._github_repository_locator("git@work-github:owner/repo.git") == (
+        "github.com",
+        "owner/repo",
+    )
+    assert sync._github_repository_locator("ssh://git@github-443/owner/repo.git") == (
+        "github.com",
+        "owner/repo",
+    )
+    with pytest.raises(sync.SourceUnavailable, match="canonical GitHub.com"):
+        sync._github_repository_locator("git@enterprise:owner/repo.git")
+    with pytest.raises(sync.SourceUnavailable, match="unsupported GitHub host"):
+        sync._github_repository_locator("https://github.example.com/owner/repo.git")
+
+
+def test_github_transport_rejects_errors_partial_data_and_repository_mismatch(
+    monkeypatch,
+) -> None:
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+
+    monkeypatch.setattr(
+        sync, "_github_graphql", lambda *_args, **_kwargs: {"errors": []}
+    )
+    with pytest.raises(sync.MalformedSource):
+        sync.observe_github_pull_request(repository, 7)
+
+    monkeypatch.setattr(
+        sync,
+        "_github_graphql",
+        lambda *_args, **_kwargs: {
+            "data": {"repository": {"id": "R_other", "pullRequest": pr_source_record()}}
+        },
+    )
+    with pytest.raises(sync.SourceMismatch):
+        sync.observe_github_pull_request(repository, 7)
+
+    monkeypatch.setattr(
+        sync,
+        "_github_graphql",
+        lambda *_args, **_kwargs: {"data": {"repository": None}},
+    )
+    with pytest.raises(sync.IncompleteSource):
+        sync.observe_github_pull_request(repository, 7)
+
+
+def test_live_ref_observation_uses_destination_and_preserves_confirmed_absence(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    source = tmp_path / "source"
+    run("git", "init", "--bare", remote)
+    run("git", "init", source)
+    run("git", "-C", source, "config", "user.name", "Test")
+    run("git", "-C", source, "config", "user.email", "test@example.com")
+    (source / "file").write_text("content\n")
+    run("git", "-C", source, "add", "file")
+    run("git", "-C", source, "commit", "-m", "base")
+    oid = run("git", "-C", source, "rev-parse", "HEAD")
+    run("git", "-C", source, "push", os.fspath(remote), "HEAD:refs/heads/main")
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+
+    refs = sync.observe_live_refs(
+        os.fspath(remote),
+        repository,
+        ("refs/heads/main", "refs/heads/missing"),
+    )
+
+    assert refs == (
+        sync.LiveRemoteRef(sync.RemoteBranchRef(repository, "refs/heads/main"), oid),
+        sync.LiveRemoteRef(
+            sync.RemoteBranchRef(repository, "refs/heads/missing"), None
+        ),
+    )
+
+
 def test_observation_record_parsers_reject_wrong_types_and_contradictions() -> None:
     bookmark = {
         "name": "topic",
@@ -530,6 +743,7 @@ def snapshot(*, desired: str, live: str, parent: str, operation: str | None = No
     observed = sync.Snapshot(
         repository,
         "ssh://git@github.com/o/r.git",
+        "origin",
         local,
         sync.ToolStateRead(None, sync.EMPTY_STATE, operation),
         (pr,),

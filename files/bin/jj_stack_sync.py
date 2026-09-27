@@ -6,15 +6,20 @@ This module intentionally has no command-line entry point and no remote mutation
 from __future__ import annotations
 
 import fcntl
+import http.client
 import json
 import os
 import re
 import subprocess
+import time
+import urllib.error
+import urllib.request
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from enum import Enum, StrEnum
+from enum import StrEnum
 from pathlib import Path
+from urllib.parse import urlparse
 
 from markdown_it import MarkdownIt
 from markdown_it.rules_inline.newline import newline as _parse_newline
@@ -23,6 +28,10 @@ from markdown_it.rules_inline.state_inline import StateInline
 
 STATE_REF = "refs/jj-stack/state"
 OPERATION_REF = "refs/jj-stack/operation"
+GITHUB_API_VERSION = "2026-03-10"
+GITHUB_CONNECT_TIMEOUT = 10.0
+GITHUB_READ_TIMEOUT = 30.0
+GITHUB_OVERALL_TIMEOUT = 45.0
 
 
 class Error(Exception):
@@ -41,12 +50,66 @@ class RemoteResolutionError(Error):
     pass
 
 
+class SourceUnavailable(Error):
+    pass
+
+
+class MalformedSource(Error):
+    pass
+
+
+class IncompleteSource(Error):
+    pass
+
+
+class SourceMismatch(Error):
+    pass
+
+
+class GitHubTransportFailure(Error):
+    """A request whose complete HTTP response is not known."""
+
+    def __init__(
+        self,
+        category: str,
+        *,
+        status: int | None = None,
+        headers: tuple[tuple[str, str], ...] = (),
+        body: bytes = b"",
+    ) -> None:
+        super().__init__(f"GitHub transport failed ({category})")
+        self.category = category
+        self.status = status
+        self.headers = headers
+        self.body = body
+
+
+@dataclass(frozen=True)
+class GitHubResponse:
+    status: int
+    headers: tuple[tuple[str, str], ...]
+    body: bytes
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        return None
+
+
 @dataclass(frozen=True)
 class GitHubRepositoryId:
     """GitHub host plus the repository's immutable GraphQL node ID."""
 
     host: str
     node_id: str
+
+
+@dataclass(frozen=True)
+class GitHubRepository:
+    identity: GitHubRepositoryId
+    name_with_owner: str
+    url: str
+    default_branch: str
 
 
 @dataclass(frozen=True)
@@ -166,6 +229,15 @@ class GitHubPullRequest:
 
 
 @dataclass(frozen=True)
+class GitHubPullRequestSource:
+    """One strictly validated PR projection plus its nullable stack fields."""
+
+    pr: GitHubPullRequest
+    stack_id: str | None
+    stack_base_branch: str | None
+
+
+@dataclass(frozen=True)
 class StandalonePullRequest:
     pr: PullRequestId
 
@@ -270,6 +342,7 @@ class Snapshot:
 
     repository: GitHubRepositoryId
     push_url: str
+    remote: str
     local: LocalObservation
     tool_state: ToolStateRead
     pull_requests: tuple[GitHubPullRequest, ...]
@@ -372,6 +445,402 @@ def _run(
         detail = result.stderr.strip() or result.stdout.strip()
         raise Error(f"`{' '.join(args)}` failed" + (f": {detail}" if detail else ""))
     return result.stdout
+
+
+def _github_token(host: str, *, cwd: str | Path | None = None) -> str:
+    if not host or any(character.isspace() for character in host):
+        raise ValueError("GitHub host must be nonempty and contain no whitespace")
+    environment = os.environ.copy()
+    environment["GH_PROMPT_DISABLED"] = "1"
+    environment.pop("GH_DEBUG", None)
+    environment.pop("DEBUG", None)
+    result = subprocess.run(
+        ["gh", "auth", "token", "--hostname", host],
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=GITHUB_CONNECT_TIMEOUT,
+        env=environment,
+    )
+    if result.returncode:
+        raise SourceUnavailable(f"GitHub authentication failed for {host}")
+    lines = result.stdout.splitlines()
+    if len(lines) != 1 or not lines[0]:
+        raise SourceUnavailable(f"GitHub authentication returned no token for {host}")
+    return lines[0]
+
+
+def _github_api_origin(host: str) -> str:
+    host = host.lower()
+    if host != "github.com":
+        raise SourceUnavailable(f"unsupported GitHub host: {host}")
+    return "https://api.github.com"
+
+
+def _github_graphql_url(host: str) -> str:
+    return f"{_github_api_origin(host)}/graphql"
+
+
+def _ssh_github_host(alias: str, *, cwd: str | Path | None = None) -> str:
+    result = subprocess.run(
+        ["ssh", "-G", alias],
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=GITHUB_CONNECT_TIMEOUT,
+    )
+    if result.returncode:
+        raise SourceUnavailable("could not resolve GitHub SSH host")
+    values: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        key, separator, value = line.partition(" ")
+        if separator and key in {"hostname", "port"} and key not in values:
+            values[key] = value.strip().lower()
+    hostname = values.get("hostname")
+    port = values.get("port", "22")
+    if hostname == "github.com" and port == "22":
+        return "github.com"
+    if hostname == "ssh.github.com" and port == "443":
+        return "github.com"
+    raise SourceUnavailable("SSH remote does not resolve to canonical GitHub.com")
+
+
+def _github_repository_locator(
+    push_url: str, *, cwd: str | Path | None = None
+) -> tuple[str, str]:
+    parsed = urlparse(push_url)
+    if parsed.scheme in {"http", "https"} and parsed.hostname is not None:
+        host = parsed.hostname.lower()
+        path = parsed.path
+        if host != "github.com":
+            raise SourceUnavailable(f"unsupported GitHub host: {host}")
+    elif parsed.scheme == "ssh" and parsed.hostname is not None:
+        host = _ssh_github_host(parsed.hostname, cwd=cwd)
+        path = parsed.path
+    else:
+        match = re.fullmatch(r"(?:[^@]+@)?([^:]+):(.+)", push_url)
+        if match is None:
+            raise MalformedSource("GitHub remote URL has no host")
+        host = _ssh_github_host(match.group(1), cwd=cwd)
+        path = match.group(2)
+    name_with_owner = path.removeprefix("/").removesuffix(".git")
+    owner, separator, name = name_with_owner.partition("/")
+    if not separator or not owner or not name or "/" in name:
+        raise MalformedSource("GitHub remote URL has no owner/name repository")
+    return host, name_with_owner
+
+
+def _response_headers(response: object) -> tuple[tuple[str, str], ...]:
+    headers = getattr(response, "headers", None)
+    return tuple(headers.items()) if headers is not None else ()
+
+
+def _read_github_response(response: object, status: int) -> GitHubResponse:
+    headers = _response_headers(response)
+    try:
+        body = response.read()  # type: ignore[attr-defined]
+    except http.client.IncompleteRead as exc:
+        raise GitHubTransportFailure(
+            "truncated-body", status=status, headers=headers, body=exc.partial
+        ) from exc
+    except (OSError, TimeoutError, socket.timeout) as exc:
+        raise GitHubTransportFailure("read", status=status, headers=headers) from exc
+    lengths = tuple(
+        int(value)
+        for name, value in headers
+        if name.lower() == "content-length" and value.isdecimal()
+    )
+    if lengths and (len(set(lengths)) != 1 or len(body) != lengths[0]):
+        raise GitHubTransportFailure(
+            "truncated-body", status=status, headers=headers, body=body
+        )
+    return GitHubResponse(status, headers, body)
+
+
+def github_http_request(
+    host: str,
+    method: str,
+    path: str,
+    *,
+    body: bytes | None = None,
+    cwd: str | Path | None = None,
+) -> GitHubResponse:
+    """Send one non-retrying request and preserve its complete response bytes."""
+    if not path.startswith("/"):
+        raise ValueError("GitHub API path must be absolute")
+    token = _github_token(host, cwd=cwd)
+    request = urllib.request.Request(
+        f"{_github_api_origin(host)}{path}",
+        data=body,
+        method=method,
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "jj-stack",
+            "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        },
+    )
+    context = ssl.create_default_context()
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler(),
+        urllib.request.HTTPSHandler(context=context),
+        _NoRedirects(),
+    )
+    started = time.monotonic()
+    try:
+        response = opener.open(
+            request, timeout=min(GITHUB_CONNECT_TIMEOUT, GITHUB_READ_TIMEOUT)
+        )
+    except urllib.error.HTTPError as exc:
+        result = _read_github_response(exc, exc.code)
+    except (urllib.error.URLError, OSError, TimeoutError, socket.timeout) as exc:
+        category = (
+            "timeout"
+            if isinstance(getattr(exc, "reason", exc), TimeoutError)
+            else "connect"
+        )
+        raise GitHubTransportFailure(category) from exc
+    else:
+        with response:
+            result = _read_github_response(response, response.status)
+    if time.monotonic() - started > GITHUB_OVERALL_TIMEOUT:
+        raise GitHubTransportFailure(
+            "overall-timeout",
+            status=result.status,
+            headers=result.headers,
+            body=result.body,
+        )
+    return result
+
+
+def _github_json_response(response: GitHubResponse, context: str) -> object:
+    if not 200 <= response.status < 300:
+        raise SourceUnavailable(f"{context} returned HTTP {response.status}")
+    try:
+        return json.loads(response.body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise MalformedSource(f"{context} returned invalid JSON") from exc
+
+
+def _github_graphql(
+    host: str,
+    query: str,
+    variables: dict[str, object],
+    *,
+    cwd: str | Path | None = None,
+) -> object:
+    payload = json.dumps(
+        {"query": query, "variables": variables},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
+    response = github_http_request(
+        host, "POST", urlparse(_github_graphql_url(host)).path, body=payload, cwd=cwd
+    )
+    value = _github_json_response(response, "GitHub GraphQL response")
+    if not isinstance(value, dict) or "errors" in value:
+        raise MalformedSource("GitHub GraphQL response contains errors or is malformed")
+    return value
+
+
+def _exact_record(value: object, fields: set[str], context: str) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != fields:
+        raise MalformedSource(f"{context} has an unexpected shape")
+    return value
+
+
+def _text(value: object, context: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise MalformedSource(f"{context} must be a nonempty string")
+    return value
+
+
+def observe_github_repository(
+    push_url: str, *, cwd: str | Path | None = None
+) -> GitHubRepository:
+    host, name_with_owner = _github_repository_locator(push_url, cwd=cwd)
+    owner, separator, name = name_with_owner.partition("/")
+    assert separator and owner and name
+    raw = _exact_record(
+        _github_graphql(
+            host,
+            """
+            query($owner: String!, $name: String!) {
+              repository(owner: $owner, name: $name) {
+                id nameWithOwner url defaultBranchRef { name }
+              }
+            }
+            """,
+            {"owner": owner, "name": name},
+            cwd=cwd,
+        ),
+        {"data"},
+        "GitHub repository GraphQL response",
+    )
+    data = _exact_record(raw["data"], {"repository"}, "repository GraphQL data")
+    if data["repository"] is None:
+        raise IncompleteSource("GitHub repository is unavailable")
+    raw = _exact_record(
+        data["repository"],
+        {"id", "nameWithOwner", "url", "defaultBranchRef"},
+        "GitHub repository response",
+    )
+    default = raw["defaultBranchRef"]
+    if default is None:
+        raise IncompleteSource("GitHub repository has no default branch")
+    default_record = _exact_record(default, {"name"}, "default branch")
+    url = _text(raw["url"], "repository URL")
+    response_host = urlparse(url).hostname
+    if response_host is None:
+        raise MalformedSource("repository URL has no host")
+    if response_host.lower() != host or raw["nameWithOwner"] != name_with_owner:
+        raise SourceMismatch("GitHub returned a different repository locator")
+    return GitHubRepository(
+        GitHubRepositoryId(host, _text(raw["id"], "repository ID")),
+        _text(raw["nameWithOwner"], "repository name"),
+        url,
+        _text(default_record["name"], "default branch name"),
+    )
+
+
+_PR_SOURCE_FIELDS = {
+    "id",
+    "number",
+    "state",
+    "isDraft",
+    "headRepository",
+    "headRefName",
+    "headRefOid",
+    "baseRefName",
+    "baseRefOid",
+    "autoMergeRequest",
+    "mergeQueueEntry",
+    "title",
+    "body",
+    "stack",
+}
+
+_PR_SOURCE_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    id
+    pullRequest(number: $number) {
+      id number state isDraft
+      headRepository { id }
+      headRefName headRefOid baseRefName baseRefOid
+      autoMergeRequest { enabledAt }
+      mergeQueueEntry { id }
+      title body
+      stack { id baseRefName }
+    }
+  }
+}
+"""
+
+
+def _parse_pr_source(
+    value: object, repository: GitHubRepository, expected_number: int
+) -> GitHubPullRequestSource:
+    raw = _exact_record(value, _PR_SOURCE_FIELDS, "pull request")
+    number = raw["number"]
+    if type(number) is not int or number <= 0 or number != expected_number:
+        raise SourceMismatch("GitHub returned a different pull request number")
+    try:
+        state = PullRequestState(_text(raw["state"], "pull request state"))
+    except ValueError as exc:
+        raise MalformedSource("pull request state is unsupported") from exc
+    draft = raw["isDraft"]
+    if type(draft) is not bool:
+        raise MalformedSource("pull request draft state must be boolean")
+    head_repository = raw["headRepository"]
+    if head_repository is None:
+        raise IncompleteSource("pull request head repository is unavailable")
+    head_repository_record = _exact_record(
+        head_repository, {"id"}, "pull request head repository"
+    )
+    auto_merge = raw["autoMergeRequest"]
+    if auto_merge is not None:
+        _exact_record(auto_merge, {"enabledAt"}, "auto-merge request")
+    merge_queue = raw["mergeQueueEntry"]
+    if merge_queue is not None:
+        _exact_record(merge_queue, {"id"}, "merge queue entry")
+    body = raw["body"]
+    if body is None:
+        body = ""
+    elif not isinstance(body, str):
+        raise MalformedSource("pull request body must be text or null")
+    stack = raw["stack"]
+    stack_id = None
+    stack_base = None
+    if stack is not None:
+        stack_record = _exact_record(stack, {"id", "baseRefName"}, "pull request stack")
+        stack_id = _text(stack_record["id"], "stack ID")
+        stack_base = _text(stack_record["baseRefName"], "stack base branch")
+    identity = PullRequestId(repository.identity, _text(raw["id"], "pull request ID"))
+    return GitHubPullRequestSource(
+        GitHubPullRequest(
+            identity,
+            number,
+            state,
+            draft,
+            GitHubRepositoryId(
+                repository.identity.host,
+                _text(head_repository_record["id"], "head repository ID"),
+            ),
+            _text(raw["headRefName"], "head branch"),
+            _text(raw["headRefOid"], "reported head commit"),
+            _text(raw["baseRefName"], "base branch"),
+            _text(raw["baseRefOid"], "reported base commit"),
+            auto_merge is not None,
+            merge_queue is not None,
+            _text(raw["title"], "pull request title"),
+            body,
+        ),
+        stack_id,
+        stack_base,
+    )
+
+
+def observe_github_pull_request(
+    repository: GitHubRepository,
+    number: int,
+    *,
+    cwd: str | Path | None = None,
+) -> GitHubPullRequestSource:
+    owner, separator, name = repository.name_with_owner.partition("/")
+    if not separator or not owner or not name or "/" in name:
+        raise ValueError("repository name must have owner/name form")
+    response = _exact_record(
+        _github_graphql(
+            repository.identity.host,
+            _PR_SOURCE_QUERY,
+            {"owner": owner, "name": name, "number": number},
+            cwd=cwd,
+        ),
+        {"data"},
+        "GitHub GraphQL response",
+    )
+    data = _exact_record(response["data"], {"repository"}, "GraphQL data")
+    raw_repository = data["repository"]
+    if raw_repository is None:
+        raise IncompleteSource("GitHub repository is unavailable")
+    repository_record = _exact_record(
+        raw_repository, {"id", "pullRequest"}, "GraphQL repository"
+    )
+    if (
+        _text(repository_record["id"], "GraphQL repository ID")
+        != repository.identity.node_id
+    ):
+        raise SourceMismatch("push destination and GraphQL repository differ")
+    pull_request = repository_record["pullRequest"]
+    if pull_request is None:
+        raise IncompleteSource(f"pull request #{number} is unavailable")
+    return _parse_pr_source(pull_request, repository, number)
 
 
 def _jj(workspace: str | Path, operation: str | None, *args: str) -> str:
@@ -651,6 +1120,96 @@ def observe_local(
         commits,
         os.fspath(common),
         tuple(sorted(git_remotes)),
+    )
+
+
+def resolve_push_url(local: LocalObservation, remote: str) -> str:
+    if not remote:
+        raise ValueError("push remote must be nonempty")
+    urls = _run(
+        [
+            "git",
+            f"--git-dir={local.git_common_dir}",
+            "remote",
+            "get-url",
+            "--push",
+            "--all",
+            remote,
+        ]
+    ).splitlines()
+    if len(urls) != 1 or not urls[0]:
+        raise SourceMismatch("selected remote does not have one unambiguous push URL")
+    return urls[0]
+
+
+def observe_live_refs(
+    push_url: str,
+    repository: GitHubRepositoryId,
+    full_names: Sequence[str],
+    *,
+    cwd: str | Path | None = None,
+) -> tuple[LiveRemoteRef, ...]:
+    if len(set(full_names)) != len(full_names):
+        raise ValueError("requested live refs must be unique")
+    refs = tuple(RemoteBranchRef(repository, name) for name in full_names)
+    result = subprocess.run(
+        ["git", "ls-remote", "--heads", push_url, *full_names],
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise SourceUnavailable(
+            "could not read authoritative destination refs"
+            + (f": {detail}" if detail else "")
+        )
+    observed: dict[str, str] = {}
+    for row in result.stdout.splitlines():
+        fields = row.split("\t")
+        if (
+            len(fields) != 2
+            or not re.fullmatch(r"[0-9a-f]{40}", fields[0])
+            or fields[1] not in full_names
+            or fields[1] in observed
+        ):
+            raise MalformedSource("git ls-remote returned an unexpected ref record")
+        observed[fields[1]] = fields[0]
+    return tuple(LiveRemoteRef(ref, observed.get(ref.full_name)) for ref in refs)
+
+
+def observe_standalone_snapshot(
+    workspace: str | Path,
+    *,
+    revision: str,
+    config_keys: Sequence[str],
+    remote: str,
+    selected_pr_number: int,
+) -> Snapshot:
+    """Assemble the temporary explicit singleton scope without selection policy."""
+    local = observe_local(workspace, revision=revision, config_keys=config_keys)
+    push_url = resolve_push_url(local, remote)
+    repository = observe_github_repository(push_url, cwd=workspace)
+    source = observe_github_pull_request(repository, selected_pr_number, cwd=workspace)
+    if source.stack_id is not None or source.stack_base_branch is not None:
+        raise SourceMismatch("selected pull request is not confirmed standalone")
+    pr = source.pr
+    live_refs = observe_live_refs(
+        push_url,
+        repository.identity,
+        (f"refs/heads/{pr.head_branch}", f"refs/heads/{pr.base_branch}"),
+        cwd=workspace,
+    )
+    return Snapshot(
+        repository.identity,
+        push_url,
+        remote,
+        local,
+        observe_tool_state(workspace),
+        (pr,),
+        StandalonePullRequest(pr.identity),
+        live_refs,
     )
 
 
