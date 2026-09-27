@@ -14,7 +14,6 @@ from pathlib import Path
 
 import pytest
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "files" / "bin"))
 import jj_stack_sync as sync  # noqa: E402
@@ -930,7 +929,11 @@ def snapshot(*, desired: str, live: str, parent: str, operation: str | None = No
         "ssh://git@github.com/o/r.git",
         "origin",
         local,
-        sync.ToolStateRead(None, sync.EMPTY_STATE, operation),
+        sync.ToolStateRead(
+            None,
+            sync.TrackedState((sync.TrackedStack(repository, "main", (pr_key,)),), ()),
+            operation,
+        ),
         (pr,),
         sync.StandalonePullRequest(pr_key),
         (
@@ -1038,14 +1041,25 @@ def stacked_snapshot(
         "ssh://git@github.com/o/r.git",
         "origin",
         local,
-        sync.ToolStateRead(None, sync.EMPTY_STATE, None),
+        sync.ToolStateRead(
+            None,
+            sync.TrackedState(
+                (
+                    sync.TrackedStack(
+                        repository, "main", tuple(pr.identity for pr in prs)
+                    ),
+                ),
+                (),
+            ),
+            None,
+        ),
         tuple(prs),
         sync.ServerStackMembership(
             selected,
             stack,
             tuple(pr.identity for pr in prs),
         ),
-        tuple(live_refs),
+        tuple(live_refs[1:] + live_refs[:1]),
     )
     return observed, sync.StackSelection("main", tuple(assignments))
 
@@ -1128,6 +1142,10 @@ def test_merged_selector_identifies_stack_without_becoming_active() -> None:
 
 def test_tracked_and_explicit_selection_have_distinct_membership_policy() -> None:
     observed, selected = stacked_snapshot(count=2)
+    observed = dataclasses.replace(
+        observed,
+        tool_state=dataclasses.replace(observed.tool_state, state=sync.EMPTY_STATE),
+    )
 
     explicit = sync.select_explicit_stack(observed, selected.ordered)
     untracked = sync.select_tracked_stack(observed, selected.ordered)
@@ -1703,20 +1721,41 @@ def standalone_plan(
 def final_snapshot(
     observed: sync.Snapshot, plan: sync.NoOp | sync.Apply
 ) -> sync.Snapshot:
-    wanted = plan.desired.active[0]
-    pr = dataclasses.replace(
-        observed.pull_requests[0],
-        head_oid=wanted.desired_commit_id,
-        title=wanted.title,
-        body=wanted.body,
+    desired = {item.pr_identity: item for item in plan.desired.active}
+    heads = {
+        f"refs/heads/{pr.head_branch}": (
+            desired[pr.identity].desired_commit_id
+            if pr.identity in desired
+            else pr.head_oid
+        )
+        for pr in observed.pull_requests
+    }
+    heads.update(
+        {
+            ref.ref.full_name: ref.commit_id
+            for ref in observed.live_refs
+            if ref.ref.full_name not in heads
+        }
+    )
+    prs = tuple(
+        pr
+        if pr.identity not in desired
+        else dataclasses.replace(
+            pr,
+            head_oid=desired[pr.identity].desired_commit_id,
+            base_oid=heads[f"refs/heads/{pr.base_branch}"],
+            title=desired[pr.identity].title,
+            body=desired[pr.identity].body,
+        )
+        for pr in observed.pull_requests
     )
     refs = tuple(
-        dataclasses.replace(ref, commit_id=wanted.desired_commit_id)
-        if ref.ref.full_name == f"refs/heads/{pr.head_branch}"
+        dataclasses.replace(ref, commit_id=heads[ref.ref.full_name])
+        if ref.ref.full_name in heads
         else ref
         for ref in observed.live_refs
     )
-    return dataclasses.replace(observed, pull_requests=(pr,), live_refs=refs)
+    return dataclasses.replace(observed, pull_requests=prs, live_refs=refs)
 
 
 def github_for(
@@ -1744,27 +1783,209 @@ def github_for(
     return server, FakeGitHubClient(server)
 
 
-def test_apply_rejects_multi_pr_shape_before_any_side_effect(monkeypatch) -> None:
+def multi_head_plan(*, merged_prefix: int = 0) -> tuple[sync.Snapshot, sync.Apply]:
+    observed, selected = stacked_snapshot(
+        count=merged_prefix + 2, merged_prefix=merged_prefix
+    )
+    base = "b" * 40
+    comparison_base = base if merged_prefix == 0 else str(merged_prefix) * 40
+    old_heads = (comparison_base, str(merged_prefix + 1) * 40)
+    prs = tuple(
+        pr
+        if index < merged_prefix
+        else dataclasses.replace(
+            pr,
+            head_oid=old_heads[index - merged_prefix],
+            base_oid=(
+                comparison_base
+                if index == merged_prefix
+                else old_heads[index - merged_prefix - 1]
+            ),
+        )
+        for index, pr in enumerate(observed.pull_requests)
+    )
+    old_by_ref = {
+        f"refs/heads/topic-{index + merged_prefix + 1}": old
+        for index, old in enumerate(old_heads)
+    }
+    refs = tuple(
+        dataclasses.replace(ref, commit_id=old_by_ref[ref.ref.full_name])
+        if ref.ref.full_name in old_by_ref
+        else ref
+        for ref in observed.live_refs
+    )
+    observed = dataclasses.replace(observed, pull_requests=prs, live_refs=refs)
+    plan = sync.plan_sync(observed, sync.derive_desired(observed, selected))
+    assert isinstance(plan, sync.Apply)
+    assert len(plan.head_updates) == 2
+    return observed, plan
+
+
+def test_apply_verifies_multi_pr_noop_without_side_effects(monkeypatch) -> None:
     observed, selected = stacked_snapshot(count=2)
     plan = sync.plan_sync(observed, sync.derive_desired(observed, selected))
     assert isinstance(plan, sync.NoOp)
 
-    monkeypatch.setattr(
-        sync,
-        "repository_lock",
-        lambda *_args: pytest.fail("unsupported shape acquired the lock"),
-    )
+    monkeypatch.setattr(sync, "repository_lock", lambda *_args: nullcontext())
     monkeypatch.setattr(
         sync,
         "reobserve_for_apply",
-        lambda *_args: pytest.fail("unsupported shape performed observation"),
+        lambda *_args: observed,
+    )
+    monkeypatch.setattr(
+        sync,
+        "push_exact_head_updates",
+        lambda *_args: pytest.fail("NoOp attempted a push"),
+    )
+    monkeypatch.setattr(
+        sync,
+        "record_verified_state",
+        lambda *_args: pytest.fail("NoOp attempted a state write"),
     )
 
     _server, client = github_for(observed)
     result = sync.apply(plan, "/unused", client)
 
-    assert isinstance(result, sync.Stopped)
-    assert result.stage == "shape"
+    assert result == sync.Verified(False, False, False)
+
+
+@pytest.mark.parametrize("merged_prefix", (0, 1))
+def test_apply_publishes_multi_pr_heads_in_one_atomic_effect(
+    merged_prefix: int, monkeypatch
+) -> None:
+    observed, plan = multi_head_plan(merged_prefix=merged_prefix)
+    observations = iter((observed, final_snapshot(observed, plan)))
+    pushes: list[tuple[sync.PlannedHeadUpdate, ...]] = []
+    recorded: list[tuple[sync.LastPublishedHead, ...]] = []
+    monkeypatch.setattr(sync, "repository_lock", lambda *_args: nullcontext())
+    monkeypatch.setattr(sync, "reobserve_for_apply", lambda *_args: next(observations))
+    monkeypatch.setattr(
+        sync,
+        "push_exact_head_updates",
+        lambda _workspace, updates, _url: (
+            pushes.append(tuple(updates)) or subprocess.CompletedProcess([], 0, "", "")
+        ),
+    )
+    monkeypatch.setattr(
+        sync,
+        "record_verified_state",
+        lambda _workspace, _oid, _state, tracking, publications: (
+            assert_no_tracking_and_record(tracking, publications, recorded)
+        ),
+    )
+
+    _server, client = github_for(observed)
+    result = sync.apply(plan, "/unused", client)
+
+    assert result == sync.Verified(True, False, True)
+    assert pushes == [plan.head_updates]
+    pr_by_ref = {f"refs/heads/{pr.head_branch}": pr for pr in plan.dependencies.prs}
+    assert recorded == [
+        tuple(
+            sync.LastPublishedHead(
+                pr_by_ref[update.ref.full_name].identity,
+                update.ref,
+                update.new_commit_id,
+            )
+            for update in plan.head_updates
+        )
+    ]
+
+
+def assert_no_tracking_and_record(
+    tracking: sync.TrackedStack | None,
+    publications,
+    recorded: list[tuple[sync.LastPublishedHead, ...]],
+) -> None:
+    assert tracking is None
+    recorded.append(tuple(publications))
+
+
+def test_explicit_selection_plans_and_persists_verified_tracking(monkeypatch) -> None:
+    observed, selected = stacked_snapshot(count=2)
+    observed = dataclasses.replace(
+        observed,
+        tool_state=dataclasses.replace(observed.tool_state, state=sync.EMPTY_STATE),
+    )
+    plan = sync.plan_sync(observed, sync.derive_desired(observed, selected))
+    assert isinstance(plan, sync.Apply)
+    assert plan.head_updates == ()
+    assert plan.metadata_updates == ()
+    assert plan.tracking_update == sync.TrackedStack(
+        observed.repository,
+        "main",
+        tuple(pr.identity for pr in observed.pull_requests),
+    )
+    recorded: list[sync.TrackedStack | None] = []
+    monkeypatch.setattr(sync, "repository_lock", lambda *_args: nullcontext())
+    monkeypatch.setattr(sync, "reobserve_for_apply", lambda *_args: observed)
+    monkeypatch.setattr(
+        sync,
+        "record_verified_state",
+        lambda _workspace, _oid, _state, tracking, _publications: recorded.append(
+            tracking
+        ),
+    )
+
+    _server, client = github_for(observed)
+    result = sync.apply(plan, "/unused", client)
+
+    assert result == sync.Verified(False, False, False, True)
+    assert recorded == [plan.tracking_update]
+
+
+def test_explicit_selection_blocks_overlapping_tracked_topology() -> None:
+    observed, selected = stacked_snapshot(count=2)
+    conflicting = sync.TrackedStack(
+        observed.repository,
+        "release",
+        (observed.pull_requests[0].identity,),
+    )
+    observed = dataclasses.replace(
+        observed,
+        tool_state=dataclasses.replace(
+            observed.tool_state,
+            state=sync.TrackedState((conflicting,), ()),
+        ),
+    )
+
+    plan = sync.plan_sync(observed, sync.derive_desired(observed, selected))
+
+    assert isinstance(plan, sync.Blocked)
+    assert plan.reasons[0].code == "tracked-topology-changed"
+
+
+def test_apply_updates_metadata_for_every_planned_pr(monkeypatch) -> None:
+    observed, selected = stacked_snapshot(count=2)
+    stale = dataclasses.replace(
+        observed,
+        pull_requests=tuple(
+            dataclasses.replace(pr, title=f"Stale {pr.number}")
+            for pr in observed.pull_requests
+        ),
+    )
+    plan = sync.plan_sync(stale, sync.derive_desired(stale, selected))
+    assert isinstance(plan, sync.Apply)
+    assert len(plan.metadata_updates) == 2
+    observations = iter((stale, final_snapshot(stale, plan)))
+    server, client = github_for(stale)
+    monkeypatch.setattr(sync, "repository_lock", lambda *_args: nullcontext())
+    monkeypatch.setattr(sync, "reobserve_for_apply", lambda *_args: next(observations))
+    monkeypatch.setattr(
+        sync,
+        "record_verified_state",
+        lambda *_args: pytest.fail("metadata-only apply attempted a state write"),
+    )
+
+    result = sync.apply(plan, "/unused", client)
+
+    assert result == sync.Verified(False, True, False)
+    assert tuple(
+        (pr.title, pr.body)
+        for pr in server.read_pull_requests(
+            tuple(pr.identity for pr in stale.pull_requests)
+        )
+    ) == tuple((wanted.title, wanted.body) for wanted in plan.desired.active)
 
 
 def test_apply_revalidation_ignores_jj_operation_but_detects_relevant_drift() -> None:
@@ -1835,13 +2056,15 @@ def test_apply_publishes_verifies_and_records_authority(monkeypatch) -> None:
     monkeypatch.setattr(sync, "reobserve_for_apply", lambda *_args: next(observations))
     monkeypatch.setattr(
         sync,
-        "push_exact_head_update",
+        "push_exact_head_updates",
         lambda *_args: subprocess.CompletedProcess([], 0, "", ""),
     )
     monkeypatch.setattr(
         sync,
-        "record_last_published_head",
-        lambda _workspace, _oid, _state, publication: recorded.append(publication),
+        "record_verified_state",
+        lambda _workspace, _oid, _state, _tracking, publications: recorded.extend(
+            publications
+        ),
     )
 
     _server, client = github_for(observed)
@@ -1864,12 +2087,12 @@ def test_apply_noop_verifies_without_mutation_or_receipt(monkeypatch) -> None:
     monkeypatch.setattr(sync, "reobserve_for_apply", lambda *_args: observed)
     monkeypatch.setattr(
         sync,
-        "push_exact_head_update",
+        "push_exact_head_updates",
         lambda *_args: pytest.fail("NoOp attempted a push"),
     )
     monkeypatch.setattr(
         sync,
-        "record_last_published_head",
+        "record_verified_state",
         lambda *_args: pytest.fail("NoOp manufactured replacement authority"),
     )
 
@@ -1899,7 +2122,7 @@ def test_apply_metadata_only_overwrites_frozen_race_without_receipt(
     monkeypatch.setattr(sync, "reobserve_for_apply", lambda *_args: next(observations))
     monkeypatch.setattr(
         sync,
-        "record_last_published_head",
+        "record_verified_state",
         lambda *_args: pytest.fail("metadata-only apply created a receipt"),
     )
     original_update = client.update_pull_request
@@ -1952,7 +2175,7 @@ def test_apply_does_not_update_metadata_after_published_head_is_superseded(
     monkeypatch.setattr(sync, "reobserve_for_apply", lambda *_args: next(observations))
     monkeypatch.setattr(
         sync,
-        "push_exact_head_update",
+        "push_exact_head_updates",
         lambda *_args: subprocess.CompletedProcess([], 0, "", ""),
     )
     server, client = github_for(stale)
@@ -2001,7 +2224,7 @@ def test_apply_classifies_failed_push_from_authoritative_head(
     monkeypatch.setattr(sync, "reobserve_for_apply", lambda *_args: next(observations))
     monkeypatch.setattr(
         sync,
-        "push_exact_head_update",
+        "push_exact_head_updates",
         lambda *_args: subprocess.CompletedProcess([], 1, "", "lost response"),
     )
     monkeypatch.setattr(
@@ -2011,7 +2234,7 @@ def test_apply_classifies_failed_push_from_authoritative_head(
             sync.LiveRemoteRef(plan.head_updates[0].ref, observed_head),
         ),
     )
-    monkeypatch.setattr(sync, "record_last_published_head", lambda *_args: "oid")
+    monkeypatch.setattr(sync, "record_verified_state", lambda *_args: "oid")
 
     _server, client = github_for(observed)
     result = sync.apply(plan, "/unused", client)
@@ -2031,12 +2254,12 @@ def test_verified_publication_reports_receipt_failure_honestly(monkeypatch) -> N
     monkeypatch.setattr(sync, "reobserve_for_apply", lambda *_args: next(observations))
     monkeypatch.setattr(
         sync,
-        "push_exact_head_update",
+        "push_exact_head_updates",
         lambda *_args: subprocess.CompletedProcess([], 0, "", ""),
     )
     monkeypatch.setattr(
         sync,
-        "record_last_published_head",
+        "record_verified_state",
         lambda *_args: (_ for _ in ()).throw(sync.ConcurrentUpdate("stale state")),
     )
 
@@ -2076,19 +2299,75 @@ def test_exact_head_push_uses_original_lease_and_has_no_fallback(
     )
     monkeypatch.setattr(sync, "git_common_dir", lambda *_args: source / ".git")
 
-    success = sync.push_exact_head_update(source, update, os.fspath(remote))
+    success = sync.push_exact_head_updates(source, (update,), os.fspath(remote))
     (source / "file").write_text("foreign\n")
     run("git", "-C", source, "commit", "-am", "foreign")
     run("git", "-C", source, "push", remote, "HEAD:refs/heads/topic")
     foreign = run("git", "-C", source, "rev-parse", "HEAD")
-    stale = sync.push_exact_head_update(source, update, os.fspath(remote))
+    stale = sync.push_exact_head_updates(source, (update,), os.fspath(remote))
 
     assert success.returncode == 0
     assert stale.returncode != 0
     assert run("git", f"--git-dir={remote}", "rev-parse", "refs/heads/topic") == foreign
 
 
-def test_record_last_published_head_replaces_only_matching_authority(
+def test_atomic_multi_head_push_changes_nothing_when_one_lease_is_stale(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source"
+    remote = tmp_path / "remote.git"
+    run("git", "init", source)
+    run("git", "init", "--bare", remote)
+    run("git", "-C", source, "config", "user.name", "Test")
+    run("git", "-C", source, "config", "user.email", "test@example.com")
+    (source / "file").write_text("old\n")
+    run("git", "-C", source, "add", "file")
+    run("git", "-C", source, "commit", "-m", "old")
+    old = run("git", "-C", source, "rev-parse", "HEAD")
+    run(
+        "git",
+        "-C",
+        source,
+        "push",
+        remote,
+        "HEAD:refs/heads/one",
+        "HEAD:refs/heads/two",
+    )
+    (source / "file").write_text("one\n")
+    run("git", "-C", source, "commit", "-am", "one")
+    one = run("git", "-C", source, "rev-parse", "HEAD")
+    (source / "file").write_text("two\n")
+    run("git", "-C", source, "commit", "-am", "two")
+    two = run("git", "-C", source, "rev-parse", "HEAD")
+    (source / "file").write_text("foreign\n")
+    run("git", "-C", source, "commit", "-am", "foreign")
+    foreign = run("git", "-C", source, "rev-parse", "HEAD")
+    run("git", "-C", source, "push", remote, f"{foreign}:refs/heads/two")
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    updates = (
+        sync.PlannedHeadUpdate(
+            sync.RemoteBranchRef(repository, "refs/heads/one"),
+            old,
+            one,
+            sync.FastForward(),
+        ),
+        sync.PlannedHeadUpdate(
+            sync.RemoteBranchRef(repository, "refs/heads/two"),
+            old,
+            two,
+            sync.FastForward(),
+        ),
+    )
+    monkeypatch.setattr(sync, "git_common_dir", lambda *_args: source / ".git")
+
+    result = sync.push_exact_head_updates(source, updates, os.fspath(remote))
+
+    assert result.returncode != 0
+    assert run("git", f"--git-dir={remote}", "rev-parse", "refs/heads/one") == old
+    assert run("git", f"--git-dir={remote}", "rev-parse", "refs/heads/two") == foreign
+
+
+def test_record_verified_state_combines_tracking_and_replaces_matching_authority(
     jj_repo: Path,
 ) -> None:
     repository = sync.GitHubRepositoryId("github.com", "R_repo")
@@ -2105,13 +2384,16 @@ def test_record_last_published_head_replaces_only_matching_authority(
     )
     oid = sync.cas_write_state(jj_repo, None, initial)
     publication = sync.LastPublishedHead(pr, ref, "2" * 40)
+    tracking = sync.TrackedStack(repository, "main", (pr,))
 
-    new_oid = sync.record_last_published_head(jj_repo, oid, initial, publication)
+    new_oid = sync.record_verified_state(
+        jj_repo, oid, initial, tracking, (publication,)
+    )
 
     assert sync.read_state(jj_repo) == (
         new_oid,
         sync.TrackedState(
-            (),
+            (tracking,),
             (sync.LastPublishedHead(other, other_ref, "8" * 40), publication),
         ),
     )
