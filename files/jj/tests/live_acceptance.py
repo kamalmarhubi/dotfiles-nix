@@ -51,7 +51,7 @@ def session(root: Path) -> dict[str, object]:
 def verify_session(root: Path) -> dict[str, object]:
     metadata = session(root)
     expected = str(metadata["source_sha256"])
-    copied = root / "jj-stack-source"
+    copied = root / str(metadata.get("retained_source", "jj-stack-source"))
     if sha256(copied) != expected:
         raise SystemExit("retained jj-stack source no longer matches session hash")
     return metadata
@@ -78,12 +78,13 @@ def create_session(args: argparse.Namespace) -> None:
         raise SystemExit(
             f"refusing to reuse acceptance artifact root: {root}"
         ) from None
-    copied = root / "jj-stack-source"
+    copied = root / source.name
     shutil.copy2(source, copied)
     metadata = {
         "created_at": now(),
         "root": str(root),
         "source": str(source),
+        "retained_source": copied.name,
         "source_sha256": actual,
         "github_repo": args.github_repo,
     }
@@ -352,6 +353,7 @@ def snapshot(args: argparse.Namespace) -> None:
             "jj-op",
             [
                 "jj",
+                "--ignore-working-copy",
                 "op",
                 "log",
                 "--no-graph",
@@ -362,11 +364,26 @@ def snapshot(args: argparse.Namespace) -> None:
         ),
         (
             "jj-bookmarks",
-            ["jj", "bookmark", "list", "--all-remotes", "--color=never"],
+            [
+                "jj",
+                "--ignore-working-copy",
+                "bookmark",
+                "list",
+                "--all-remotes",
+                "--color=never",
+            ],
             True,
         ),
-        ("jj-status", ["jj", "status", "--color=never"], True),
-        ("jj-workspaces", ["jj", "workspace", "list"], True),
+        (
+            "jj-status",
+            ["jj", "--ignore-working-copy", "status", "--color=never"],
+            True,
+        ),
+        (
+            "jj-workspaces",
+            ["jj", "--ignore-working-copy", "workspace", "list"],
+            True,
+        ),
         (
             "jj-log",
             [
