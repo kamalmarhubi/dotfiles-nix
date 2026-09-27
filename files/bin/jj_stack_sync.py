@@ -16,7 +16,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from urllib.parse import urlparse
@@ -491,6 +491,26 @@ class Apply:
 
 
 SyncPlan = Blocked | NoOp | Apply
+
+
+@dataclass(frozen=True)
+class Verified:
+    head_published: bool
+    metadata_updated: bool
+    authority_persisted: bool
+
+
+@dataclass(frozen=True)
+class Stopped:
+    stage: str
+    detail: str
+    head_published: bool = False
+    metadata_updated: bool = False
+    final_state_verified: bool = False
+    authority_persisted: bool = False
+
+
+ApplyResult = Verified | Stopped
 
 
 def _run(
@@ -2130,3 +2150,403 @@ def render(plan: SyncPlan) -> str:
         ),
     ]
     return "apply:\n" + "\n".join(f"  - {item}" for item in consequences)
+
+
+def _standalone_apply_shape(plan: SyncPlan) -> Stopped | None:
+    if isinstance(plan, Blocked):
+        return Stopped("plan", "a blocked plan cannot be applied")
+    if (
+        len(plan.desired.active) != 1
+        or len(plan.dependencies.prs) != 1
+        or not isinstance(plan.dependencies.membership, StandalonePullRequest)
+        or plan.dependencies.membership.pr != plan.desired.active[0].pr_identity
+        or plan.dependencies.prs[0].identity != plan.desired.active[0].pr_identity
+        or plan.dependencies.prs[0].state is not PullRequestState.OPEN
+    ):
+        return Stopped(
+            "shape",
+            "apply currently requires exactly one open standalone pull request",
+        )
+    if isinstance(plan, Apply):
+        if (
+            len(plan.head_updates) > 1
+            or len(plan.metadata_updates) > 1
+            or any(
+                update.pr_identity != plan.desired.active[0].pr_identity
+                for update in plan.metadata_updates
+            )
+        ):
+            return Stopped("shape", "plan contains unsupported multi-PR effects")
+        expected_ref = RemoteBranchRef(
+            plan.desired.repository,
+            f"refs/heads/{plan.dependencies.prs[0].head_branch}",
+        )
+        if any(update.ref != expected_ref for update in plan.head_updates):
+            return Stopped("shape", "plan changes an unexpected head branch")
+    return None
+
+
+def _apply_revision(plan: NoOp | Apply) -> str:
+    desired = plan.desired.active[0].desired_commit_id
+    base = plan.dependencies.live_bases[0].commit_id
+    if base is None:
+        raise Error("planned base ref is absent")
+    return f"{base}::{desired}"
+
+
+def reobserve_for_apply(workspace: str | Path, plan: NoOp | Apply) -> Snapshot:
+    """Reobserve only the frozen standalone plan's publication dependencies."""
+    config_keys = tuple(key for key, _value in plan.dependencies.effective_config)
+    local = observe_local(
+        workspace,
+        revision=_apply_revision(plan),
+        config_keys=config_keys,
+    )
+    push_url = resolve_push_url(local, plan.dependencies.remote)
+    repository = observe_github_repository(push_url, cwd=workspace)
+    planned_pr = plan.dependencies.prs[0]
+    source = observe_github_pull_request(repository, planned_pr.number, cwd=workspace)
+    if source.stack_id is None:
+        if source.stack_base_branch is not None:
+            raise SourceMismatch("standalone pull request reported a stack base")
+        membership: PullRequestMembership = StandalonePullRequest(source.pr.identity)
+    else:
+        if source.stack_base_branch is None:
+            raise IncompleteSource("stack base branch is unavailable")
+        stack = observe_github_stack(repository, source.stack_id, cwd=workspace)
+        membership = ServerStackMembership(
+            source.pr.identity,
+            stack.stack_id,
+            stack.base_branch,
+            tuple(pr.identity for pr in stack.ordered_prs),
+        )
+    ref_names = tuple(
+        dict.fromkeys(
+            (
+                *(ref.ref.full_name for ref in plan.dependencies.live_heads),
+                *(ref.ref.full_name for ref in plan.dependencies.live_bases),
+            )
+        )
+    )
+    return Snapshot(
+        repository.identity,
+        push_url,
+        plan.dependencies.remote,
+        local,
+        observe_tool_state(workspace),
+        (source.pr,),
+        membership,
+        observe_live_refs(push_url, repository.identity, ref_names, cwd=workspace),
+    )
+
+
+def _pr_without_metadata(pr: GitHubPullRequest) -> tuple[object, ...]:
+    return (
+        pr.identity,
+        pr.number,
+        pr.state,
+        pr.draft,
+        pr.head_repository,
+        pr.head_branch,
+        pr.reported_head_commit_id,
+        pr.base_branch,
+        pr.reported_base_commit_id,
+        pr.auto_merge_enabled,
+        pr.in_merge_queue,
+    )
+
+
+def validate_frozen_dependencies(plan: NoOp | Apply, fresh: Snapshot) -> Blocked | None:
+    dependencies = plan.dependencies
+    if fresh.repository != plan.desired.repository:
+        return _block("repository-changed", "repository", "repository identity changed")
+    if fresh.local.effective_config != dependencies.effective_config:
+        return _block("config-changed", "config", "effective configuration changed")
+    if fresh.push_url != dependencies.push_url:
+        return _block("push-url-changed", "push-url", "push destination changed")
+    if fresh.tool_state.state_blob_oid != dependencies.state_blob_oid:
+        return _block("state-changed", STATE_REF, "private state changed")
+    if fresh.tool_state.operation_blob_oid != dependencies.operation_blob_oid:
+        return _block("operation-changed", OPERATION_REF, "operation fence changed")
+    if fresh.membership != dependencies.membership:
+        return _block("membership-changed", "stack", "pull request membership changed")
+    if fresh.live_refs != dependencies.live_heads + dependencies.live_bases:
+        return _block("refs-changed", "destination", "live head or base refs changed")
+    if len(fresh.pull_requests) != 1:
+        return _block("pr-changed", "pull-request", "pull request observation changed")
+    old_pr, new_pr = dependencies.prs[0], fresh.pull_requests[0]
+    if _pr_without_metadata(new_pr) != _pr_without_metadata(old_pr):
+        return _block(
+            "pr-changed", old_pr.identity.node_id, "pull request state changed"
+        )
+    metadata_planned = isinstance(plan, Apply) and bool(plan.metadata_updates)
+    if not metadata_planned and (new_pr.title, new_pr.body) != (
+        old_pr.title,
+        old_pr.body,
+    ):
+        return _block(
+            "metadata-changed",
+            old_pr.identity.node_id,
+            "unplanned pull request metadata changed",
+        )
+    active = _validate_plan_scope(fresh, plan.desired)
+    if isinstance(active, Blocked):
+        return active
+    checked = _validate_pr_dependencies(fresh, plan.desired, active)
+    if isinstance(checked, Blocked):
+        return checked
+    return None
+
+
+def push_exact_head_update(
+    workspace: str | Path, update: PlannedHeadUpdate, push_url: str
+) -> subprocess.CompletedProcess[str]:
+    common = git_common_dir(workspace)
+    return subprocess.run(
+        [
+            "git",
+            f"--git-dir={common}",
+            "push",
+            "--atomic",
+            "--no-follow-tags",
+            "--recurse-submodules=no",
+            f"--force-with-lease={update.ref.full_name}:{update.expected_old_commit_id}",
+            push_url,
+            f"{update.new_commit_id}:{update.ref.full_name}",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+_UPDATE_PR_MUTATION = """
+mutation($id: ID!, $title: String!, $body: String!) {
+  updatePullRequest(input: {pullRequestId: $id, title: $title, body: $body}) {
+    pullRequest { id }
+  }
+}
+"""
+
+
+def update_frozen_pr_metadata(workspace: str | Path, update: PRMetadataUpdate) -> None:
+    response = _exact_record(
+        _command_json(
+            [
+                "gh",
+                "api",
+                "--hostname",
+                update.pr_identity.repository.host,
+                "graphql",
+                "--input",
+                "-",
+            ],
+            cwd=workspace,
+            stdin=json.dumps(
+                {
+                    "query": _UPDATE_PR_MUTATION,
+                    "variables": {
+                        "id": update.pr_identity.node_id,
+                        "title": update.title,
+                        "body": update.body,
+                    },
+                }
+            ),
+        ),
+        {"data"},
+        "update pull request response",
+    )
+    data = _exact_record(
+        response["data"], {"updatePullRequest"}, "update pull request data"
+    )
+    updated = _exact_record(
+        data["updatePullRequest"], {"pullRequest"}, "update pull request payload"
+    )
+    pull_request = _exact_record(updated["pullRequest"], {"id"}, "updated pull request")
+    if pull_request["id"] != update.pr_identity.node_id:
+        raise SourceMismatch("GitHub updated a different pull request")
+
+
+def _expected_final_pr(plan: NoOp | Apply) -> GitHubPullRequest:
+    pr = plan.dependencies.prs[0]
+    wanted = plan.desired.active[0]
+    return GitHubPullRequest(
+        pr.identity,
+        pr.number,
+        pr.state,
+        pr.draft,
+        pr.head_repository,
+        pr.head_branch,
+        wanted.desired_commit_id,
+        pr.base_branch,
+        pr.reported_base_commit_id,
+        pr.auto_merge_enabled,
+        pr.in_merge_queue,
+        wanted.title,
+        wanted.body,
+    )
+
+
+def verify_final_one_pr_state(
+    workspace: str | Path, plan: NoOp | Apply
+) -> tuple[Snapshot | None, Stopped | None]:
+    try:
+        fresh = reobserve_for_apply(workspace, plan)
+    except Error as exc:
+        return None, Stopped("verify", str(exc))
+    expected_pr = _expected_final_pr(plan)
+    expected_head = LiveRemoteRef(
+        RemoteBranchRef(
+            plan.desired.repository, f"refs/heads/{expected_pr.head_branch}"
+        ),
+        plan.desired.active[0].desired_commit_id,
+    )
+    if (
+        fresh.repository != plan.desired.repository
+        or fresh.local.effective_config != plan.dependencies.effective_config
+        or fresh.push_url != plan.dependencies.push_url
+        or fresh.tool_state.state_blob_oid != plan.dependencies.state_blob_oid
+        or fresh.tool_state.operation_blob_oid != plan.dependencies.operation_blob_oid
+        or fresh.membership != plan.dependencies.membership
+        or fresh.pull_requests != (expected_pr,)
+        or fresh.live_refs != (expected_head,) + plan.dependencies.live_bases
+    ):
+        return fresh, Stopped(
+            "verify", "authoritative final state does not match the frozen plan"
+        )
+    return fresh, None
+
+
+def record_last_published_head(
+    workspace: str | Path,
+    expected_state_oid: str | None,
+    state: TrackedState,
+    publication: LastPublishedHead,
+) -> str:
+    retained = tuple(
+        item
+        for item in state.last_published_heads
+        if not (item.pr == publication.pr and item.ref == publication.ref)
+    )
+    return cas_write_state(
+        workspace,
+        expected_state_oid,
+        TrackedState(state.stacks, retained + (publication,)),
+    )
+
+
+def apply(plan: SyncPlan, workspace: str | Path) -> ApplyResult:
+    """Execute one frozen existing-head plan without replanning or lease refresh."""
+    unsupported = _standalone_apply_shape(plan)
+    if unsupported is not None:
+        return unsupported
+    assert isinstance(plan, NoOp | Apply)
+    with repository_lock(workspace):
+        try:
+            fresh = reobserve_for_apply(workspace, plan)
+        except Error as exc:
+            return Stopped("reobserve", str(exc))
+        drift = validate_frozen_dependencies(plan, fresh)
+        if drift is not None:
+            reason = drift.reasons[0]
+            return Stopped("revalidate", f"{reason.code}: {reason.detail}")
+        if isinstance(plan, NoOp):
+            _fresh, stopped = verify_final_one_pr_state(workspace, plan)
+            return stopped or Verified(False, False, False)
+
+        head_published = False
+        metadata_updated = False
+        if plan.head_updates:
+            update = plan.head_updates[0]
+            response = push_exact_head_update(
+                workspace, update, plan.dependencies.push_url
+            )
+            if response.returncode == 0:
+                head_published = True
+            else:
+                try:
+                    observed = observe_live_refs(
+                        plan.dependencies.push_url,
+                        plan.desired.repository,
+                        (update.ref.full_name,),
+                        cwd=workspace,
+                    )[0].commit_id
+                except Error as exc:
+                    return Stopped("push", f"push result is unknown: {exc}")
+                if observed == update.new_commit_id:
+                    head_published = True
+                elif observed == update.expected_old_commit_id:
+                    return Stopped("push", "push was not observed at the destination")
+                else:
+                    return Stopped("push", "destination head has an unexpected value")
+        if plan.head_updates and plan.metadata_updates:
+            try:
+                published = reobserve_for_apply(workspace, plan)
+            except Error as exc:
+                return Stopped(
+                    "pre-metadata-verify",
+                    f"heads were published but could not be verified before metadata: {exc}",
+                    head_published=head_published,
+                )
+            expected_heads = {
+                update.ref.full_name: update.new_commit_id
+                for update in plan.head_updates
+            }
+            live_heads = {
+                item.ref.full_name: item.commit_id for item in published.live_refs
+            }
+            pr_heads = {
+                f"refs/heads/{pr.head_branch}": pr.reported_head_commit_id
+                for pr in published.pull_requests
+            }
+            if any(
+                live_heads.get(name) != commit_id or pr_heads.get(name) != commit_id
+                for name, commit_id in expected_heads.items()
+            ):
+                return Stopped(
+                    "pre-metadata-verify",
+                    "a published head was superseded before metadata update",
+                    head_published=head_published,
+                )
+        if plan.metadata_updates:
+            try:
+                update_frozen_pr_metadata(workspace, plan.metadata_updates[0])
+                metadata_updated = True
+            except Error:
+                # A lost API response is resolved by the same authoritative final read.
+                pass
+
+        final, stopped = verify_final_one_pr_state(workspace, plan)
+        if stopped is not None:
+            return replace(
+                stopped,
+                head_published=head_published,
+                metadata_updated=metadata_updated,
+            )
+        assert final is not None
+        if plan.metadata_updates:
+            metadata_updated = True
+        if not plan.head_updates:
+            return Verified(False, metadata_updated, False)
+        wanted = plan.desired.active[0]
+        publication = LastPublishedHead(
+            wanted.pr_identity,
+            plan.head_updates[0].ref,
+            wanted.desired_commit_id,
+        )
+        try:
+            record_last_published_head(
+                workspace,
+                plan.dependencies.state_blob_oid,
+                final.tool_state.state,
+                publication,
+            )
+        except Error as exc:
+            return Stopped(
+                "receipt",
+                f"publication verified but authority persistence failed: {exc}",
+                head_published=True,
+                metadata_updated=metadata_updated,
+                final_state_verified=True,
+            )
+        return Verified(True, metadata_updated, True)
