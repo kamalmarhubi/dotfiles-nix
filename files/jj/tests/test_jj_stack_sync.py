@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -723,6 +724,56 @@ def test_fake_github_derives_stack_associations_and_preserves_requested_order() 
     assert client.stack(repository, stack.identity) == stack
     assert client.resolve_repository(repository.identity) == repository
     assert client.resolve_repository("ssh://github/owner/repo") == repository
+
+
+def test_github_api_update_uses_keyword_fields_and_preserves_empty_body(
+    monkeypatch,
+) -> None:
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    pull_request = sync._parse_github_pull_request(pr_source_record(), repository, 7)
+    api = sync.GitHubAPI(workspace="/repo")
+    monkeypatch.setattr(api, "pull_requests", lambda identities: (pull_request,))
+    requests = []
+
+    def graphql(host, query, variables, *, cwd):
+        requests.append((host, query, variables, cwd))
+        return {
+            "data": {
+                "updatePullRequest": {
+                    "pullRequest": {
+                        "id": pull_request.node_id,
+                        "number": pull_request.number,
+                        "repository": {"id": repository.identity.node_id},
+                    }
+                }
+            }
+        }
+
+    monkeypatch.setattr(sync, "_github_graphql", graphql)
+
+    api.update_pull_request(
+        repository,
+        pull_request.identity,
+        body="",
+        state=sync.PullRequestUpdateState.CLOSED,
+    )
+
+    assert requests[0][0] == "github.com"
+    assert requests[0][2] == {
+        "id": pull_request.node_id,
+        "body": "",
+        "state": "CLOSED",
+    }
+    assert "body: $body" in requests[0][1]
+    assert "state: $state" in requests[0][1]
+    with pytest.raises(ValueError, match="at least one field"):
+        api.update_pull_request(repository, pull_request.identity)
+    assert len(requests) == 1
 
 
 def test_complete_stack_source_validates_order_membership_and_base() -> None:
@@ -1636,6 +1687,434 @@ def test_operation_fence_blocks_without_io(monkeypatch) -> None:
     assert sync.render(
         sync.plan_sync(fenced, sync.derive_desired(fenced, selection(fenced, pr)))
     ).startswith("blocked [operation-fenced]")
+
+
+def standalone_plan(
+    *, desired: str, live: str, parent: str
+) -> tuple[sync.Snapshot, sync.NoOp | sync.Apply]:
+    observed, pr = snapshot(desired=desired, live=live, parent=parent)
+    plan = sync.plan_sync(
+        observed, sync.derive_desired(observed, selection(observed, pr))
+    )
+    assert isinstance(plan, sync.NoOp | sync.Apply)
+    return observed, plan
+
+
+def final_snapshot(
+    observed: sync.Snapshot, plan: sync.NoOp | sync.Apply
+) -> sync.Snapshot:
+    wanted = plan.desired.active[0]
+    pr = dataclasses.replace(
+        observed.pull_requests[0],
+        head_oid=wanted.desired_commit_id,
+        title=wanted.title,
+        body=wanted.body,
+    )
+    refs = tuple(
+        dataclasses.replace(ref, commit_id=wanted.desired_commit_id)
+        if ref.ref.full_name == f"refs/heads/{pr.head_branch}"
+        else ref
+        for ref in observed.live_refs
+    )
+    return dataclasses.replace(observed, pull_requests=(pr,), live_refs=refs)
+
+
+def github_for(
+    observed: sync.Snapshot,
+) -> tuple[FakeGitHubServer, FakeGitHubClient]:
+    repository = sync.GitHubRepository(
+        observed.repository,
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    server = FakeGitHubServer()
+    server.seed_repository(repository, aliases=(observed.push_url,))
+    for pull_request in observed.pull_requests:
+        server.seed_pull_request(dataclasses.replace(pull_request, stack=None))
+    if isinstance(observed.membership, sync.ServerStackMembership):
+        server.seed_stack(
+            sync.GitHubStack(
+                observed.membership.stack.identity,
+                observed.membership.stack.node_id,
+                observed.membership.stack.base_branch,
+                observed.membership.ordered_prs,
+            )
+        )
+    return server, FakeGitHubClient(server)
+
+
+def test_apply_rejects_multi_pr_shape_before_any_side_effect(monkeypatch) -> None:
+    observed, selected = stacked_snapshot(count=2)
+    plan = sync.plan_sync(observed, sync.derive_desired(observed, selected))
+    assert isinstance(plan, sync.NoOp)
+
+    monkeypatch.setattr(
+        sync,
+        "repository_lock",
+        lambda *_args: pytest.fail("unsupported shape acquired the lock"),
+    )
+    monkeypatch.setattr(
+        sync,
+        "reobserve_for_apply",
+        lambda *_args: pytest.fail("unsupported shape performed observation"),
+    )
+
+    _server, client = github_for(observed)
+    result = sync.apply(plan, "/unused", client)
+
+    assert isinstance(result, sync.Stopped)
+    assert result.stage == "shape"
+
+
+def test_apply_revalidation_ignores_jj_operation_but_detects_relevant_drift() -> None:
+    observed, plan = standalone_plan(desired="2" * 40, live="1" * 40, parent="1" * 40)
+    unrelated = dataclasses.replace(
+        observed,
+        local=dataclasses.replace(observed.local, operation_id="new-jj-operation"),
+    )
+    assert sync.validate_frozen_dependencies(plan, unrelated) is None
+
+    changed = (
+        dataclasses.replace(observed, push_url="ssh://elsewhere/repo.git"),
+        dataclasses.replace(
+            observed,
+            tool_state=dataclasses.replace(
+                observed.tool_state, operation_blob_oid="f" * 40
+            ),
+        ),
+        dataclasses.replace(
+            observed,
+            pull_requests=(
+                dataclasses.replace(observed.pull_requests[0], base_branch="release"),
+            ),
+        ),
+    )
+    assert [
+        sync.validate_frozen_dependencies(plan, item).reasons[0].code  # type: ignore[union-attr]
+        for item in changed
+    ] == ["push-url-changed", "operation-changed", "pr-changed"]
+
+
+def test_frozen_metadata_effect_allows_race_but_noop_does_not() -> None:
+    observed, no_op = standalone_plan(desired="1" * 40, live="1" * 40, parent="0" * 40)
+    raced = dataclasses.replace(
+        observed,
+        pull_requests=(
+            dataclasses.replace(observed.pull_requests[0], title="Concurrent title"),
+        ),
+    )
+    blocked = sync.validate_frozen_dependencies(no_op, raced)
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "metadata-changed"
+
+    stale = dataclasses.replace(
+        observed,
+        pull_requests=(dataclasses.replace(observed.pull_requests[0], title="Stale"),),
+    )
+    desired = sync.derive_desired(
+        stale, selection(stale, stale.pull_requests[0].identity)
+    )
+    metadata_plan = sync.plan_sync(stale, desired)
+    assert isinstance(metadata_plan, sync.Apply)
+    raced_again = dataclasses.replace(
+        stale,
+        pull_requests=(
+            dataclasses.replace(stale.pull_requests[0], title="Concurrent title"),
+        ),
+    )
+    assert sync.validate_frozen_dependencies(metadata_plan, raced_again) is None
+
+
+def test_apply_publishes_verifies_and_records_authority(monkeypatch) -> None:
+    observed, plan = standalone_plan(desired="2" * 40, live="1" * 40, parent="1" * 40)
+    assert isinstance(plan, sync.Apply)
+    observations = iter((observed, final_snapshot(observed, plan)))
+    recorded: list[sync.LastPublishedHead] = []
+    monkeypatch.setattr(sync, "repository_lock", lambda *_args: nullcontext())
+    monkeypatch.setattr(sync, "reobserve_for_apply", lambda *_args: next(observations))
+    monkeypatch.setattr(
+        sync,
+        "push_exact_head_update",
+        lambda *_args: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    monkeypatch.setattr(
+        sync,
+        "record_last_published_head",
+        lambda _workspace, _oid, _state, publication: recorded.append(publication),
+    )
+
+    _server, client = github_for(observed)
+    result = sync.apply(plan, "/unused", client)
+
+    assert result == sync.Verified(True, False, True)
+    assert recorded == [
+        sync.LastPublishedHead(
+            plan.desired.active[0].pr_identity,
+            plan.head_updates[0].ref,
+            "2" * 40,
+        )
+    ]
+
+
+def test_apply_noop_verifies_without_mutation_or_receipt(monkeypatch) -> None:
+    observed, plan = standalone_plan(desired="1" * 40, live="1" * 40, parent="0" * 40)
+    assert isinstance(plan, sync.NoOp)
+    monkeypatch.setattr(sync, "repository_lock", lambda *_args: nullcontext())
+    monkeypatch.setattr(sync, "reobserve_for_apply", lambda *_args: observed)
+    monkeypatch.setattr(
+        sync,
+        "push_exact_head_update",
+        lambda *_args: pytest.fail("NoOp attempted a push"),
+    )
+    monkeypatch.setattr(
+        sync,
+        "record_last_published_head",
+        lambda *_args: pytest.fail("NoOp manufactured replacement authority"),
+    )
+
+    _server, client = github_for(observed)
+    assert sync.apply(plan, "/unused", client) == sync.Verified(
+        False, False, False
+    )
+
+
+def test_apply_metadata_only_overwrites_frozen_race_without_receipt(
+    monkeypatch,
+) -> None:
+    observed, pr = snapshot(desired="1" * 40, live="1" * 40, parent="0" * 40)
+    stale = dataclasses.replace(
+        observed,
+        pull_requests=(dataclasses.replace(observed.pull_requests[0], title="Stale"),),
+    )
+    plan = sync.plan_sync(stale, sync.derive_desired(stale, selection(stale, pr)))
+    assert isinstance(plan, sync.Apply)
+    raced = dataclasses.replace(
+        stale,
+        pull_requests=(dataclasses.replace(stale.pull_requests[0], title="Raced"),),
+    )
+    observations = iter((raced, final_snapshot(stale, plan)))
+    server, client = github_for(stale)
+    monkeypatch.setattr(sync, "repository_lock", lambda *_args: nullcontext())
+    monkeypatch.setattr(sync, "reobserve_for_apply", lambda *_args: next(observations))
+    monkeypatch.setattr(
+        sync,
+        "record_last_published_head",
+        lambda *_args: pytest.fail("metadata-only apply created a receipt"),
+    )
+    original_update = client.update_pull_request
+    attempted = False
+
+    def update_once(*args, **kwargs):
+        nonlocal attempted
+        if attempted:
+            pytest.fail("replayed metadata update")
+        attempted = True
+        return original_update(*args, **kwargs)
+
+    monkeypatch.setattr(client, "update_pull_request", update_once)
+
+    with client.lose_response(sync.GitHubClient.update_pull_request, pr=pr):
+        result = sync.apply(plan, "/unused", client)
+
+    assert result == sync.Verified(False, True, False)
+    updated = server.read_pull_requests((pr,))[0]
+    assert (updated.title, updated.body) == ("Desired title", "Desired body")
+
+
+def test_apply_does_not_update_metadata_after_published_head_is_superseded(
+    monkeypatch,
+) -> None:
+    observed, pr = snapshot(desired="2" * 40, live="1" * 40, parent="1" * 40)
+    stale = dataclasses.replace(
+        observed,
+        pull_requests=(dataclasses.replace(observed.pull_requests[0], title="Stale"),),
+    )
+    plan = sync.plan_sync(stale, sync.derive_desired(stale, selection(stale, pr)))
+    assert isinstance(plan, sync.Apply)
+    superseded = final_snapshot(stale, plan)
+    superseded = dataclasses.replace(
+        superseded,
+        pull_requests=(
+            dataclasses.replace(
+                superseded.pull_requests[0], head_oid="3" * 40
+            ),
+        ),
+        live_refs=tuple(
+            dataclasses.replace(ref, commit_id="3" * 40)
+            if ref.ref.full_name == "refs/heads/topic"
+            else ref
+            for ref in superseded.live_refs
+        ),
+    )
+    observations = iter((stale, superseded))
+    monkeypatch.setattr(sync, "repository_lock", lambda *_args: nullcontext())
+    monkeypatch.setattr(sync, "reobserve_for_apply", lambda *_args: next(observations))
+    monkeypatch.setattr(
+        sync,
+        "push_exact_head_update",
+        lambda *_args: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    server, client = github_for(stale)
+
+    result = sync.apply(plan, "/unused", client)
+
+    assert isinstance(result, sync.Stopped)
+    assert result.stage == "pre-metadata-verify"
+    unchanged = server.read_pull_requests((pr,))[0]
+    assert (unchanged.title, unchanged.body) == (
+        stale.pull_requests[0].title,
+        stale.pull_requests[0].body,
+    )
+
+
+def test_apply_lock_contention_raises_lock_busy(jj_repo: Path, monkeypatch) -> None:
+    _observed, plan = standalone_plan(desired="1" * 40, live="1" * 40, parent="0" * 40)
+    monkeypatch.setattr(
+        sync,
+        "reobserve_for_apply",
+        lambda *_args: pytest.fail("contended apply performed observation"),
+    )
+
+    with sync.repository_lock(jj_repo):
+        with pytest.raises(sync.LockBusy):
+            server = FakeGitHubServer()
+            sync.apply(plan, jj_repo, FakeGitHubClient(server))
+
+
+@pytest.mark.parametrize(
+    ("observed_head", "expected_stage", "published"),
+    (
+        ("2" * 40, None, True),
+        ("1" * 40, "push", False),
+        ("9" * 40, "push", False),
+    ),
+)
+def test_apply_classifies_failed_push_from_authoritative_head(
+    observed_head: str, expected_stage: str | None, published: bool, monkeypatch
+) -> None:
+    observed, plan = standalone_plan(desired="2" * 40, live="1" * 40, parent="1" * 40)
+    assert isinstance(plan, sync.Apply)
+    final = final_snapshot(observed, plan)
+    observations = iter((observed, final))
+    monkeypatch.setattr(sync, "repository_lock", lambda *_args: nullcontext())
+    monkeypatch.setattr(sync, "reobserve_for_apply", lambda *_args: next(observations))
+    monkeypatch.setattr(
+        sync,
+        "push_exact_head_update",
+        lambda *_args: subprocess.CompletedProcess([], 1, "", "lost response"),
+    )
+    monkeypatch.setattr(
+        sync,
+        "observe_live_refs",
+        lambda *_args, **_kwargs: (
+            sync.LiveRemoteRef(plan.head_updates[0].ref, observed_head),
+        ),
+    )
+    monkeypatch.setattr(sync, "record_last_published_head", lambda *_args: "oid")
+
+    _server, client = github_for(observed)
+    result = sync.apply(plan, "/unused", client)
+
+    if expected_stage is None:
+        assert result == sync.Verified(published, False, True)
+    else:
+        assert isinstance(result, sync.Stopped)
+        assert result.stage == expected_stage
+
+
+def test_verified_publication_reports_receipt_failure_honestly(monkeypatch) -> None:
+    observed, plan = standalone_plan(desired="2" * 40, live="1" * 40, parent="1" * 40)
+    assert isinstance(plan, sync.Apply)
+    observations = iter((observed, final_snapshot(observed, plan)))
+    monkeypatch.setattr(sync, "repository_lock", lambda *_args: nullcontext())
+    monkeypatch.setattr(sync, "reobserve_for_apply", lambda *_args: next(observations))
+    monkeypatch.setattr(
+        sync,
+        "push_exact_head_update",
+        lambda *_args: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    monkeypatch.setattr(
+        sync,
+        "record_last_published_head",
+        lambda *_args: (_ for _ in ()).throw(sync.ConcurrentUpdate("stale state")),
+    )
+
+    _server, client = github_for(observed)
+    result = sync.apply(plan, "/unused", client)
+
+    assert isinstance(result, sync.Stopped)
+    assert result.stage == "receipt"
+    assert result.head_published
+    assert result.final_state_verified
+    assert not result.authority_persisted
+
+
+def test_exact_head_push_uses_original_lease_and_has_no_fallback(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "source"
+    remote = tmp_path / "remote.git"
+    run("git", "init", source)
+    run("git", "init", "--bare", remote)
+    run("git", "-C", source, "config", "user.name", "Test")
+    run("git", "-C", source, "config", "user.email", "test@example.com")
+    (source / "file").write_text("old\n")
+    run("git", "-C", source, "add", "file")
+    run("git", "-C", source, "commit", "-m", "old")
+    old = run("git", "-C", source, "rev-parse", "HEAD")
+    run("git", "-C", source, "push", remote, "HEAD:refs/heads/topic")
+    (source / "file").write_text("new\n")
+    run("git", "-C", source, "commit", "-am", "new")
+    new = run("git", "-C", source, "rev-parse", "HEAD")
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    update = sync.PlannedHeadUpdate(
+        sync.RemoteBranchRef(repository, "refs/heads/topic"),
+        old,
+        new,
+        sync.FastForward(),
+    )
+    monkeypatch.setattr(sync, "git_common_dir", lambda *_args: source / ".git")
+
+    success = sync.push_exact_head_update(source, update, os.fspath(remote))
+    (source / "file").write_text("foreign\n")
+    run("git", "-C", source, "commit", "-am", "foreign")
+    run("git", "-C", source, "push", remote, "HEAD:refs/heads/topic")
+    foreign = run("git", "-C", source, "rev-parse", "HEAD")
+    stale = sync.push_exact_head_update(source, update, os.fspath(remote))
+
+    assert success.returncode == 0
+    assert stale.returncode != 0
+    assert run("git", f"--git-dir={remote}", "rev-parse", "refs/heads/topic") == foreign
+
+
+def test_record_last_published_head_replaces_only_matching_authority(
+    jj_repo: Path,
+) -> None:
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    pr = sync.PullRequestId(repository, 7)
+    other = sync.PullRequestId(repository, 8)
+    ref = sync.RemoteBranchRef(repository, "refs/heads/topic")
+    other_ref = sync.RemoteBranchRef(repository, "refs/heads/other")
+    initial = sync.TrackedState(
+        (),
+        (
+            sync.LastPublishedHead(pr, ref, "1" * 40),
+            sync.LastPublishedHead(other, other_ref, "8" * 40),
+        ),
+    )
+    oid = sync.cas_write_state(jj_repo, None, initial)
+    publication = sync.LastPublishedHead(pr, ref, "2" * 40)
+
+    new_oid = sync.record_last_published_head(jj_repo, oid, initial, publication)
+
+    assert sync.read_state(jj_repo) == (
+        new_oid,
+        sync.TrackedState(
+            (),
+            (sync.LastPublishedHead(other, other_ref, "8" * 40), publication),
+        ),
+    )
 
 
 def test_observations_are_deeply_immutable() -> None:
