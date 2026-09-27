@@ -1,6 +1,6 @@
-"""Read-only observation and pure planning foundation for ``jj stack sync``.
+"""Observation, planning, and existing-stack synchronization for ``jj stack sync``.
 
-This module intentionally has no command-line entry point and no remote mutation.
+This module intentionally has no command-line entry point or topology mutation.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from urllib.parse import urlparse
 from markdown_it import MarkdownIt
 from markdown_it.rules_inline.newline import newline as _parse_newline
 from markdown_it.rules_inline.state_inline import StateInline
-
 
 STATE_REF = "refs/jj-stack/state"
 OPERATION_REF = "refs/jj-stack/operation"
@@ -487,6 +486,7 @@ class Apply:
     desired: DesiredStack
     head_updates: tuple[PlannedHeadUpdate, ...]
     metadata_updates: tuple[PRMetadataUpdate, ...]
+    tracking_update: TrackedStack | None
     dependencies: Dependencies
 
 
@@ -498,6 +498,7 @@ class Verified:
     head_published: bool
     metadata_updated: bool
     authority_persisted: bool
+    tracking_persisted: bool = False
 
 
 @dataclass(frozen=True)
@@ -508,6 +509,7 @@ class Stopped:
     metadata_updated: bool = False
     final_state_verified: bool = False
     authority_persisted: bool = False
+    tracking_persisted: bool = False
 
 
 ApplyResult = Verified | Stopped
@@ -2090,6 +2092,34 @@ def _metadata_updates(
     return (PRMetadataUpdate(pr.identity, wanted.title, wanted.body),)
 
 
+def _tracking_update(snapshot: Snapshot) -> TrackedStack | Blocked | None:
+    ordered_prs = (
+        (snapshot.membership.pr,)
+        if isinstance(snapshot.membership, StandalonePullRequest)
+        else snapshot.membership.ordered_prs
+    )
+    base_branch = (
+        snapshot.pull_requests[0].base_branch
+        if isinstance(snapshot.membership, StandalonePullRequest)
+        else snapshot.membership.base_branch
+    )
+    candidate = TrackedStack(snapshot.repository, base_branch, ordered_prs)
+    if candidate in snapshot.tool_state.state.stacks:
+        return None
+    members = set(ordered_prs)
+    if any(
+        stack.repository == snapshot.repository
+        and members.intersection(stack.ordered_prs)
+        for stack in snapshot.tool_state.state.stacks
+    ):
+        return _block(
+            "tracked-topology-changed",
+            "stack",
+            "observed membership overlaps a different tracked stack",
+        )
+    return candidate
+
+
 def plan_sync(
     snapshot: Snapshot,
     desired: DesiredStack | Blocked,
@@ -2113,8 +2143,11 @@ def plan_sync(
         planned_metadata.extend(_metadata_updates(pr, wanted))
     head_updates = tuple(planned_heads)
     metadata = tuple(planned_metadata)
+    tracking = _tracking_update(snapshot)
+    if isinstance(tracking, Blocked):
+        return tracking
     dependencies = _dependencies(snapshot, snapshot.pull_requests, all_heads, all_bases)
-    if not head_updates and not metadata:
+    if not head_updates and not metadata and tracking is None:
         return NoOp(desired, dependencies)
     for pr in prs:
         if pr.auto_merge_enabled or pr.in_merge_queue:
@@ -2127,6 +2160,7 @@ def plan_sync(
         desired,
         head_updates,
         metadata,
+        tracking,
         dependencies,
     )
 
@@ -2148,95 +2182,97 @@ def render(plan: SyncPlan) -> str:
             f"update metadata for PR {item.pr_identity.node_id}"
             for item in plan.metadata_updates
         ),
+        *(
+            ("record verified stack membership",)
+            if plan.tracking_update is not None
+            else ()
+        ),
     ]
     return "apply:\n" + "\n".join(f"  - {item}" for item in consequences)
 
 
-def _standalone_apply_shape(plan: SyncPlan) -> Stopped | None:
+def _apply_shape(plan: SyncPlan) -> Stopped | None:
     if isinstance(plan, Blocked):
         return Stopped("plan", "a blocked plan cannot be applied")
-    if (
-        len(plan.desired.active) != 1
-        or len(plan.dependencies.prs) != 1
-        or not isinstance(plan.dependencies.membership, StandalonePullRequest)
-        or plan.dependencies.membership.pr != plan.desired.active[0].pr_identity
-        or plan.dependencies.prs[0].identity != plan.desired.active[0].pr_identity
-        or plan.dependencies.prs[0].state is not PullRequestState.OPEN
+    membership = plan.dependencies.membership
+    ordered_members = (
+        (membership.pr,)
+        if isinstance(membership, StandalonePullRequest)
+        else membership.ordered_prs
+    )
+    if tuple(pr.identity for pr in plan.dependencies.prs) != ordered_members:
+        return Stopped("shape", "plan does not contain complete ordered membership")
+    active = tuple(
+        pr for pr in plan.dependencies.prs if pr.state is PullRequestState.OPEN
+    )
+    if tuple(pr.identity for pr in active) != tuple(
+        wanted.pr_identity for wanted in plan.desired.active
     ):
-        return Stopped(
-            "shape",
-            "apply currently requires exactly one open standalone pull request",
-        )
+        return Stopped("shape", "plan does not cover every open pull request")
     if isinstance(plan, Apply):
-        if (
-            len(plan.head_updates) > 1
-            or len(plan.metadata_updates) > 1
-            or any(
-                update.pr_identity != plan.desired.active[0].pr_identity
-                for update in plan.metadata_updates
-            )
-        ):
-            return Stopped("shape", "plan contains unsupported multi-PR effects")
-        expected_ref = RemoteBranchRef(
-            plan.desired.repository,
-            f"refs/heads/{plan.dependencies.prs[0].head_branch}",
-        )
-        if any(update.ref != expected_ref for update in plan.head_updates):
+        expected_refs = {
+            RemoteBranchRef(plan.desired.repository, f"refs/heads/{pr.head_branch}")
+            for pr in active
+        }
+        if len({update.ref for update in plan.head_updates}) != len(
+            plan.head_updates
+        ) or any(update.ref not in expected_refs for update in plan.head_updates):
             return Stopped("shape", "plan changes an unexpected head branch")
+        active_ids = {pr.identity for pr in active}
+        if len({update.pr_identity for update in plan.metadata_updates}) != len(
+            plan.metadata_updates
+        ) or any(
+            update.pr_identity not in active_ids for update in plan.metadata_updates
+        ):
+            return Stopped("shape", "plan changes unexpected pull request metadata")
+        if plan.tracking_update is not None:
+            expected_tracking = TrackedStack(
+                plan.desired.repository,
+                plan.desired.base_branch,
+                ordered_members,
+            )
+            if plan.tracking_update != expected_tracking:
+                return Stopped("shape", "plan records unexpected tracked membership")
     return None
 
 
 def _apply_revision(plan: NoOp | Apply) -> str:
-    desired = plan.desired.active[0].desired_commit_id
-    base = plan.dependencies.live_bases[0].commit_id
+    desired = plan.desired.active[-1].desired_commit_id
+    merged = tuple(
+        pr for pr in plan.dependencies.prs if pr.state is PullRequestState.MERGED
+    )
+    base = merged[-1].reported_head_commit_id if merged else None
+    if base is None:
+        base_ref = RemoteBranchRef(
+            plan.desired.repository, f"refs/heads/{plan.desired.base_branch}"
+        )
+        matches = tuple(
+            item for item in plan.dependencies.live_bases if item.ref == base_ref
+        )
+        if len(matches) == 1:
+            base = matches[0].commit_id
     if base is None:
         raise Error("planned base ref is absent")
     return f"{base}::{desired}"
 
 
 def reobserve_for_apply(workspace: str | Path, plan: NoOp | Apply) -> Snapshot:
-    """Reobserve only the frozen standalone plan's publication dependencies."""
+    """Reobserve only the frozen existing-stack plan's publication dependencies."""
     config_keys = tuple(key for key, _value in plan.dependencies.effective_config)
-    local = observe_local(
+    selected = (
+        plan.dependencies.membership.pr
+        if isinstance(plan.dependencies.membership, StandalonePullRequest)
+        else plan.dependencies.membership.selected_pr
+    )
+    selected_prs = tuple(pr for pr in plan.dependencies.prs if pr.identity == selected)
+    if len(selected_prs) != 1:
+        raise SourceMismatch("selected pull request is not unique in frozen membership")
+    return observe_snapshot(
         workspace,
         revision=_apply_revision(plan),
         config_keys=config_keys,
-    )
-    push_url = resolve_push_url(local, plan.dependencies.remote)
-    repository = observe_github_repository(push_url, cwd=workspace)
-    planned_pr = plan.dependencies.prs[0]
-    source = observe_github_pull_request(repository, planned_pr.number, cwd=workspace)
-    if source.stack_id is None:
-        if source.stack_base_branch is not None:
-            raise SourceMismatch("standalone pull request reported a stack base")
-        membership: PullRequestMembership = StandalonePullRequest(source.pr.identity)
-    else:
-        if source.stack_base_branch is None:
-            raise IncompleteSource("stack base branch is unavailable")
-        stack = observe_github_stack(repository, source.stack_id, cwd=workspace)
-        membership = ServerStackMembership(
-            source.pr.identity,
-            stack.stack_id,
-            stack.base_branch,
-            tuple(pr.identity for pr in stack.ordered_prs),
-        )
-    ref_names = tuple(
-        dict.fromkeys(
-            (
-                *(ref.ref.full_name for ref in plan.dependencies.live_heads),
-                *(ref.ref.full_name for ref in plan.dependencies.live_bases),
-            )
-        )
-    )
-    return Snapshot(
-        repository.identity,
-        push_url,
-        plan.dependencies.remote,
-        local,
-        observe_tool_state(workspace),
-        (source.pr,),
-        membership,
-        observe_live_refs(push_url, repository.identity, ref_names, cwd=workspace),
+        remote=plan.dependencies.remote,
+        selected_pr_number=selected_prs[0].number,
     )
 
 
@@ -2256,6 +2292,10 @@ def _pr_without_metadata(pr: GitHubPullRequest) -> tuple[object, ...]:
     )
 
 
+def _dependency_live_refs(dependencies: Dependencies) -> tuple[LiveRemoteRef, ...]:
+    return tuple(dict.fromkeys(dependencies.live_heads + dependencies.live_bases))
+
+
 def validate_frozen_dependencies(plan: NoOp | Apply, fresh: Snapshot) -> Blocked | None:
     dependencies = plan.dependencies
     if fresh.repository != plan.desired.repository:
@@ -2270,25 +2310,29 @@ def validate_frozen_dependencies(plan: NoOp | Apply, fresh: Snapshot) -> Blocked
         return _block("operation-changed", OPERATION_REF, "operation fence changed")
     if fresh.membership != dependencies.membership:
         return _block("membership-changed", "stack", "pull request membership changed")
-    if fresh.live_refs != dependencies.live_heads + dependencies.live_bases:
+    if fresh.live_refs != _dependency_live_refs(dependencies):
         return _block("refs-changed", "destination", "live head or base refs changed")
-    if len(fresh.pull_requests) != 1:
+    if len(fresh.pull_requests) != len(dependencies.prs):
         return _block("pr-changed", "pull-request", "pull request observation changed")
-    old_pr, new_pr = dependencies.prs[0], fresh.pull_requests[0]
-    if _pr_without_metadata(new_pr) != _pr_without_metadata(old_pr):
-        return _block(
-            "pr-changed", old_pr.identity.node_id, "pull request state changed"
-        )
-    metadata_planned = isinstance(plan, Apply) and bool(plan.metadata_updates)
-    if not metadata_planned and (new_pr.title, new_pr.body) != (
-        old_pr.title,
-        old_pr.body,
-    ):
-        return _block(
-            "metadata-changed",
-            old_pr.identity.node_id,
-            "unplanned pull request metadata changed",
-        )
+    metadata_planned = (
+        {update.pr_identity for update in plan.metadata_updates}
+        if isinstance(plan, Apply)
+        else set()
+    )
+    for old_pr, new_pr in zip(dependencies.prs, fresh.pull_requests, strict=True):
+        if _pr_without_metadata(new_pr) != _pr_without_metadata(old_pr):
+            return _block(
+                "pr-changed", old_pr.identity.node_id, "pull request state changed"
+            )
+        if old_pr.identity not in metadata_planned and (
+            new_pr.title,
+            new_pr.body,
+        ) != (old_pr.title, old_pr.body):
+            return _block(
+                "metadata-changed",
+                old_pr.identity.node_id,
+                "unplanned pull request metadata changed",
+            )
     active = _validate_plan_scope(fresh, plan.desired)
     if isinstance(active, Blocked):
         return active
@@ -2298,9 +2342,13 @@ def validate_frozen_dependencies(plan: NoOp | Apply, fresh: Snapshot) -> Blocked
     return None
 
 
-def push_exact_head_update(
-    workspace: str | Path, update: PlannedHeadUpdate, push_url: str
+def push_exact_head_updates(
+    workspace: str | Path,
+    updates: Sequence[PlannedHeadUpdate],
+    push_url: str,
 ) -> subprocess.CompletedProcess[str]:
+    if not updates:
+        raise ValueError("atomic publication requires at least one head update")
     common = git_common_dir(workspace)
     return subprocess.run(
         [
@@ -2310,9 +2358,12 @@ def push_exact_head_update(
             "--atomic",
             "--no-follow-tags",
             "--recurse-submodules=no",
-            f"--force-with-lease={update.ref.full_name}:{update.expected_old_commit_id}",
+            *(
+                f"--force-with-lease={update.ref.full_name}:{update.expected_old_commit_id}"
+                for update in updates
+            ),
             push_url,
-            f"{update.new_commit_id}:{update.ref.full_name}",
+            *(f"{update.new_commit_id}:{update.ref.full_name}" for update in updates),
         ],
         text=True,
         capture_output=True,
@@ -2367,39 +2418,55 @@ def update_frozen_pr_metadata(workspace: str | Path, update: PRMetadataUpdate) -
         raise SourceMismatch("GitHub updated a different pull request")
 
 
-def _expected_final_pr(plan: NoOp | Apply) -> GitHubPullRequest:
-    pr = plan.dependencies.prs[0]
-    wanted = plan.desired.active[0]
-    return GitHubPullRequest(
-        pr.identity,
-        pr.number,
-        pr.state,
-        pr.draft,
-        pr.head_repository,
-        pr.head_branch,
-        wanted.desired_commit_id,
-        pr.base_branch,
-        pr.reported_base_commit_id,
-        pr.auto_merge_enabled,
-        pr.in_merge_queue,
-        wanted.title,
-        wanted.body,
-    )
+def _expected_final_prs(plan: NoOp | Apply) -> tuple[GitHubPullRequest, ...]:
+    desired = {item.pr_identity: item for item in plan.desired.active}
+    final_refs = {
+        item.ref.full_name: item.commit_id
+        for item in _dependency_live_refs(plan.dependencies)
+    }
+    for pr in plan.dependencies.prs:
+        wanted = desired.get(pr.identity)
+        if wanted is not None:
+            final_refs[f"refs/heads/{pr.head_branch}"] = wanted.desired_commit_id
+    expected = []
+    for pr in plan.dependencies.prs:
+        wanted = desired.get(pr.identity)
+        expected.append(
+            replace(
+                pr,
+                reported_head_commit_id=(
+                    wanted.desired_commit_id
+                    if wanted is not None
+                    else pr.reported_head_commit_id
+                ),
+                reported_base_commit_id=final_refs[f"refs/heads/{pr.base_branch}"],
+                title=wanted.title if wanted is not None else pr.title,
+                body=wanted.body if wanted is not None else pr.body,
+            )
+        )
+    return tuple(expected)
 
 
-def verify_final_one_pr_state(
+def verify_final_state(
     workspace: str | Path, plan: NoOp | Apply
 ) -> tuple[Snapshot | None, Stopped | None]:
     try:
         fresh = reobserve_for_apply(workspace, plan)
     except Error as exc:
         return None, Stopped("verify", str(exc))
-    expected_pr = _expected_final_pr(plan)
-    expected_head = LiveRemoteRef(
-        RemoteBranchRef(
-            plan.desired.repository, f"refs/heads/{expected_pr.head_branch}"
-        ),
-        plan.desired.active[0].desired_commit_id,
+    expected_prs = _expected_final_prs(plan)
+    desired_heads = {
+        RemoteBranchRef(plan.desired.repository, f"refs/heads/{pr.head_branch}"): (
+            pr.reported_head_commit_id
+        )
+        for pr in expected_prs
+    }
+    expected_refs = tuple(
+        replace(
+            observed,
+            commit_id=desired_heads.get(observed.ref, observed.commit_id),
+        )
+        for observed in _dependency_live_refs(plan.dependencies)
     )
     if (
         fresh.repository != plan.desired.repository
@@ -2408,8 +2475,8 @@ def verify_final_one_pr_state(
         or fresh.tool_state.state_blob_oid != plan.dependencies.state_blob_oid
         or fresh.tool_state.operation_blob_oid != plan.dependencies.operation_blob_oid
         or fresh.membership != plan.dependencies.membership
-        or fresh.pull_requests != (expected_pr,)
-        or fresh.live_refs != (expected_head,) + plan.dependencies.live_bases
+        or fresh.pull_requests != expected_prs
+        or fresh.live_refs != expected_refs
     ):
         return fresh, Stopped(
             "verify", "authoritative final state does not match the frozen plan"
@@ -2417,27 +2484,30 @@ def verify_final_one_pr_state(
     return fresh, None
 
 
-def record_last_published_head(
+def record_verified_state(
     workspace: str | Path,
     expected_state_oid: str | None,
     state: TrackedState,
-    publication: LastPublishedHead,
+    tracking_update: TrackedStack | None,
+    publications: Sequence[LastPublishedHead],
 ) -> str:
+    publication_keys = {(item.pr, item.ref) for item in publications}
     retained = tuple(
         item
         for item in state.last_published_heads
-        if not (item.pr == publication.pr and item.ref == publication.ref)
+        if (item.pr, item.ref) not in publication_keys
     )
+    stacks = state.stacks + ((tracking_update,) if tracking_update is not None else ())
     return cas_write_state(
         workspace,
         expected_state_oid,
-        TrackedState(state.stacks, retained + (publication,)),
+        TrackedState(stacks, retained + tuple(publications)),
     )
 
 
 def apply(plan: SyncPlan, workspace: str | Path) -> ApplyResult:
-    """Execute one frozen existing-head plan without replanning or lease refresh."""
-    unsupported = _standalone_apply_shape(plan)
+    """Execute one frozen existing-stack plan without replanning or lease refresh."""
+    unsupported = _apply_shape(plan)
     if unsupported is not None:
         return unsupported
     assert isinstance(plan, NoOp | Apply)
@@ -2451,15 +2521,15 @@ def apply(plan: SyncPlan, workspace: str | Path) -> ApplyResult:
             reason = drift.reasons[0]
             return Stopped("revalidate", f"{reason.code}: {reason.detail}")
         if isinstance(plan, NoOp):
-            _fresh, stopped = verify_final_one_pr_state(workspace, plan)
+            _fresh, stopped = verify_final_state(workspace, plan)
             return stopped or Verified(False, False, False)
 
         head_published = False
         metadata_updated = False
+        metadata_error = False
         if plan.head_updates:
-            update = plan.head_updates[0]
-            response = push_exact_head_update(
-                workspace, update, plan.dependencies.push_url
+            response = push_exact_head_updates(
+                workspace, plan.head_updates, plan.dependencies.push_url
             )
             if response.returncode == 0:
                 head_published = True
@@ -2468,17 +2538,31 @@ def apply(plan: SyncPlan, workspace: str | Path) -> ApplyResult:
                     observed = observe_live_refs(
                         plan.dependencies.push_url,
                         plan.desired.repository,
-                        (update.ref.full_name,),
+                        tuple(update.ref.full_name for update in plan.head_updates),
                         cwd=workspace,
-                    )[0].commit_id
+                    )
                 except Error as exc:
                     return Stopped("push", f"push result is unknown: {exc}")
-                if observed == update.new_commit_id:
+                actual = tuple(item.commit_id for item in observed)
+                wanted = tuple(item.new_commit_id for item in plan.head_updates)
+                previous = tuple(
+                    item.expected_old_commit_id for item in plan.head_updates
+                )
+                if actual == wanted:
                     head_published = True
-                elif observed == update.expected_old_commit_id:
+                elif actual == previous:
                     return Stopped("push", "push was not observed at the destination")
                 else:
-                    return Stopped("push", "destination head has an unexpected value")
+                    return Stopped(
+                        "push",
+                        "destination heads have unexpected or partial values",
+                        head_published=any(
+                            actual_commit == update.new_commit_id
+                            for actual_commit, update in zip(
+                                actual, plan.head_updates, strict=True
+                            )
+                        ),
+                    )
         if plan.head_updates and plan.metadata_updates:
             try:
                 published = reobserve_for_apply(workspace, plan)
@@ -2508,16 +2592,21 @@ def apply(plan: SyncPlan, workspace: str | Path) -> ApplyResult:
                     "a published head was superseded before metadata update",
                     head_published=head_published,
                 )
-        if plan.metadata_updates:
+        for update in plan.metadata_updates:
             try:
-                update_frozen_pr_metadata(workspace, plan.metadata_updates[0])
+                update_frozen_pr_metadata(workspace, update)
                 metadata_updated = True
             except Error:
                 # A lost API response is resolved by the same authoritative final read.
-                pass
+                metadata_error = True
 
-        final, stopped = verify_final_one_pr_state(workspace, plan)
+        final, stopped = verify_final_state(workspace, plan)
         if stopped is not None:
+            if plan.metadata_updates and (metadata_updated or metadata_error):
+                stopped = replace(
+                    stopped,
+                    detail=stopped.detail + "; metadata updates may be incomplete",
+                )
             return replace(
                 stopped,
                 head_published=head_published,
@@ -2526,27 +2615,39 @@ def apply(plan: SyncPlan, workspace: str | Path) -> ApplyResult:
         assert final is not None
         if plan.metadata_updates:
             metadata_updated = True
-        if not plan.head_updates:
-            return Verified(False, metadata_updated, False)
-        wanted = plan.desired.active[0]
-        publication = LastPublishedHead(
-            wanted.pr_identity,
-            plan.head_updates[0].ref,
-            wanted.desired_commit_id,
+        pr_by_ref = {
+            RemoteBranchRef(plan.desired.repository, f"refs/heads/{pr.head_branch}"): pr
+            for pr in plan.dependencies.prs
+        }
+        publications = tuple(
+            LastPublishedHead(
+                pr_by_ref[update.ref].identity,
+                update.ref,
+                update.new_commit_id,
+            )
+            for update in plan.head_updates
         )
+        if not publications and plan.tracking_update is None:
+            return Verified(False, metadata_updated, False)
         try:
-            record_last_published_head(
+            record_verified_state(
                 workspace,
                 plan.dependencies.state_blob_oid,
                 final.tool_state.state,
-                publication,
+                plan.tracking_update,
+                publications,
             )
         except Error as exc:
             return Stopped(
                 "receipt",
-                f"publication verified but authority persistence failed: {exc}",
-                head_published=True,
+                f"effects verified but state persistence failed: {exc}",
+                head_published=head_published,
                 metadata_updated=metadata_updated,
                 final_state_verified=True,
             )
-        return Verified(True, metadata_updated, True)
+        return Verified(
+            head_published,
+            metadata_updated,
+            bool(publications),
+            plan.tracking_update is not None,
+        )
