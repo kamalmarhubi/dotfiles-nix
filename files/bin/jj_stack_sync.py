@@ -238,8 +238,36 @@ class GitHubPullRequestSource:
 
 
 @dataclass(frozen=True)
+class GitHubStackSource:
+    identity: ServerStackIdentity
+    base_branch: str
+    ordered_prs: tuple[GitHubPullRequest, ...]
+
+    @property
+    def stack_id(self) -> str:
+        return self.identity.node_id
+
+    @property
+    def stack_number(self) -> int:
+        return self.identity.number
+
+
+@dataclass(frozen=True)
 class StandalonePullRequest:
     pr: PullRequestId
+
+
+@dataclass(frozen=True)
+class ServerStackIdentity:
+    repository: GitHubRepositoryId
+    node_id: str
+    number: int
+
+    def __post_init__(self) -> None:
+        if not self.repository.host or not self.repository.node_id or not self.node_id:
+            raise ValueError("server stack identity strings must be nonempty")
+        if type(self.number) is not int or self.number <= 0:
+            raise ValueError("server stack number must be a positive integer")
 
 
 @dataclass(frozen=True)
@@ -247,11 +275,12 @@ class ServerStackMembership:
     """Complete ordered membership for the stack containing selected_pr."""
 
     selected_pr: PullRequestId
-    server_stack_id: str
+    stack: ServerStackIdentity
+    base_branch: str
     ordered_prs: tuple[PullRequestId, ...]
 
     def __post_init__(self) -> None:
-        if not self.server_stack_id or not self.ordered_prs:
+        if not self.base_branch or not self.ordered_prs:
             raise ValueError("server stack identity and membership must be nonempty")
         if self.selected_pr not in self.ordered_prs:
             raise ValueError("selected PR must belong to the observed server stack")
@@ -259,6 +288,16 @@ class ServerStackMembership:
             raise ValueError("server stack membership must not contain duplicates")
         if any(pr.repository != self.selected_pr.repository for pr in self.ordered_prs):
             raise ValueError("all server stack members must belong to one repository")
+        if self.stack.repository != self.selected_pr.repository:
+            raise ValueError("server stack and members must belong to one repository")
+
+    @property
+    def server_stack_id(self) -> str:
+        return self.stack.node_id
+
+    @property
+    def server_stack_number(self) -> int:
+        return self.stack.number
 
 
 PullRequestMembership = StandalonePullRequest | ServerStackMembership
@@ -359,6 +398,25 @@ class DesiredExistingPR:
 
 
 @dataclass(frozen=True)
+class ExistingPRAssignment:
+    pr_identity: PullRequestId
+    commit_id: str
+
+
+@dataclass(frozen=True)
+class StackSelection:
+    base_branch: str
+    ordered: tuple[ExistingPRAssignment, ...]
+
+    def __post_init__(self) -> None:
+        if not self.base_branch or not self.ordered:
+            raise ValueError("stack selection must have a base and assignments")
+        identities = tuple(item.pr_identity for item in self.ordered)
+        if len(set(identities)) != len(identities):
+            raise ValueError("stack selection must not assign a PR more than once")
+
+
+@dataclass(frozen=True)
 class DesiredStack:
     repository: GitHubRepositoryId
     base_branch: str
@@ -381,13 +439,13 @@ class Blocked:
 class Dependencies:
     effective_config: tuple[tuple[str, str], ...]
     push_url: str
+    remote: str
     state_blob_oid: str | None
     operation_blob_oid: str | None
-    pr: GitHubPullRequest
+    prs: tuple[GitHubPullRequest, ...]
     membership: PullRequestMembership
-    bookmark: LocalBookmark
-    live_head: LiveRemoteRef
-    live_base: LiveRemoteRef
+    live_heads: tuple[LiveRemoteRef, ...]
+    live_bases: tuple[LiveRemoteRef, ...]
 
 
 @dataclass(frozen=True)
@@ -843,6 +901,110 @@ def observe_github_pull_request(
     return _parse_pr_source(pull_request, repository, number)
 
 
+_STACK_SOURCE_QUERY = """
+query($id: ID!) {
+  node(id: $id) {
+    ... on PullRequestStack {
+      id number baseRefName
+      entries(first: 100) {
+        nodes { position pullRequest {
+          id number state isDraft
+          headRepository { id }
+          headRefName headRefOid baseRefName baseRefOid
+          autoMergeRequest { enabledAt }
+          mergeQueueEntry { id }
+          title body
+          stack { id baseRefName }
+        } }
+        pageInfo { hasNextPage }
+      }
+    }
+  }
+}
+"""
+
+
+def observe_github_stack(
+    repository: GitHubRepository,
+    stack_id: str,
+    *,
+    cwd: str | Path | None = None,
+) -> GitHubStackSource:
+    response = _exact_record(
+        _command_json(
+            [
+                "gh",
+                "api",
+                "--hostname",
+                repository.identity.host,
+                "graphql",
+                "--input",
+                "-",
+            ],
+            cwd=cwd,
+            stdin=json.dumps(
+                {"query": _STACK_SOURCE_QUERY, "variables": {"id": stack_id}}
+            ),
+        ),
+        {"data"},
+        "GitHub stack response",
+    )
+    data = _exact_record(response["data"], {"node"}, "stack GraphQL data")
+    if data["node"] is None:
+        raise IncompleteSource("pull request stack is unavailable")
+    stack = _exact_record(
+        data["node"],
+        {"id", "number", "baseRefName", "entries"},
+        "pull request stack",
+    )
+    if _text(stack["id"], "stack ID") != stack_id:
+        raise SourceMismatch("GitHub returned a different stack")
+    stack_number = stack["number"]
+    if type(stack_number) is not int or stack_number <= 0:
+        raise MalformedSource("stack number must be a positive integer")
+    base_branch = _text(stack["baseRefName"], "stack base branch")
+    entries = _exact_record(stack["entries"], {"nodes", "pageInfo"}, "stack entries")
+    page_info = _exact_record(
+        entries["pageInfo"], {"hasNextPage"}, "stack entries page info"
+    )
+    if page_info["hasNextPage"] is not False:
+        if page_info["hasNextPage"] is True:
+            raise IncompleteSource("pull request stack has more than 100 entries")
+        raise MalformedSource("stack pagination state must be boolean")
+    nodes = entries["nodes"]
+    if not isinstance(nodes, list) or not nodes:
+        raise IncompleteSource("pull request stack has no entries")
+    positioned: list[tuple[int, GitHubPullRequest]] = []
+    for node in nodes:
+        entry = _exact_record(node, {"position", "pullRequest"}, "stack entry")
+        position = entry["position"]
+        if type(position) is not int or position <= 0:
+            raise MalformedSource("stack position must be a positive integer")
+        if entry["pullRequest"] is None:
+            raise IncompleteSource("stack entry pull request is unavailable")
+        raw_pr = _exact_record(
+            entry["pullRequest"], _PR_SOURCE_FIELDS, "stack pull request"
+        )
+        number = raw_pr["number"]
+        if type(number) is not int:
+            raise MalformedSource("pull request number must be an integer")
+        parsed = _parse_pr_source(raw_pr, repository, number)
+        if parsed.stack_id != stack_id or parsed.stack_base_branch != base_branch:
+            raise SourceMismatch("stack entry reports different membership or base")
+        positioned.append((position, parsed.pr))
+    positioned.sort(key=lambda item: item[0])
+    if [position for position, _pr in positioned] != list(
+        range(1, len(positioned) + 1)
+    ):
+        raise IncompleteSource("stack positions are incomplete or duplicated")
+    prs = tuple(pr for _position, pr in positioned)
+    if len({pr.identity for pr in prs}) != len(prs):
+        raise SourceMismatch("stack contains duplicate pull request identities")
+    return GitHubStackSource(
+        ServerStackIdentity(repository.identity, stack_id, stack_number), base_branch, prs
+    )
+
+
 def _jj(workspace: str | Path, operation: str | None, *args: str) -> str:
     command = ["jj", "--color=never", "--repository", os.fspath(workspace)]
     if operation is not None:
@@ -1179,7 +1341,7 @@ def observe_live_refs(
     return tuple(LiveRemoteRef(ref, observed.get(ref.full_name)) for ref in refs)
 
 
-def observe_standalone_snapshot(
+def observe_snapshot(
     workspace: str | Path,
     *,
     revision: str,
@@ -1187,18 +1349,50 @@ def observe_standalone_snapshot(
     remote: str,
     selected_pr_number: int,
 ) -> Snapshot:
-    """Assemble the temporary explicit singleton scope without selection policy."""
+    """Assemble complete source facts for one explicitly selected PR's stack."""
     local = observe_local(workspace, revision=revision, config_keys=config_keys)
     push_url = resolve_push_url(local, remote)
     repository = observe_github_repository(push_url, cwd=workspace)
     source = observe_github_pull_request(repository, selected_pr_number, cwd=workspace)
-    if source.stack_id is not None or source.stack_base_branch is not None:
-        raise SourceMismatch("selected pull request is not confirmed standalone")
-    pr = source.pr
+    selected_pr = source.pr
+    if source.stack_id is None:
+        if source.stack_base_branch is not None:
+            raise SourceMismatch("standalone pull request reported a stack base")
+        pull_requests = (selected_pr,)
+        membership: PullRequestMembership = StandalonePullRequest(selected_pr.identity)
+        base_branch = selected_pr.base_branch
+    else:
+        if source.stack_base_branch is None:
+            raise IncompleteSource("stack base branch is unavailable")
+        stack = observe_github_stack(repository, source.stack_id, cwd=workspace)
+        if (
+            stack.identity.repository != repository.identity
+            or stack.identity.node_id != source.stack_id
+            or stack.base_branch != source.stack_base_branch
+            or selected_pr.identity not in {pr.identity for pr in stack.ordered_prs}
+        ):
+            raise SourceMismatch("selected pull request and complete stack disagree")
+        pull_requests = stack.ordered_prs
+        membership = ServerStackMembership(
+            selected_pr.identity,
+            stack.identity,
+            stack.base_branch,
+            tuple(pr.identity for pr in pull_requests),
+        )
+        base_branch = stack.base_branch
+    ref_names = tuple(
+        dict.fromkeys(
+            (
+                *(f"refs/heads/{pr.head_branch}" for pr in pull_requests),
+                *(f"refs/heads/{pr.base_branch}" for pr in pull_requests),
+                f"refs/heads/{base_branch}",
+            )
+        )
+    )
     live_refs = observe_live_refs(
         push_url,
         repository.identity,
-        (f"refs/heads/{pr.head_branch}", f"refs/heads/{pr.base_branch}"),
+        ref_names,
         cwd=workspace,
     )
     return Snapshot(
@@ -1207,8 +1401,8 @@ def observe_standalone_snapshot(
         remote,
         local,
         observe_tool_state(workspace),
-        (pr,),
-        StandalonePullRequest(pr.identity),
+        pull_requests,
+        membership,
         live_refs,
     )
 
@@ -1476,81 +1670,142 @@ def _metadata(description: str) -> tuple[str, str] | None:
     return title, body
 
 
-def derive_desired(
-    snapshot: Snapshot, selected_pr: PullRequestId
-) -> DesiredStack | Blocked:
-    matches = tuple(pr for pr in snapshot.pull_requests if pr.identity == selected_pr)
+def _complete_selection(
+    snapshot: Snapshot,
+    assignments: Sequence[ExistingPRAssignment],
+) -> StackSelection | Blocked:
+    if isinstance(snapshot.membership, StandalonePullRequest):
+        membership = (snapshot.membership.pr,)
+        matches = tuple(
+            pr for pr in snapshot.pull_requests if pr.identity == snapshot.membership.pr
+        )
+        if len(matches) != 1:
+            return _block(
+                "incomplete-membership",
+                "stack",
+                "standalone membership was not observed exactly once",
+            )
+        base_branch = matches[0].base_branch
+    else:
+        membership = snapshot.membership.ordered_prs
+        base_branch = snapshot.membership.base_branch
+    active = tuple(
+        pr.identity
+        for pr in snapshot.pull_requests
+        if pr.state is PullRequestState.OPEN
+    )
+    if tuple(item.pr_identity for item in assignments) != active:
+        return _block(
+            "incomplete-selection",
+            "stack",
+            "assignments must exactly cover the ordered open membership",
+        )
+    if tuple(pr.identity for pr in snapshot.pull_requests) != membership:
+        return _block(
+            "incomplete-membership",
+            "stack",
+            "observed PRs do not exactly cover membership",
+        )
+    return StackSelection(base_branch, tuple(assignments))
+
+
+def select_explicit_stack(
+    snapshot: Snapshot, assignments: Sequence[ExistingPRAssignment]
+) -> StackSelection | Blocked:
+    """Resolve explicit complete intent without silently adding server members."""
+    return _complete_selection(snapshot, assignments)
+
+
+def select_tracked_stack(
+    snapshot: Snapshot, assignments: Sequence[ExistingPRAssignment]
+) -> StackSelection | Blocked:
+    """Resolve implicit intent only from one exact persisted membership."""
+    selected = _complete_selection(snapshot, assignments)
+    if isinstance(selected, Blocked):
+        return selected
+    membership = (
+        (snapshot.membership.pr,)
+        if isinstance(snapshot.membership, StandalonePullRequest)
+        else snapshot.membership.ordered_prs
+    )
+    matches = tuple(
+        stack
+        for stack in snapshot.tool_state.state.stacks
+        if stack.repository == snapshot.repository
+        and stack.base_branch == selected.base_branch
+        and stack.ordered_prs == membership
+    )
     if len(matches) != 1:
         return _block(
-            "selected-pr-unavailable",
-            selected_pr.node_id,
-            "selected PR was not observed exactly once",
+            "untracked-membership",
+            "stack",
+            "implicit selection requires one exact tracked membership",
         )
-    pr = matches[0]
-    bookmark = next(
-        (
-            item
-            for item in snapshot.local.local_bookmarks
-            if item.name == pr.head_branch
-        ),
-        None,
-    )
-    if bookmark is None or isinstance(bookmark.target, AbsentBookmarkTarget):
-        return _block(
-            "bookmark-absent", pr.head_branch, "same-named local bookmark is absent"
+    return selected
+
+
+def derive_desired(
+    snapshot: Snapshot, selection: StackSelection
+) -> DesiredStack | Blocked:
+    desired: list[DesiredExistingPR] = []
+    for assignment in selection.ordered:
+        matches = tuple(
+            pr for pr in snapshot.pull_requests if pr.identity == assignment.pr_identity
         )
-    if isinstance(bookmark.target, BookmarkConflict):
-        return _block(
-            "bookmark-conflicted",
-            pr.head_branch,
-            "same-named local bookmark is conflicted",
-        )
-    commit = next(
-        (
+        if len(matches) != 1:
+            return _block(
+                "selected-pr-unavailable",
+                assignment.pr_identity.node_id,
+                "assigned PR was not observed exactly once",
+            )
+        pr = matches[0]
+        commits = tuple(
             item
             for item in snapshot.local.commits
-            if item.commit_id == bookmark.target.commit_id
-        ),
-        None,
-    )
-    if commit is None:
-        return _block(
-            "commit-unobserved",
-            bookmark.target.commit_id,
-            "bookmark target commit was not observed",
+            if item.commit_id == assignment.commit_id
         )
-    metadata = _metadata(commit.description)
-    if metadata is None:
-        return _block(
-            "title-missing",
-            commit.commit_id,
-            "selected revision has no description title",
+        if len(commits) != 1:
+            return _block(
+                "commit-unobserved",
+                assignment.commit_id,
+                "assigned commit was not observed exactly once",
+            )
+        metadata = _metadata(commits[0].description)
+        if metadata is None:
+            return _block(
+                "title-missing",
+                commits[0].commit_id,
+                "selected revision has no description title",
+            )
+        title, body = metadata
+        desired.append(
+            DesiredExistingPR(pr.identity, commits[0].commit_id, title, body)
         )
-    title, body = metadata
     return DesiredStack(
         snapshot.repository,
-        pr.base_branch,
-        (DesiredExistingPR(pr.identity, commit.commit_id, title, body),),
+        selection.base_branch,
+        tuple(desired),
     )
 
 
 def _dependencies(
     snapshot: Snapshot,
-    pr: GitHubPullRequest,
-    bookmark: LocalBookmark,
-    head: LiveRemoteRef,
-    base: LiveRemoteRef,
+    prs: tuple[GitHubPullRequest, ...],
+    heads: tuple[LiveRemoteRef, ...],
+    bases: tuple[LiveRemoteRef, ...],
 ) -> Dependencies:
     return Dependencies(
-        snapshot.local.effective_config,
+        tuple(
+            item for item in snapshot.local.effective_config if item[0] != "git.push"
+        ),
         snapshot.push_url,
+        snapshot.remote,
         snapshot.tool_state.state_blob_oid,
         snapshot.tool_state.operation_blob_oid,
-        pr,
+        prs,
         snapshot.membership,
-        bookmark,
-        head,
-        base,
+        heads,
+        bases,
     )
 
 
@@ -1597,7 +1852,7 @@ def _comparison_is_nonempty_linear_and_conflict_free(
 
 def _validate_plan_scope(
     snapshot: Snapshot, desired: DesiredStack
-) -> GitHubPullRequest | Blocked:
+) -> tuple[GitHubPullRequest, ...] | Blocked:
     if snapshot.tool_state.operation_blob_oid is not None:
         return _block(
             "operation-fenced",
@@ -1610,113 +1865,161 @@ def _validate_plan_scope(
             desired.repository.node_id,
             "desired repository differs from the observed repository",
         )
-    if (
-        len(desired.active) != 1
-        or not isinstance(snapshot.membership, StandalonePullRequest)
-        or snapshot.membership.pr != desired.active[0].pr_identity
-    ):
+    observed = {pr.identity: pr for pr in snapshot.pull_requests}
+    if len(observed) != len(snapshot.pull_requests):
         return _block(
-            "unsupported-membership",
+            "ambiguous-membership",
             "stack",
-            "foundation planner requires one complete active member",
+            "pull request observations contain duplicate identities",
         )
-    pr = next(
-        (
-            value
-            for value in snapshot.pull_requests
-            if value.identity == desired.active[0].pr_identity
-        ),
-        None,
-    )
-    if pr is None or pr.state is not PullRequestState.OPEN:
+    if isinstance(snapshot.membership, StandalonePullRequest):
+        ordered_members = (snapshot.membership.pr,)
+        observed_base = observed.get(snapshot.membership.pr)
+        base_branch = observed_base.base_branch if observed_base is not None else None
+    else:
+        ordered_members = snapshot.membership.ordered_prs
+        base_branch = snapshot.membership.base_branch
+    if tuple(observed) != ordered_members:
         return _block(
-            "pr-not-open",
-            desired.active[0].pr_identity.node_id,
-            "selected PR is not open",
+            "incomplete-membership",
+            "stack",
+            "observed PRs do not exactly match complete ordered membership",
         )
-    if (
-        pr.identity.repository != snapshot.repository
-        or pr.head_repository != snapshot.repository
-    ):
-        return _block(
-            "nonlocal-pr",
-            pr.identity.node_id,
-            "foundation planner requires a repository-local PR",
-        )
-    if desired.base_branch != pr.base_branch:
+    if desired.base_branch != base_branch:
         return _block(
             "target-mismatch",
             desired.base_branch,
-            "desired target differs from the observed PR base branch",
+            "desired target differs from the observed stack base branch",
         )
-    return pr
+    seen_open = False
+    for pr in snapshot.pull_requests:
+        if (
+            pr.identity.repository != snapshot.repository
+            or pr.head_repository != snapshot.repository
+        ):
+            return _block(
+                "nonlocal-pr",
+                pr.identity.node_id,
+                "planner requires repository-local PRs",
+            )
+        if pr.state is PullRequestState.OPEN:
+            seen_open = True
+        elif pr.state is PullRequestState.CLOSED or seen_open:
+            return _block(
+                "unsupported-member-state",
+                pr.identity.node_id,
+                "membership must be a merged prefix followed by open PRs",
+            )
+    active = tuple(
+        pr for pr in snapshot.pull_requests if pr.state is PullRequestState.OPEN
+    )
+    if tuple(item.pr_identity for item in desired.active) != tuple(
+        pr.identity for pr in active
+    ):
+        return _block(
+            "incomplete-selection",
+            "stack",
+            "desired assignments must exactly cover the ordered open membership",
+        )
+    return active
 
 
 def _validate_pr_dependencies(
-    snapshot: Snapshot, desired: DesiredStack, pr: GitHubPullRequest
-) -> tuple[DesiredExistingPR, LocalBookmark, LiveRemoteRef, LiveRemoteRef] | Blocked:
-    head_name = f"refs/heads/{pr.head_branch}"
-    base_name = f"refs/heads/{pr.base_branch}"
-    head_ref = RemoteBranchRef(snapshot.repository, head_name)
+    snapshot: Snapshot,
+    desired: DesiredStack,
+    prs: tuple[GitHubPullRequest, ...],
+) -> (
+    tuple[
+        tuple[LiveRemoteRef, ...],
+        tuple[LiveRemoteRef, ...],
+        tuple[LiveRemoteRef, ...],
+    ]
+    | Blocked
+):
+    base_name = f"refs/heads/{desired.base_branch}"
     base_ref = RemoteBranchRef(snapshot.repository, base_name)
-    heads = tuple(value for value in snapshot.live_refs if value.ref == head_ref)
     bases = tuple(value for value in snapshot.live_refs if value.ref == base_ref)
-    if len(heads) != 1 or heads[0].commit_id != pr.reported_head_commit_id:
-        return _block(
-            "head-disagrees",
-            head_name,
-            "GitHub PR head and authoritative live ref disagree",
-        )
-    if len(bases) != 1 or bases[0].commit_id != pr.reported_base_commit_id:
+    if len(bases) != 1 or bases[0].commit_id is None:
         return _block(
             "base-disagrees",
             base_name,
-            "GitHub PR base and authoritative live ref disagree",
+            "authoritative stack base ref is absent or ambiguous",
         )
-    wanted = desired.active[0]
-    bookmarks = tuple(
-        value
-        for value in snapshot.local.local_bookmarks
-        if value.name == pr.head_branch
+    all_heads: list[LiveRemoteRef] = []
+    all_bases: list[LiveRemoteRef] = []
+    heads_by_pr: dict[PullRequestId, LiveRemoteRef] = {}
+    previous_pr: GitHubPullRequest | None = None
+    for pr in snapshot.pull_requests:
+        head_name = f"refs/heads/{pr.head_branch}"
+        head_ref = RemoteBranchRef(snapshot.repository, head_name)
+        heads = tuple(value for value in snapshot.live_refs if value.ref == head_ref)
+        if len(heads) != 1 or heads[0].commit_id != pr.reported_head_commit_id:
+            return _block(
+                "head-disagrees",
+                head_name,
+                "GitHub PR head and authoritative live ref disagree",
+            )
+        expected_base_branch = (
+            previous_pr.head_branch if previous_pr is not None else desired.base_branch
+        )
+        if pr.base_branch != expected_base_branch:
+            return _block(
+                "topology-changed",
+                pr.identity.node_id,
+                "PR literal base does not match unchanged stack order",
+            )
+        pr_base_name = f"refs/heads/{pr.base_branch}"
+        pr_base_ref = RemoteBranchRef(snapshot.repository, pr_base_name)
+        pr_bases = tuple(
+            value for value in snapshot.live_refs if value.ref == pr_base_ref
+        )
+        if len(pr_bases) != 1 or pr_bases[0].commit_id != pr.reported_base_commit_id:
+            return _block(
+                "base-disagrees",
+                pr_base_name,
+                "GitHub PR base and authoritative live ref disagree",
+            )
+        all_heads.append(heads[0])
+        if pr_bases[0] not in all_bases:
+            all_bases.append(pr_bases[0])
+        heads_by_pr[pr.identity] = heads[0]
+        previous_pr = pr
+    merged = tuple(
+        pr for pr in snapshot.pull_requests if pr.state is PullRequestState.MERGED
     )
-    if len(bookmarks) != 1 or not isinstance(bookmarks[0].target, CommitTarget):
-        return _block(
-            "bookmark-changed",
-            pr.head_branch,
-            "planned local bookmark is absent, duplicated, or conflicted",
-        )
-    if bookmarks[0].target.commit_id != wanted.desired_commit_id:
-        return _block(
-            "bookmark-changed",
-            pr.head_branch,
-            "planned local bookmark target differs from desired state",
-        )
-    commit = next(
-        (
+    comparison_base = (
+        merged[-1].reported_head_commit_id if merged else bases[0].commit_id
+    )
+    active_heads: list[LiveRemoteRef] = []
+    for pr, wanted in zip(prs, desired.active, strict=True):
+        commits = tuple(
             value
             for value in snapshot.local.commits
             if value.commit_id == wanted.desired_commit_id
-        ),
-        None,
+        )
+        if len(commits) != 1 or commits[0].has_conflicts:
+            return _block(
+                "commit-conflicted",
+                wanted.desired_commit_id,
+                "desired commit is absent, duplicated, or conflicted",
+            )
+        if not _comparison_is_nonempty_linear_and_conflict_free(
+            snapshot.local.commits,
+            comparison_base,
+            wanted.desired_commit_id,
+        ):
+            return _block(
+                "invalid-comparison",
+                wanted.desired_commit_id,
+                "desired predecessor-to-head segment is empty, nonlinear, incomplete, or conflicted",
+            )
+        active_heads.append(heads_by_pr[pr.identity])
+        comparison_base = wanted.desired_commit_id
+    return (
+        tuple(active_heads),
+        tuple(all_heads),
+        tuple(all_bases),
     )
-    if commit is None or commit.has_conflicts:
-        return _block(
-            "commit-conflicted",
-            wanted.desired_commit_id,
-            "desired commit is absent or conflicted",
-        )
-    assert bases[0].commit_id is not None
-    if not _comparison_is_nonempty_linear_and_conflict_free(
-        snapshot.local.commits,
-        bases[0].commit_id,
-        wanted.desired_commit_id,
-    ):
-        return _block(
-            "invalid-comparison",
-            wanted.desired_commit_id,
-            "selected base-to-head comparison is empty, nonlinear, incomplete, or conflicted",
-        )
-    return wanted, bookmarks[0], heads[0], bases[0]
 
 
 def _plan_publication(
@@ -1773,26 +2076,33 @@ def plan_sync(
 ) -> SyncPlan:
     if isinstance(desired, Blocked):
         return desired
-    pr = _validate_plan_scope(snapshot, desired)
-    if isinstance(pr, Blocked):
-        return pr
-    pr_dependencies = _validate_pr_dependencies(snapshot, desired, pr)
+    prs = _validate_plan_scope(snapshot, desired)
+    if isinstance(prs, Blocked):
+        return prs
+    pr_dependencies = _validate_pr_dependencies(snapshot, desired, prs)
     if isinstance(pr_dependencies, Blocked):
         return pr_dependencies
-    wanted, bookmark, head, base = pr_dependencies
-    head_updates = _plan_publication(snapshot, wanted, head)
-    if isinstance(head_updates, Blocked):
-        return head_updates
-    metadata = _metadata_updates(pr, wanted)
-    dependencies = _dependencies(snapshot, pr, bookmark, head, base)
+    heads, all_heads, all_bases = pr_dependencies
+    planned_heads: list[PlannedHeadUpdate] = []
+    planned_metadata: list[PRMetadataUpdate] = []
+    for pr, wanted, head in zip(prs, desired.active, heads, strict=True):
+        head_updates = _plan_publication(snapshot, wanted, head)
+        if isinstance(head_updates, Blocked):
+            return head_updates
+        planned_heads.extend(head_updates)
+        planned_metadata.extend(_metadata_updates(pr, wanted))
+    head_updates = tuple(planned_heads)
+    metadata = tuple(planned_metadata)
+    dependencies = _dependencies(snapshot, snapshot.pull_requests, all_heads, all_bases)
     if not head_updates and not metadata:
         return NoOp(desired, dependencies)
-    if pr.auto_merge_enabled or pr.in_merge_queue:
-        return _block(
-            "active-automation",
-            pr.identity.node_id,
-            "mutation is blocked while auto-merge or merge queue state is active",
-        )
+    for pr in prs:
+        if pr.auto_merge_enabled or pr.in_merge_queue:
+            return _block(
+                "active-automation",
+                pr.identity.node_id,
+                "mutation is blocked while auto-merge or merge queue state is active",
+            )
     return Apply(
         desired,
         head_updates,
