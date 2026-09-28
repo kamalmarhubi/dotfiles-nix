@@ -258,6 +258,53 @@ def test_real_jj_observation_distinguishes_bookmark_and_tracking_sources(
     assert all(bookmark.name != "topic" for bookmark in absent.local_bookmarks)
 
 
+def test_private_inspection_fetch_is_invisible_to_jj_and_cleans_refs(
+    jj_repo: Path, tmp_path: Path
+) -> None:
+    observed = sync.observe_local(
+        jj_repo, revision="topic", config_keys=("git.push",)
+    )
+    topic = next(
+        item.target.commit_id
+        for item in observed.local_bookmarks
+        if item.name == "topic" and isinstance(item.target, sync.CommitTarget)
+    )
+    remote = tmp_path / "remote.git"
+    run("git", "init", "--bare", remote)
+    run(
+        "git",
+        f"--git-dir={observed.git_common_dir}",
+        "push",
+        remote,
+        f"{topic}:refs/heads/topic",
+    )
+    namespace = sync._inspection_namespace(observed.operation_id)
+    ordinary_before = sync._git_refs(
+        observed.git_common_dir, "refs/heads", "refs/remotes"
+    )
+    fetch_head = Path(observed.git_common_dir) / "FETCH_HEAD"
+    fetch_head_before = fetch_head.read_bytes() if fetch_head.exists() else None
+
+    try:
+        sync._fetch_inspection_refs(
+            observed.git_common_dir, os.fspath(remote), namespace, ("topic",)
+        )
+
+        assert sync.read_ref_oid(jj_repo, f"{namespace}/topic") == topic
+        assert (
+            sync._git_refs(observed.git_common_dir, "refs/heads", "refs/remotes")
+            == ordinary_before
+        )
+        assert sync.pin_operation(jj_repo) == observed.operation_id
+        assert (
+            fetch_head.read_bytes() if fetch_head.exists() else None
+        ) == fetch_head_before
+    finally:
+        sync._cleanup_inspection_refs(observed.git_common_dir, namespace)
+
+    assert sync._git_refs(observed.git_common_dir, namespace) == ""
+
+
 def test_real_jj_observation_parses_conflicted_local_bookmark(jj_repo: Path) -> None:
     original = jj(jj_repo, "log", "-r", "topic", "--no-graph", "-T", "commit_id")
     jj(jj_repo, "new", "root()")
@@ -393,7 +440,11 @@ def test_repository_lock_is_shared_by_workspaces(jj_repo: Path, tmp_path: Path) 
 
 def test_state_round_trip_uses_unversioned_shape() -> None:
     payload = sync.state_to_json(sync.EMPTY_STATE)
-    assert json.loads(payload) == {"last_published_heads": [], "stacks": []}
+    assert json.loads(payload) == {
+        "last_adopted_heads": [],
+        "last_published_heads": [],
+        "stacks": [],
+    }
     assert sync.parse_state(payload) == sync.EMPTY_STATE
 
 
@@ -1768,7 +1819,9 @@ def github_for(
         "main",
     )
     server = FakeGitHubServer()
-    server.seed_repository(repository, aliases=(observed.push_url,))
+    server.seed_repository(
+        repository, aliases=(observed.push_url, observed.fetch_url)
+    )
     for pull_request in observed.pull_requests:
         server.seed_pull_request(dataclasses.replace(pull_request, stack=None))
     if isinstance(observed.membership, sync.ServerStackMembership):
@@ -1781,6 +1834,197 @@ def github_for(
             )
         )
     return server, FakeGitHubClient(server)
+
+
+def remote_restack_plan() -> tuple[
+    sync.Snapshot, sync.Snapshot, sync.RemoteRestackAdoption
+]:
+    old = "1" * 40
+    new = "2" * 40
+    base = "0" * 40
+    observed, pr = snapshot(desired=old, live=new, parent=base)
+    observed = dataclasses.replace(
+        observed,
+        fetch_url="ssh://git@github.com/o/r.git",
+        local=dataclasses.replace(
+            observed.local,
+            remote_bookmarks=(
+                sync.JjRemoteBookmark(
+                    "origin",
+                    "topic",
+                    sync.CommitTarget(old),
+                    sync.TrackingState.TRACKED,
+                ),
+            ),
+        ),
+    )
+    boundary = sync.RemoteRestackBoundary(
+        pr,
+        "topic",
+        old,
+        old,
+        new,
+        (sync.RewriteCommitPair(old, new, "change", "patch"),),
+    )
+    plan = sync.RemoteRestackAdoption(
+        observed.repository,
+        "origin",
+        observed.fetch_url,
+        sync.operation_config(observed.local),
+        observed.tool_state.state_blob_oid,
+        observed.tool_state.operation_blob_oid,
+        observed.membership,
+        observed.pull_requests,
+        observed.live_refs,
+        (boundary,),
+        (("default", "change"),),
+    )
+    adopted_commit = sync.ObservedCommit(
+        new, (base,), "change", "Desired title\n\nDesired body", False, False
+    )
+    superseded_commit = sync.ObservedCommit(
+        old, (base,), "change", "Desired title\n\nDesired body", False, True
+    )
+    after = dataclasses.replace(
+        observed,
+        local=dataclasses.replace(
+            observed.local,
+            workspace_targets=(("default", new),),
+            local_bookmarks=(sync.LocalBookmark("topic", sync.CommitTarget(new)),),
+            remote_bookmarks=(
+                sync.JjRemoteBookmark(
+                    "origin",
+                    "topic",
+                    sync.CommitTarget(new),
+                    sync.TrackingState.TRACKED,
+                ),
+            ),
+            commits=(adopted_commit, superseded_commit),
+        ),
+    )
+    return observed, after, plan
+
+
+def test_remote_restack_adoption_fetches_only_frozen_branches_and_records_authority(
+    monkeypatch,
+) -> None:
+    before, after, plan = remote_restack_plan()
+    observations = iter((before, after))
+    commands: list[list[str]] = []
+    recorded: list[tuple[sync.LastAdoptedHead, ...]] = []
+    monkeypatch.setattr(sync, "repository_lock", lambda *_args: nullcontext())
+    monkeypatch.setattr(
+        sync, "reobserve_for_adoption", lambda *_args: next(observations)
+    )
+    monkeypatch.setattr(
+        sync, "reobserve_after_adoption", lambda *_args: next(observations)
+    )
+    monkeypatch.setattr(
+        sync.subprocess,
+        "run",
+        lambda command, **_kwargs: (
+            commands.append(command) or subprocess.CompletedProcess(command, 0, "", "")
+        ),
+    )
+    monkeypatch.setattr(
+        sync,
+        "record_verified_adoptions",
+        lambda _workspace, _oid, _state, receipts: recorded.append(tuple(receipts)),
+    )
+
+    _server, client = github_for(before)
+    result = sync.adopt_remote_restack(plan, "/repo", client)
+
+    expected = sync.LastAdoptedHead(
+        plan.boundaries[0].pr_identity,
+        sync.RemoteBranchRef(plan.repository, "refs/heads/topic"),
+        "2" * 40,
+    )
+    assert result == sync.AdoptionVerified((expected,))
+    assert commands == [
+        ["jj", "git", "fetch", "--remote", "origin", "--branch", "topic"]
+    ]
+    assert recorded == [(expected,)]
+
+
+@pytest.mark.parametrize(
+    ("commit_index", "is_hidden", "expected"),
+    (
+        (1, False, "superseded commit remains visible for topic"),
+        (0, True, "adopted boundary is absent, hidden, or conflicted for topic"),
+    ),
+)
+def test_remote_restack_adoption_requires_old_commit_hidden_and_new_commit_visible(
+    commit_index: int, is_hidden: bool, expected: str
+) -> None:
+    _before, after, plan = remote_restack_plan()
+    commits = list(after.local.commits)
+    commits[commit_index] = dataclasses.replace(
+        commits[commit_index], is_hidden=is_hidden
+    )
+    after = dataclasses.replace(
+        after, local=dataclasses.replace(after.local, commits=tuple(commits))
+    )
+
+    assert sync._validate_adoption_poststate(plan, after) == expected
+
+
+def test_adoption_pre_fetch_reobservation_never_resolves_remote_only_oids(
+    monkeypatch,
+) -> None:
+    before, after, plan = remote_restack_plan()
+    revisions: list[str] = []
+
+    def observe(_workspace, _github, *, revision, **_kwargs):
+        revisions.append(revision)
+        return before if len(revisions) == 1 else after
+
+    monkeypatch.setattr(sync, "observe_snapshot", observe)
+
+    _server, client = github_for(before)
+    assert sync.reobserve_for_adoption("/repo", client, plan) == before
+    assert sync.reobserve_after_adoption("/repo", client, plan) == after
+    old = plan.boundaries[0].local_commit_id
+    remote_only = plan.boundaries[0].remote_commit_id
+    assert old in revisions[0]
+    assert remote_only not in revisions[0]
+    assert old in revisions[1]
+    assert remote_only in revisions[1]
+
+
+def test_remote_restack_adoption_blocks_mixed_local_and_remote_movement() -> None:
+    before, _after, plan = remote_restack_plan()
+    moved = dataclasses.replace(
+        before,
+        local=dataclasses.replace(
+            before.local,
+            local_bookmarks=(sync.LocalBookmark("topic", sync.CommitTarget("3" * 40)),),
+        ),
+    )
+
+    assert sync._validate_adoption_prestate(plan, moved) == "L/T changed for topic"
+
+
+def test_adopted_authority_is_distinct_and_can_authorize_replacement() -> None:
+    observed, pr = snapshot(desired="3" * 40, live="2" * 40, parent="0" * 40)
+    ref = sync.RemoteBranchRef(observed.repository, "refs/heads/topic")
+    receipt = sync.LastAdoptedHead(pr, ref, "2" * 40)
+    observed = dataclasses.replace(
+        observed,
+        tool_state=dataclasses.replace(
+            observed.tool_state,
+            state=dataclasses.replace(
+                observed.tool_state.state, last_adopted_heads=(receipt,)
+            ),
+        ),
+    )
+
+    plan = sync.plan_sync(
+        observed, sync.derive_desired(observed, selection(observed, pr))
+    )
+
+    assert isinstance(plan, sync.Apply)
+    assert plan.head_updates[0].authority == sync.MatchesLastAdoption(receipt)
 
 
 def multi_head_plan(*, merged_prefix: int = 0) -> tuple[sync.Snapshot, sync.Apply]:
