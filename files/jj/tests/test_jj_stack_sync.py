@@ -2225,7 +2225,12 @@ def first_publication_operation(
         (("default", "2" * 40),),
         "main",
         None,
+        sync.FirstPublicationTarget.STANDALONE,
+        (),
+        None,
         (slot,),
+        sync.StackLinkPhase.NOT_REQUIRED,
+        None,
         operation_phase,
     )
 
@@ -2790,6 +2795,229 @@ def test_native_first_publication_establishes_tracking_without_moving_workspace(
         (repo / "change").read_bytes(),
     )
     assert after == before
+
+
+def multi_publication_operation(
+    *,
+    slot_phases: tuple[sync.NewPRPhase, sync.NewPRPhase] = (
+        sync.NewPRPhase.NOT_ATTEMPTED,
+        sync.NewPRPhase.NOT_ATTEMPTED,
+    ),
+    operation_phase: sync.FirstPublicationPhase = sync.FirstPublicationPhase.PREPARING_BOOKMARKS,
+) -> sync.FirstPublication:
+    base = first_publication_operation()
+    slots = tuple(
+        dataclasses.replace(
+            base.slots[0],
+            slot_id=f"slot-{index}",
+            branch=f"topic-{index}",
+            commit_id=str(index) * 40,
+            base_branch="main" if index == 1 else "topic-1",
+            title=f"Title {index}",
+            phase=phase,
+        )
+        for index, phase in zip((1, 2), slot_phases, strict=True)
+    )
+    return dataclasses.replace(
+        base,
+        workspace_targets=(("default", "2" * 40),),
+        target=sync.FirstPublicationTarget.FRESH_STACK,
+        slots=slots,
+        stack_phase=sync.StackLinkPhase.NOT_ATTEMPTED,
+        phase=operation_phase,
+    )
+
+
+def test_multi_publication_codec_and_final_state_preserve_complete_order() -> None:
+    operation = multi_publication_operation(
+        slot_phases=(sync.NewPRPhase.VERIFIED, sync.NewPRPhase.VERIFIED),
+        operation_phase=sync.FirstPublicationPhase.LINKING_STACK,
+    )
+    identities = tuple(
+        sync.PullRequestId(operation.repository, index) for index in (1, 2)
+    )
+    stack = sync.GitHubStackId(operation.repository, 31)
+    operation = dataclasses.replace(
+        operation,
+        slots=tuple(
+            dataclasses.replace(slot, pr_identity=identity)
+            for slot, identity in zip(operation.slots, identities, strict=True)
+        ),
+        stack_phase=sync.StackLinkPhase.VERIFIED,
+        resulting_stack=stack,
+    )
+
+    assert sync.parse_first_publication(sync.first_publication_to_json(operation)) == operation
+    final = sync._build_first_publication_state(operation, sync.EMPTY_STATE)
+    assert final.stacks[0].ordered_prs == identities
+    assert tuple(item.verified_commit_id for item in final.last_published_heads) == (
+        "1" * 40,
+        "2" * 40,
+    )
+
+
+def test_partial_native_publication_recovers_before_any_pr_effect(
+    jj_repo: Path, monkeypatch
+) -> None:
+    operation = multi_publication_operation(
+        slot_phases=(
+            sync.NewPRPhase.PUBLICATION_POSSIBLY_SENT,
+            sync.NewPRPhase.PUBLICATION_POSSIBLY_SENT,
+        ),
+        operation_phase=sync.FirstPublicationPhase.PUBLISHING,
+    )
+    second_ready = False
+
+    def observe(_workspace, current):
+        local = sync.LocalObservation(
+            "/repo", "op", current.effective_config, current.workspace_targets,
+            tuple(
+                sync.LocalBookmark(slot.branch, sync.CommitTarget(slot.commit_id))
+                for slot in current.slots
+            ),
+            (), (), (), "/git",
+        )
+        return local, tuple(
+            sync.PublicationSlotReadback(
+                slot.slot_id,
+                sync.CommitTarget(slot.commit_id),
+                sync.CommitTarget(slot.commit_id)
+                if index == 0 or second_ready else None,
+                sync.TrackingState.TRACKED
+                if index == 0 or second_ready else None,
+                slot.commit_id if index == 0 or second_ready else None,
+            )
+            for index, slot in enumerate(current.slots)
+        )
+
+    pushed: list[tuple[str, ...]] = []
+
+    def push(_workspace, _operation, slots):
+        nonlocal second_ready
+        pushed.append(tuple(slot.slot_id for slot in slots))
+        second_ready = True
+        return subprocess.CompletedProcess([], 1, "", "lost response")
+
+    server, client = github_for_publication(operation)
+    monkeypatch.setattr(sync, "observe_publication_slots", observe)
+    monkeypatch.setattr(sync, "push_new_slot_refs", push)
+    sync.cas_write_first_publication(jj_repo, None, operation)
+
+    with client.fail_before(sync.GitHubClient.create_pull_request):
+        stopped = sync.resume_first_publication(jj_repo, client)
+
+    assert pushed == [(operation.slots[1].slot_id,)]
+    assert server.read_find_pull_requests(
+        operation.repository,
+        head_branches=tuple(slot.branch for slot in operation.slots),
+    ) == ()
+    assert isinstance(stopped, sync.Stopped)
+    assert stopped.stage == "create-pr"
+
+
+@pytest.mark.parametrize(
+    "target",
+    (sync.FirstPublicationTarget.FRESH_STACK, sync.FirstPublicationTarget.APPEND),
+)
+def test_stack_mutation_uses_frozen_repository_and_only_new_append_suffix(
+    target: sync.FirstPublicationTarget,
+) -> None:
+    operation = multi_publication_operation()
+    server, client = github_for_publication(operation)
+    if target is sync.FirstPublicationTarget.APPEND:
+        repository = operation.repository
+        member = sync.ExistingFirstPublicationPR(
+            sync.PullRequestId(repository, 7),
+            "existing",
+            "7" * 40,
+            "main",
+            "0" * 40,
+            True,
+            "Existing",
+            "",
+        )
+        operation = dataclasses.replace(
+            operation,
+            target=target,
+            existing_members=(member,),
+            existing_stack=sync.GitHubStackId(repository, 17),
+        )
+    operation = dataclasses.replace(
+        operation,
+        slots=tuple(
+            dataclasses.replace(
+                slot, pr_identity=sync.PullRequestId(operation.repository, index)
+            )
+            for index, slot in enumerate(operation.slots, start=1)
+        ),
+    )
+    for slot in operation.slots:
+        assert slot.pr_identity is not None
+        server.seed_pull_request(
+            sync.GitHubPullRequest(
+                slot.pr_identity,
+                f"PR_{slot.pr_identity.number}",
+                sync.PullRequestState.OPEN,
+                True,
+                operation.repository,
+                slot.branch,
+                slot.commit_id,
+                slot.base_branch,
+                "0" * 40 if slot.base_branch == "main" else "1" * 40,
+                False,
+                False,
+                slot.title,
+                slot.body,
+                None,
+            )
+        )
+    if target is sync.FirstPublicationTarget.APPEND:
+        member = operation.existing_members[0]
+        server.seed_pull_request(
+            sync.GitHubPullRequest(
+                member.identity,
+                "PR_existing",
+                sync.PullRequestState.OPEN,
+                member.draft,
+                operation.repository,
+                member.head_branch,
+                member.head_commit_id,
+                member.base_branch,
+                member.base_commit_id,
+                False,
+                False,
+                member.title,
+                member.body,
+                None,
+            )
+        )
+        assert operation.existing_stack is not None
+        server.seed_stack(
+            sync.GitHubStack(
+                operation.existing_stack,
+                "STACK_existing",
+                operation.base_branch,
+                operation.existing_prs,
+            )
+        )
+
+    sync.run_first_publication_stack_link(client, operation)
+
+    new_members = tuple(
+        slot.pr_identity for slot in operation.slots
+    )
+    pull_requests = server.read_pull_requests(new_members)
+    summaries = tuple(pr.stack for pr in pull_requests)
+    assert summaries[0] is not None
+    assert all(summary == summaries[0] for summary in summaries)
+    repository = server.read_repository(operation.repository)
+    stack = server.read_stack(repository, summaries[0].identity)
+    assert stack is not None
+    assert stack.pull_requests == (
+        operation.existing_prs + new_members
+        if target is sync.FirstPublicationTarget.APPEND
+        else new_members
+    )
 
 
 def multi_head_plan(*, merged_prefix: int = 0) -> tuple[sync.Snapshot, sync.Apply]:

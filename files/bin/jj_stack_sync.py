@@ -637,7 +637,21 @@ class FirstPublicationPhase(StrEnum):
     PREPARING_BOOKMARKS = "preparing-bookmarks"
     PUBLISHING = "publishing"
     CREATING_PRS = "creating-prs"
+    LINKING_STACK = "linking-stack"
     COMMITTING = "committing"
+
+
+class FirstPublicationTarget(StrEnum):
+    STANDALONE = "standalone"
+    FRESH_STACK = "fresh-stack"
+    APPEND = "append"
+
+
+class StackLinkPhase(StrEnum):
+    NOT_REQUIRED = "not-required"
+    NOT_ATTEMPTED = "not-attempted"
+    POSSIBLY_SENT = "possibly-sent"
+    VERIFIED = "verified"
 
 
 @dataclass(frozen=True)
@@ -662,6 +676,18 @@ class NewPRSlot:
 
 
 @dataclass(frozen=True)
+class ExistingFirstPublicationPR:
+    identity: PullRequestId
+    head_branch: str
+    head_commit_id: str
+    base_branch: str
+    base_commit_id: str
+    draft: bool
+    title: str
+    body: str
+
+
+@dataclass(frozen=True)
 class FirstPublication:
     repository: GitHubRepositoryId
     repository_name: str
@@ -671,10 +697,19 @@ class FirstPublication:
     workspace_targets: tuple[tuple[str, str], ...]
     base_branch: str
     expected_state_oid: str | None
+    target: FirstPublicationTarget
+    existing_members: tuple[ExistingFirstPublicationPR, ...]
+    existing_stack: GitHubStackId | None
     slots: tuple[NewPRSlot, ...]
+    stack_phase: StackLinkPhase = StackLinkPhase.NOT_REQUIRED
+    resulting_stack: GitHubStackId | None = None
     phase: FirstPublicationPhase = FirstPublicationPhase.PREPARING_BOOKMARKS
     final_state_json: str | None = None
     final_state_oid: str | None = None
+
+    @property
+    def existing_prs(self) -> tuple[PullRequestId, ...]:
+        return tuple(member.identity for member in self.existing_members)
 
 
 @dataclass(frozen=True)
@@ -2362,11 +2397,9 @@ def _validate_first_publication(operation: FirstPublication) -> None:
         or not operation.push_url
         or not operation.remote
         or not operation.base_branch
-        or len(operation.slots) != 1
+        or not operation.slots
     ):
-        raise ValueError(
-            "standalone first-publication identity and goal must be nonempty"
-        )
+        raise ValueError("first-publication identity and goal must be nonempty")
     owner, separator, name = operation.repository_name.partition("/")
     if not separator or not owner or not name or "/" in name:
         raise ValueError("first-publication repository name must be owner/name")
@@ -2385,6 +2418,50 @@ def _validate_first_publication(operation: FirstPublication) -> None:
         raise ValueError("first-publication slot IDs must be unique")
     if len({slot.branch for slot in operation.slots}) != len(operation.slots):
         raise ValueError("first-publication branches must be unique")
+    if operation.target is FirstPublicationTarget.STANDALONE:
+        if (
+            len(operation.slots) != 1
+            or operation.existing_members
+            or operation.existing_stack is not None
+            or operation.stack_phase is not StackLinkPhase.NOT_REQUIRED
+        ):
+            raise ValueError("standalone publication must contain exactly one new slot")
+    elif operation.target is FirstPublicationTarget.FRESH_STACK:
+        if (
+            len(operation.slots) < 2
+            or operation.existing_members
+            or operation.existing_stack is not None
+            or operation.stack_phase is StackLinkPhase.NOT_REQUIRED
+        ):
+            raise ValueError("fresh stack publication requires at least two new slots")
+    elif (
+        not operation.existing_members
+        or operation.existing_stack is None
+        or operation.stack_phase is StackLinkPhase.NOT_REQUIRED
+    ):
+        raise ValueError("append publication requires a frozen existing stack")
+    if operation.existing_stack is not None and (
+        operation.existing_stack.repository != operation.repository
+    ):
+        raise ValueError("existing stack belongs to another repository")
+    if (operation.stack_phase is StackLinkPhase.VERIFIED) != (
+        operation.resulting_stack is not None
+    ):
+        raise ValueError("verified stack link must record the resulting stack")
+    if operation.resulting_stack is not None and (
+        operation.resulting_stack.repository != operation.repository
+    ):
+        raise ValueError("resulting stack belongs to another repository")
+    for member in operation.existing_members:
+        if (
+            member.identity.repository != operation.repository
+            or not member.head_branch
+            or not member.head_commit_id
+            or not member.base_branch
+            or not member.base_commit_id
+            or not member.title
+        ):
+            raise ValueError("existing append member is malformed")
     for slot in operation.slots:
         if (
             not slot.slot_id
@@ -2421,10 +2498,20 @@ def _validate_first_publication(operation: FirstPublication) -> None:
         NewPRPhase.VERIFIED,
     }:
         raise ValueError("PR creation phase has invalid slot progress")
+    if operation.phase is FirstPublicationPhase.LINKING_STACK and phases != {
+        NewPRPhase.VERIFIED
+    }:
+        raise ValueError("stack linking requires every PR verified")
     if operation.phase is FirstPublicationPhase.COMMITTING and phases != {
         NewPRPhase.VERIFIED
     }:
         raise ValueError("committing requires every slot verified")
+    if (
+        operation.target is not FirstPublicationTarget.STANDALONE
+        and operation.phase is FirstPublicationPhase.COMMITTING
+        and operation.stack_phase is not StackLinkPhase.VERIFIED
+    ):
+        raise ValueError("stack publication cannot commit before topology verification")
     committing = operation.phase is FirstPublicationPhase.COMMITTING
     if committing != (
         operation.final_state_json is not None and operation.final_state_oid is not None
@@ -2473,6 +2560,18 @@ def parse_first_publication(data: str) -> FirstPublication:
             number,
         )
 
+    def stack_identity(value: object, context: str) -> GitHubStackId | None:
+        if value is None:
+            return None
+        raw = exact(value, {"repository", "number"}, context)
+        number = raw["number"]
+        if type(number) is not int or number <= 0:
+            raise ValueError(f"{context}.number must be a positive integer")
+        return GitHubStackId(
+            repository(raw["repository"], f"{context}.repository"),
+            number,
+        )
+
     try:
         raw = exact(
             json.loads(data),
@@ -2486,7 +2585,12 @@ def parse_first_publication(data: str) -> FirstPublication:
                 "workspace_targets",
                 "base_branch",
                 "expected_state_oid",
+                "target",
+                "existing_members",
+                "existing_stack",
                 "slots",
+                "stack_phase",
+                "resulting_stack",
                 "phase",
                 "final_state_json",
                 "final_state_oid",
@@ -2496,10 +2600,12 @@ def parse_first_publication(data: str) -> FirstPublication:
         if raw["operation_kind"] != "first-publication":
             raise ValueError("operation kind is invalid")
         raw_slots = raw["slots"]
+        raw_existing = raw["existing_members"]
         raw_config = raw["effective_config"]
         raw_workspaces = raw["workspace_targets"]
         if (
             not isinstance(raw_slots, list)
+            or not isinstance(raw_existing, list)
             or not isinstance(raw_config, list)
             or not isinstance(raw_workspaces, list)
         ):
@@ -2516,6 +2622,40 @@ def parse_first_publication(data: str) -> FirstPublication:
                     raise ValueError(f"{context}[{index}] must be a text pair")
                 parsed.append((item[0], item[1]))  # type: ignore[arg-type]
             return tuple(parsed)
+
+        existing_members: list[ExistingFirstPublicationPR] = []
+        for index, value in enumerate(raw_existing):
+            context = f"existing_members[{index}]"
+            member = exact(
+                value,
+                {
+                    "identity",
+                    "head_branch",
+                    "head_commit_id",
+                    "base_branch",
+                    "base_commit_id",
+                    "draft",
+                    "title",
+                    "body",
+                },
+                context,
+            )
+            draft = member["draft"]
+            body = member["body"]
+            if type(draft) is not bool or not isinstance(body, str):
+                raise ValueError(f"{context} scalar fields are malformed")
+            existing_members.append(
+                ExistingFirstPublicationPR(
+                    pr(member["identity"], f"{context}.identity"),
+                    text(member["head_branch"], f"{context}.head_branch"),
+                    text(member["head_commit_id"], f"{context}.head_commit_id"),
+                    text(member["base_branch"], f"{context}.base_branch"),
+                    text(member["base_commit_id"], f"{context}.base_commit_id"),
+                    draft,
+                    text(member["title"], f"{context}.title"),
+                    body,
+                )
+            )
 
         slots: list[NewPRSlot] = []
         for index, value in enumerate(raw_slots):
@@ -2568,7 +2708,12 @@ def parse_first_publication(data: str) -> FirstPublication:
             pairs(raw_workspaces, "workspace_targets"),
             text(raw["base_branch"], "operation.base_branch"),
             expected_oid,
+            FirstPublicationTarget(text(raw["target"], "operation.target")),
+            tuple(existing_members),
+            stack_identity(raw["existing_stack"], "operation.existing_stack"),
             tuple(slots),
+            StackLinkPhase(text(raw["stack_phase"], "operation.stack_phase")),
+            stack_identity(raw["resulting_stack"], "operation.resulting_stack"),
             FirstPublicationPhase(text(raw["phase"], "operation.phase")),
             optional_text(raw["final_state_json"], "operation.final_state_json"),
             optional_text(raw["final_state_oid"], "operation.final_state_oid"),
@@ -2977,6 +3122,9 @@ def prepare_standalone_first_publication(
         local.workspace_targets,
         base_branch,
         tool_state.state_blob_oid,
+        FirstPublicationTarget.STANDALONE,
+        (),
+        None,
         (
             NewPRSlot(
                 nonce,
@@ -2988,6 +3136,196 @@ def prepare_standalone_first_publication(
                 body,
             ),
         ),
+    )
+
+
+def prepare_multi_first_publication(
+    workspace: str | Path,
+    local: LocalObservation,
+    tool_state: ToolStateRead,
+    repository: GitHubRepository,
+    push_url: str,
+    remote: str,
+    base_branch: str,
+    assignments: Sequence[PublicationAssignment],
+    *,
+    slot_ids: Sequence[str] | None = None,
+    existing_stack: GitHubStack | None = None,
+    existing_pull_requests: Sequence[GitHubPullRequest] = (),
+) -> FirstPublication | Blocked:
+    """Freeze a fresh stack or append while reusing per-slot publication recovery."""
+    assignments = tuple(assignments)
+    if not assignments:
+        return _block("empty-publication", "stack", "at least one revision is required")
+    if existing_stack is None and len(assignments) < 2:
+        return _block(
+            "standalone-required", "stack", "one revision uses standalone publication"
+        )
+    if tool_state.operation_blob_oid is not None:
+        return _block("operation-fenced", OPERATION_REF, "another operation is active")
+    if len({item.commit_id for item in assignments}) != len(assignments) or len(
+        {item.branch_name for item in assignments}
+    ) != len(assignments):
+        return _block(
+            "invalid-publication-assignment",
+            "stack",
+            "publication assignments must have unique commits and branches",
+        )
+    try:
+        observed_push_url = resolve_push_url(local, remote)
+    except Error as exc:
+        return _block("push-remote-unavailable", remote, str(exc))
+    if observed_push_url != push_url:
+        return _block("push-url-changed", remote, "publication remote changed")
+
+    existing_prs = tuple(existing_pull_requests)
+    if existing_stack is not None:
+        if (
+            existing_stack.identity.repository != repository.identity
+            or existing_stack.base_branch != base_branch
+            or not existing_prs
+            or tuple(pr.identity for pr in existing_prs)
+            != existing_stack.pull_requests
+            or any(pr.state is not PullRequestState.OPEN for pr in existing_prs)
+            or any(pr.auto_merge_enabled or pr.in_merge_queue for pr in existing_prs)
+        ):
+            return _block(
+                "append-unsupported",
+                "stack",
+                "append requires one completely open repository-local stack",
+            )
+        tracked = tuple(
+            stack
+            for stack in tool_state.state.stacks
+            if stack.repository == repository.identity
+            and stack.base_branch == base_branch
+            and stack.ordered_prs == tuple(pr.identity for pr in existing_prs)
+        )
+        if len(tracked) != 1:
+            return _block(
+                "untracked-membership",
+                "stack",
+                "append requires exact tracked membership",
+            )
+
+    nonces = (
+        tuple(secrets.token_hex(16) for _assignment in assignments)
+        if slot_ids is None
+        else tuple(slot_ids)
+    )
+    if len(nonces) != len(assignments) or len(set(nonces)) != len(nonces):
+        return _block("slot-collision", "stack", "slot IDs must be complete and unique")
+    by_commit = {commit.commit_id: commit for commit in local.commits}
+    names = tuple(item.branch_name for item in assignments)
+    ref_names = tuple(
+        dict.fromkeys(
+            (
+                f"refs/heads/{base_branch}",
+                *(f"refs/heads/{pr.head_branch}" for pr in existing_prs),
+                *(f"refs/heads/{name}" for name in names),
+            )
+        )
+    )
+    live = observe_live_refs(push_url, repository.identity, ref_names, cwd=workspace)
+    by_name = {item.ref.full_name: item.commit_id for item in live}
+    previous_branch = existing_prs[-1].head_branch if existing_prs else base_branch
+    if existing_prs:
+        if any(
+            by_name.get(f"refs/heads/{pr.head_branch}") != pr.head_oid
+            for pr in existing_prs
+        ):
+            return _block("stack-moved", "stack", "an existing append head moved")
+        previous_commit = existing_prs[-1].head_oid
+    else:
+        previous_commit = by_name.get(f"refs/heads/{base_branch}")
+    if previous_commit is None:
+        return _block("base-unavailable", base_branch, "publication base is absent")
+
+    slots: list[NewPRSlot] = []
+    for nonce, assignment in zip(nonces, assignments, strict=True):
+        commit = by_commit.get(assignment.commit_id)
+        if commit is None or commit.has_conflicts:
+            return _block(
+                "commit-unavailable", assignment.commit_id, "revision is absent or conflicted"
+            )
+        metadata = _metadata(commit.description)
+        if metadata is None:
+            return _block("title-missing", assignment.commit_id, "revision has no title")
+        if by_name.get(f"refs/heads/{assignment.branch_name}") is not None:
+            return _block(
+                "branch-collision", assignment.branch_name, "destination branch exists"
+            )
+        local_matches = tuple(
+            item for item in local.local_bookmarks if item.name == assignment.branch_name
+        )
+        if not local_matches:
+            setup = BookmarkSetup.CREATE
+        elif (
+            len(local_matches) == 1
+            and isinstance(local_matches[0].target, CommitTarget)
+            and local_matches[0].target.commit_id == assignment.commit_id
+        ):
+            setup = BookmarkSetup.KEEP
+        else:
+            return _block(
+                "bookmark-setup-changed",
+                assignment.branch_name,
+                "resolved publication bookmark is no longer absent or exact",
+            )
+        if not _comparison_is_nonempty_linear_and_conflict_free(
+            local.commits, previous_commit, assignment.commit_id
+        ):
+            return _block(
+                "invalid-comparison",
+                assignment.commit_id,
+                "each new predecessor-to-head segment must be complete and linear",
+            )
+        title, body = metadata
+        slots.append(
+            NewPRSlot(
+                nonce,
+                assignment.branch_name,
+                assignment.commit_id,
+                setup,
+                previous_branch,
+                title,
+                body,
+            )
+        )
+        previous_branch = assignment.branch_name
+        previous_commit = assignment.commit_id
+
+    target = (
+        FirstPublicationTarget.APPEND
+        if existing_stack is not None
+        else FirstPublicationTarget.FRESH_STACK
+    )
+    return FirstPublication(
+        repository.identity,
+        repository.name_with_owner,
+        push_url,
+        remote,
+        local.effective_config,
+        local.workspace_targets,
+        base_branch,
+        tool_state.state_blob_oid,
+        target,
+        tuple(
+            ExistingFirstPublicationPR(
+                pr.identity,
+                pr.head_branch,
+                pr.head_oid,
+                pr.base_branch,
+                pr.base_oid,
+                pr.draft,
+                pr.title,
+                pr.body,
+            )
+            for pr in existing_prs
+        ),
+        existing_stack.identity if existing_stack is not None else None,
+        tuple(slots),
+        StackLinkPhase.NOT_ATTEMPTED,
     )
 
 
@@ -3693,6 +4031,7 @@ def _slot_pr_matches(
     pr: GitHubPullRequest,
     *,
     initial: bool,
+    stacked: bool = False,
 ) -> bool:
     return (
         pr.identity.repository == repository
@@ -3702,7 +4041,7 @@ def _slot_pr_matches(
         and pr.base_branch == slot.base_branch
         and pr.title == slot.title
         and pr.body == (slot.initial_body if initial else slot.body)
-        and pr.stack is None
+        and (pr.stack is not None if stacked else pr.stack is None)
         and not pr.auto_merge_enabled
         and not pr.in_merge_queue
         and pr.state is PullRequestState.OPEN
@@ -3922,6 +4261,151 @@ def push_new_slot_refs(
         operation.remote,
         *(argument for slot in slots for argument in ("--bookmark", slot.branch)),
     )
+
+
+def _operation_repository(operation: FirstPublication) -> GitHubRepository:
+    return GitHubRepository(
+        operation.repository,
+        operation.repository_name,
+        f"https://{operation.repository.host}/{operation.repository_name}",
+        operation.base_branch,
+    )
+
+
+def _prevalidate_operation_repository(
+    github: GitHubClient, operation: FirstPublication
+) -> GitHubRepository:
+    observed = github.resolve_repository(
+        f"https://{operation.repository.host}/{operation.repository_name}"
+    )
+    if (
+        observed.identity != operation.repository
+        or observed.name_with_owner != operation.repository_name
+    ):
+        raise SourceMismatch("frozen GitHub repository locator changed identity")
+    return observed
+
+
+def run_first_publication_stack_link(
+    github: GitHubClient, operation: FirstPublication
+) -> GitHubStackSummary:
+    if operation.target is FirstPublicationTarget.STANDALONE:
+        raise ValueError("standalone publication has no stack-link request")
+    repository = _prevalidate_operation_repository(github, operation)
+    new_ids = tuple(
+        slot.pr_identity for slot in operation.slots if slot.pr_identity is not None
+    )
+    if len(new_ids) != len(operation.slots):
+        raise ValueError("stack request requires every new PR to be bound")
+    if operation.target is FirstPublicationTarget.APPEND:
+        assert operation.existing_stack is not None
+        return github.add_stack_members(
+            repository,
+            operation.existing_stack,
+            pull_requests=new_ids,
+        )
+    return github.create_stack(repository, pull_requests=new_ids)
+
+
+def _existing_member_matches(
+    member: ExistingFirstPublicationPR, pr: GitHubPullRequest
+) -> bool:
+    return (
+        pr.identity == member.identity
+        and pr.state is PullRequestState.OPEN
+        and pr.head_branch == member.head_branch
+        and pr.head_oid == member.head_commit_id
+        and pr.base_branch == member.base_branch
+        and pr.base_oid == member.base_commit_id
+        and pr.draft == member.draft
+        and pr.title == member.title
+        and pr.body == member.body
+        and not pr.auto_merge_enabled
+        and not pr.in_merge_queue
+    )
+
+
+def append_source_is_unchanged(
+    github: GitHubClient, operation: FirstPublication
+) -> bool:
+    if operation.target is not FirstPublicationTarget.APPEND:
+        return True
+    assert operation.existing_stack is not None
+    repository = _prevalidate_operation_repository(github, operation)
+    stack = github.stack(repository, operation.existing_stack)
+    if stack is None:
+        return False
+    prs = github.pull_requests(stack.pull_requests)
+    return (
+        stack.identity == operation.existing_stack
+        and stack.base_branch == operation.base_branch
+        and len(prs) == len(operation.existing_members)
+        and all(
+            _existing_member_matches(member, pr)
+            for member, pr in zip(
+                operation.existing_members, prs, strict=True
+            )
+        )
+    )
+
+
+def observe_first_publication_stack(
+    github: GitHubClient, operation: FirstPublication
+) -> GitHubStack | None:
+    repository = _prevalidate_operation_repository(github, operation)
+    if operation.target is FirstPublicationTarget.APPEND:
+        assert operation.existing_stack is not None
+        stack = github.stack(repository, operation.existing_stack)
+        if stack is None:
+            return None
+        if stack.identity != operation.existing_stack:
+            return None
+    else:
+        new_ids = tuple(slot.pr_identity for slot in operation.slots)
+        if any(identity is None for identity in new_ids):
+            raise ValueError("stack readback requires every new PR to be bound")
+        prs = github.pull_requests(
+            tuple(identity for identity in new_ids if identity is not None)
+        )
+        if any(pr.stack is None for pr in prs):
+            return None
+        stack_ids = {pr.stack.identity for pr in prs if pr.stack is not None}
+        if len(stack_ids) != 1:
+            return None
+        stack = github.stack(repository, stack_ids.pop())
+        if stack is None:
+            return None
+    expected_ids = operation.existing_prs + tuple(
+        slot.pr_identity for slot in operation.slots if slot.pr_identity is not None
+    )
+    if (
+        stack.base_branch != operation.base_branch
+        or stack.pull_requests != expected_ids
+    ):
+        return None
+    prs = github.pull_requests(stack.pull_requests)
+    if any(pr.state is not PullRequestState.OPEN for pr in prs):
+        return None
+    expected_existing = {
+        member.identity: member for member in operation.existing_members
+    }
+    expected_slots = {
+        slot.pr_identity: slot
+        for slot in operation.slots
+        if slot.pr_identity is not None
+    }
+    for pr in prs:
+        member = expected_existing.get(pr.identity)
+        if member is not None:
+            if not _existing_member_matches(member, pr):
+                return None
+            continue
+        slot = expected_slots.get(pr.identity)
+        if slot is None or not _slot_pr_matches(
+            operation.repository, slot, pr, initial=False, stacked=True
+        ):
+            return None
+    return stack
 
 
 def _expected_final_prs(plan: NoOp | Apply) -> tuple[GitHubPullRequest, ...]:
@@ -4627,6 +5111,15 @@ def _verify_first_publication_external(
                 operation.repository, slot, matches[0], initial=False
             ):
                 return f"pull request for slot {slot.slot_id} does not match the goal"
+        if operation.target is not FirstPublicationTarget.STANDALONE:
+            stack = observe_first_publication_stack(github, operation)
+            if (
+                operation.stack_phase is not StackLinkPhase.VERIFIED
+                or operation.resulting_stack is None
+                or stack is None
+                or stack.identity != operation.resulting_stack
+            ):
+                return "published stack topology does not match the frozen goal"
     except Error as exc:
         return str(exc)
     return None
@@ -4639,16 +5132,28 @@ def _build_first_publication_state(
     if any(identity is None for identity in identities):
         raise Error("cannot commit first publication before every slot is bound")
     new_prs = tuple(identity for identity in identities if identity is not None)
-    ordered = new_prs
+    ordered = operation.existing_prs + new_prs
     if len(set(ordered)) != len(ordered):
         raise Error("first-publication final membership contains duplicate PRs")
-    if any(
-        stack.repository == operation.repository
-        and set(stack.ordered_prs).intersection(ordered)
-        for stack in state.stacks
-    ):
-        raise Error("new PR membership overlaps an existing tracked stack")
-    stacks = state.stacks
+    if operation.target is FirstPublicationTarget.APPEND:
+        matches = tuple(
+            stack
+            for stack in state.stacks
+            if stack.repository == operation.repository
+            and stack.base_branch == operation.base_branch
+            and stack.ordered_prs == operation.existing_prs
+        )
+        if len(matches) != 1:
+            raise Error("append source no longer has one exact tracked stack")
+        stacks = tuple(stack for stack in state.stacks if stack != matches[0])
+    else:
+        if any(
+            stack.repository == operation.repository
+            and set(stack.ordered_prs).intersection(ordered)
+            for stack in state.stacks
+        ):
+            raise Error("new PR membership overlaps an existing tracked stack")
+        stacks = state.stacks
     final_stack = TrackedStack(operation.repository, operation.base_branch, ordered)
     refs = tuple(
         RemoteBranchRef(operation.repository, f"refs/heads/{slot.branch}")
@@ -4722,9 +5227,8 @@ def _finish_first_publication(
             tracking_persisted=True,
         )
     return FirstPublicationVerified(
-        tuple(
-            slot.pr_identity for slot in operation.slots if slot.pr_identity is not None
-        )
+        operation.existing_prs
+        + tuple(slot.pr_identity for slot in operation.slots if slot.pr_identity is not None)
     )
 
 
@@ -5045,6 +5549,69 @@ def resume_first_publication(
                 )
         if any(slot.phase is not NewPRPhase.VERIFIED for slot in operation.slots):
             return Stopped("create-pr", "not every first-publication slot is verified")
+        if operation.target is not FirstPublicationTarget.STANDALONE:
+            readiness_error = _publication_readiness_error(workspace, operation)
+            if readiness_error is not None:
+                return Stopped("readiness", readiness_error)
+            send_stack = False
+            if operation.stack_phase is StackLinkPhase.NOT_ATTEMPTED:
+                try:
+                    if not append_source_is_unchanged(github, operation):
+                        return Stopped(
+                            "stack-link", "existing append stack changed before linking"
+                        )
+                except Error as exc:
+                    return Stopped("stack-link", str(exc))
+                operation = replace(
+                    operation,
+                    stack_phase=StackLinkPhase.POSSIBLY_SENT,
+                    phase=FirstPublicationPhase.LINKING_STACK,
+                )
+                operation_oid = cas_write_first_publication(
+                    workspace, operation_oid, operation
+                )
+                send_stack = True
+            if operation.stack_phase is StackLinkPhase.POSSIBLY_SENT:
+                try:
+                    stack = observe_first_publication_stack(github, operation)
+                except Error as exc:
+                    return Stopped("stack-link", f"topology readback failed: {exc}")
+                if stack is None and send_stack:
+                    readiness_error = _publication_readiness_error(workspace, operation)
+                    if readiness_error is not None:
+                        return Stopped("readiness", readiness_error)
+                    try:
+                        if not append_source_is_unchanged(github, operation):
+                            return Stopped(
+                                "stack-link", "existing append stack changed before request"
+                            )
+                    except Error as exc:
+                        return Stopped("stack-link", str(exc))
+                    try:
+                        run_first_publication_stack_link(github, operation)
+                    except Error:
+                        # The mutation may have reached GitHub. Only topology
+                        # readback determines whether it completed.
+                        pass
+                    try:
+                        stack = observe_first_publication_stack(github, operation)
+                    except Error as exc:
+                        return Stopped(
+                            "stack-link", f"possibly sent; readback failed: {exc}"
+                        )
+                if stack is None:
+                    return Stopped(
+                        "stack-link",
+                        "possibly sent; complete stack membership is not yet exact",
+                    )
+                operation = replace(
+                    operation,
+                    stack_phase=StackLinkPhase.VERIFIED,
+                    resulting_stack=stack.identity,
+                )
+                operation_oid = cas_write_first_publication(
+                    workspace, operation_oid, operation
+                )
         return _finish_first_publication(operation_oid, operation, workspace, github)
 
 
