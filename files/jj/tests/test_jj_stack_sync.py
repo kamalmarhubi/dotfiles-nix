@@ -745,7 +745,7 @@ def test_complete_stack_source_validates_order_membership_and_base(monkeypatch) 
             }
         }
     }
-    monkeypatch.setattr(sync, "_command_json", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(sync, "_github_graphql", lambda *_args, **_kwargs: response)
 
     stack = sync.observe_github_stack(repository, "STACK_node")
 
@@ -1889,6 +1889,614 @@ def test_adopted_authority_is_distinct_and_can_authorize_replacement() -> None:
     assert plan.head_updates[0].authority == sync.MatchesLastAdoption(receipt)
 
 
+def first_publication_operation(
+    *,
+    phase: sync.NewPRPhase = sync.NewPRPhase.NOT_ATTEMPTED,
+    operation_phase: sync.FirstPublicationPhase = sync.FirstPublicationPhase.PREPARING_BOOKMARKS,
+    setup: sync.BookmarkSetup = sync.BookmarkSetup.CREATE,
+) -> sync.FirstPublication:
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    slot = sync.NewPRSlot(
+        "slot-123",
+        "jj-stack/change-slot123",
+        "2" * 40,
+        setup,
+        "main",
+        "New title",
+        "New body",
+        phase,
+    )
+    return sync.FirstPublication(
+        repository,
+        "owner/repo",
+        "ssh://git@github.com/owner/repo.git",
+        "origin",
+        (("stack.remote", "origin"),),
+        (("default", "2" * 40),),
+        "main",
+        None,
+        (slot,),
+        operation_phase,
+    )
+
+
+def publication_pr(
+    operation: sync.FirstPublication, *, initial: bool
+) -> sync.GitHubPullRequest:
+    slot = operation.slots[0]
+    return sync.GitHubPullRequest(
+        sync.PullRequestId(operation.repository, "PR_new"),
+        17,
+        sync.PullRequestState.OPEN,
+        True,
+        operation.repository,
+        slot.branch,
+        slot.commit_id,
+        slot.base_branch,
+        "0" * 40,
+        False,
+        False,
+        slot.title,
+        slot.initial_body if initial else slot.body,
+    )
+
+
+def test_first_publication_operation_round_trip_is_exact() -> None:
+    operation = first_publication_operation()
+
+    assert (
+        sync.parse_first_publication(sync.first_publication_to_json(operation))
+        == operation
+    )
+    malformed = json.loads(sync.first_publication_to_json(operation))
+    malformed["slots"][0]["unexpected"] = True
+    with pytest.raises(sync.Error, match="operation payload"):
+        sync.parse_first_publication(json.dumps(malformed))
+    untagged = json.loads(sync.first_publication_to_json(operation))
+    del untagged["operation_kind"]
+    with pytest.raises(sync.Error, match="operation payload"):
+        sync.parse_first_publication(json.dumps(untagged))
+
+
+def test_standalone_first_publication_is_state_first_and_fence_last(
+    jj_repo: Path, monkeypatch
+) -> None:
+    operation = first_publication_operation(setup=sync.BookmarkSetup.KEEP)
+    initial_pr = publication_pr(operation, initial=True)
+    final_pr = publication_pr(operation, initial=False)
+    slot = operation.slots[0]
+
+    def observe(_workspace, current):
+        published = (
+            current.phase is not sync.FirstPublicationPhase.PREPARING_BOOKMARKS
+            and current.slots[0].phase is not sync.NewPRPhase.NOT_ATTEMPTED
+        )
+        local = sync.LocalObservation(
+            "/repo",
+            "op",
+            current.effective_config,
+            current.workspace_targets,
+            (sync.LocalBookmark(slot.branch, sync.CommitTarget(slot.commit_id)),),
+            (),
+            (),
+            (),
+            "/git",
+        )
+        return local, (
+            sync.PublicationSlotReadback(
+                slot.slot_id,
+                sync.CommitTarget(slot.commit_id),
+                sync.CommitTarget(slot.commit_id) if published else None,
+                sync.TrackingState.TRACKED if published else None,
+                slot.commit_id if published else None,
+            ),
+        )
+
+    monkeypatch.setattr(sync, "observe_publication_slots", observe)
+    monkeypatch.setattr(
+        sync,
+        "push_new_slot_refs",
+        lambda *_args: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    monkeypatch.setattr(sync, "create_slot_pull_request", lambda *_args: initial_pr)
+    monkeypatch.setattr(sync, "update_frozen_pr_metadata", lambda *_args: None)
+    monkeypatch.setattr(
+        sync,
+        "find_slot_pull_requests",
+        lambda *_args, **_kwargs: (final_pr,),
+    )
+    original_delete = sync.cas_delete_operation
+    monkeypatch.setattr(
+        sync,
+        "cas_delete_operation",
+        lambda *_args: (_ for _ in ()).throw(sync.Error("injected cleanup failure")),
+    )
+
+    sync.start_first_publication(operation, jj_repo)
+    interrupted = sync.resume_first_publication(jj_repo)
+
+    assert isinstance(interrupted, sync.Stopped)
+    assert interrupted.stage == "fence"
+    state_oid, state = sync.read_state(jj_repo)
+    operation_oid, persisted = sync.read_first_publication(jj_repo)
+    assert state_oid == persisted.final_state_oid
+    assert persisted.phase is sync.FirstPublicationPhase.COMMITTING
+    assert state.stacks[0].ordered_prs == (initial_pr.identity,)
+    assert (
+        state.last_published_heads[0].verified_commit_id == operation.slots[0].commit_id
+    )
+
+    monkeypatch.setattr(sync, "cas_delete_operation", original_delete)
+    completed = sync.resume_first_publication(jj_repo)
+
+    assert completed == sync.FirstPublicationVerified((initial_pr.identity,))
+    assert sync.read_ref_oid(jj_repo, sync.OPERATION_REF) is None
+    assert sync.read_ref_oid(jj_repo, sync.STATE_REF) == state_oid
+    assert operation_oid is not None
+
+
+def test_possibly_sent_pr_create_with_negative_readback_never_replays(
+    jj_repo: Path, monkeypatch
+) -> None:
+    operation = first_publication_operation(
+        phase=sync.NewPRPhase.READY,
+        operation_phase=sync.FirstPublicationPhase.CREATING_PRS,
+        setup=sync.BookmarkSetup.KEEP,
+    )
+    creates: list[str] = []
+    slot = operation.slots[0]
+    local = sync.LocalObservation(
+        "/repo",
+        "op",
+        operation.effective_config,
+        operation.workspace_targets,
+        (sync.LocalBookmark(slot.branch, sync.CommitTarget(slot.commit_id)),),
+        (),
+        (),
+        (),
+        "/git",
+    )
+    monkeypatch.setattr(
+        sync,
+        "observe_publication_slots",
+        lambda *_args: (
+            local,
+            (
+                sync.PublicationSlotReadback(
+                    slot.slot_id,
+                    sync.CommitTarget(slot.commit_id),
+                    sync.CommitTarget(slot.commit_id),
+                    sync.TrackingState.TRACKED,
+                    slot.commit_id,
+                ),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        sync,
+        "create_slot_pull_request",
+        lambda *_args: (
+            creates.append("attempt")
+            or (_ for _ in ()).throw(sync.SourceUnavailable("lost response"))
+        ),
+    )
+    monkeypatch.setattr(sync, "find_slot_pull_requests", lambda *_args, **_kwargs: ())
+    sync.cas_write_first_publication(jj_repo, None, operation)
+
+    first = sync.resume_first_publication(jj_repo)
+    second = sync.resume_first_publication(jj_repo)
+
+    assert isinstance(first, sync.Stopped) and first.stage == "create-pr"
+    assert isinstance(second, sync.Stopped) and second.stage == "create-pr"
+    assert creates == ["attempt"]
+    _oid, persisted = sync.read_first_publication(jj_repo)
+    assert persisted.slots[0].phase is sync.NewPRPhase.POSSIBLY_SENT
+
+
+def test_publication_recovery_classifies_partial_slots_independently() -> None:
+    operation = first_publication_operation(
+        phase=sync.NewPRPhase.PUBLICATION_POSSIBLY_SENT,
+        operation_phase=sync.FirstPublicationPhase.PUBLISHING,
+        setup=sync.BookmarkSetup.KEEP,
+    )
+    prototype = operation.slots[0]
+    slots = (
+        dataclasses.replace(
+            prototype, slot_id="ready", branch="ready", phase=sync.NewPRPhase.READY
+        ),
+        dataclasses.replace(prototype, slot_id="track", branch="track"),
+        dataclasses.replace(prototype, slot_id="retry", branch="retry"),
+    )
+    operation = dataclasses.replace(operation, slots=slots)
+    readbacks = (
+        sync.PublicationSlotReadback(
+            "ready",
+            sync.CommitTarget(prototype.commit_id),
+            sync.CommitTarget(prototype.commit_id),
+            sync.TrackingState.TRACKED,
+            prototype.commit_id,
+        ),
+        sync.PublicationSlotReadback(
+            "track",
+            sync.CommitTarget(prototype.commit_id),
+            sync.CommitTarget(prototype.commit_id),
+            sync.TrackingState.UNTRACKED,
+            prototype.commit_id,
+        ),
+        sync.PublicationSlotReadback(
+            "retry",
+            sync.CommitTarget(prototype.commit_id),
+            None,
+            None,
+            None,
+        ),
+    )
+
+    assert sync.classify_publication_recovery(operation, readbacks) == (
+        sync.PublicationRecoveryAction.READY,
+        sync.PublicationRecoveryAction.TRACK,
+        sync.PublicationRecoveryAction.PUSH,
+    )
+
+    disappeared = dataclasses.replace(readbacks[0], live_commit_id=None)
+    blocked = sync.classify_publication_recovery(
+        operation, (disappeared, *readbacks[1:])
+    )
+    assert isinstance(blocked, sync.Stopped)
+    assert "drifted" in blocked.detail
+
+
+def test_native_publication_command_freezes_remote_names_and_disables_signing(
+    monkeypatch,
+) -> None:
+    operation = first_publication_operation(
+        phase=sync.NewPRPhase.PUBLICATION_POSSIBLY_SENT,
+        operation_phase=sync.FirstPublicationPhase.PUBLISHING,
+        setup=sync.BookmarkSetup.KEEP,
+    )
+    calls: list[list[str]] = []
+    monkeypatch.setattr(
+        sync.subprocess,
+        "run",
+        lambda command, **_kwargs: (
+            calls.append(command) or subprocess.CompletedProcess(command, 0, "", "")
+        ),
+    )
+
+    sync.push_new_slot_refs("/repo", operation, operation.slots)
+
+    assert calls == [
+        [
+            "jj",
+            "--color=never",
+            "--repository",
+            "/repo",
+            "--ignore-working-copy",
+            "--config",
+            "git.sign-on-push=false",
+            "git",
+            "push",
+            "--remote",
+            "origin",
+            "--bookmark",
+            operation.slots[0].branch,
+        ]
+    ]
+
+
+@pytest.mark.parametrize(
+    ("live", "remote", "tracking", "expected"),
+    (
+        (None, None, None, sync.PublicationRecoveryAction.PUSH),
+        ("2" * 40, None, None, sync.PublicationRecoveryAction.PUSH),
+        (
+            "2" * 40,
+            sync.CommitTarget("2" * 40),
+            sync.TrackingState.UNTRACKED,
+            sync.PublicationRecoveryAction.TRACK,
+        ),
+        (
+            "2" * 40,
+            sync.CommitTarget("2" * 40),
+            sync.TrackingState.TRACKED,
+            sync.PublicationRecoveryAction.READY,
+        ),
+    ),
+)
+def test_recorded_possible_publication_recovers_each_supported_readback(
+    live: str | None,
+    remote: sync.BookmarkTarget | None,
+    tracking: sync.TrackingState | None,
+    expected: sync.PublicationRecoveryAction,
+) -> None:
+    operation = first_publication_operation(
+        phase=sync.NewPRPhase.PUBLICATION_POSSIBLY_SENT,
+        operation_phase=sync.FirstPublicationPhase.PUBLISHING,
+        setup=sync.BookmarkSetup.KEEP,
+    )
+    slot = operation.slots[0]
+    readback = sync.PublicationSlotReadback(
+        slot.slot_id,
+        sync.CommitTarget(slot.commit_id),
+        remote,
+        tracking,
+        live,
+    )
+
+    assert sync.classify_publication_recovery(operation, (readback,)) == (expected,)
+
+
+def test_publication_never_creates_pr_before_all_ready(
+    jj_repo: Path, monkeypatch
+) -> None:
+    operation = first_publication_operation(
+        phase=sync.NewPRPhase.PUBLICATION_POSSIBLY_SENT,
+        operation_phase=sync.FirstPublicationPhase.PUBLISHING,
+        setup=sync.BookmarkSetup.KEEP,
+    )
+    slot = operation.slots[0]
+    local = sync.LocalObservation(
+        "/repo",
+        "op",
+        operation.effective_config,
+        operation.workspace_targets,
+        (sync.LocalBookmark(slot.branch, sync.CommitTarget(slot.commit_id)),),
+        (),
+        (),
+        (),
+        "/git",
+    )
+    readback = sync.PublicationSlotReadback(
+        slot.slot_id, sync.CommitTarget(slot.commit_id), None, None, None
+    )
+    monkeypatch.setattr(
+        sync, "observe_publication_slots", lambda *_args: (local, (readback,))
+    )
+    monkeypatch.setattr(
+        sync,
+        "push_new_slot_refs",
+        lambda *_args: subprocess.CompletedProcess([], 1, "", "lost"),
+    )
+    creates: list[str] = []
+    monkeypatch.setattr(
+        sync, "create_slot_pull_request", lambda *_args: creates.append("created")
+    )
+    sync.cas_write_first_publication(jj_repo, None, operation)
+
+    stopped = sync.resume_first_publication(jj_repo)
+
+    assert isinstance(stopped, sync.Stopped)
+    assert stopped.stage == "publish"
+    assert creates == []
+
+
+def test_exact_untracked_publication_is_repaired_before_pr_creation(
+    jj_repo: Path, monkeypatch
+) -> None:
+    operation = first_publication_operation(
+        phase=sync.NewPRPhase.PUBLICATION_POSSIBLY_SENT,
+        operation_phase=sync.FirstPublicationPhase.PUBLISHING,
+        setup=sync.BookmarkSetup.KEEP,
+    )
+    slot = operation.slots[0]
+    tracked = False
+    local = sync.LocalObservation(
+        "/repo",
+        "op",
+        operation.effective_config,
+        operation.workspace_targets,
+        (sync.LocalBookmark(slot.branch, sync.CommitTarget(slot.commit_id)),),
+        (),
+        (),
+        (),
+        "/git",
+    )
+
+    def observe(*_args):
+        return local, (
+            sync.PublicationSlotReadback(
+                slot.slot_id,
+                sync.CommitTarget(slot.commit_id),
+                sync.CommitTarget(slot.commit_id),
+                sync.TrackingState.TRACKED if tracked else sync.TrackingState.UNTRACKED,
+                slot.commit_id,
+            ),
+        )
+
+    def track(*_args):
+        nonlocal tracked
+        tracked = True
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    creates: list[str] = []
+    monkeypatch.setattr(sync, "observe_publication_slots", observe)
+    monkeypatch.setattr(sync, "track_publication_bookmark", track)
+    monkeypatch.setattr(
+        sync,
+        "create_slot_pull_request",
+        lambda *_args: (
+            creates.append("created")
+            or (_ for _ in ()).throw(sync.SourceUnavailable("lost"))
+        ),
+    )
+    monkeypatch.setattr(sync, "find_slot_pull_requests", lambda *_args, **_kwargs: ())
+    sync.cas_write_first_publication(jj_repo, None, operation)
+
+    stopped = sync.resume_first_publication(jj_repo)
+
+    assert tracked
+    assert creates == ["created"]
+    assert isinstance(stopped, sync.Stopped)
+    assert stopped.stage == "create-pr"
+
+
+@pytest.mark.parametrize("colocated", (True, False))
+@pytest.mark.parametrize("setup", (sync.BookmarkSetup.CREATE, sync.BookmarkSetup.KEEP))
+def test_native_first_publication_establishes_tracking_without_moving_workspace(
+    tmp_path: Path,
+    monkeypatch,
+    colocated: bool,
+    setup: sync.BookmarkSetup,
+) -> None:
+    remote = tmp_path / "remote.git"
+    seed = tmp_path / "seed"
+    repo = tmp_path / "repo"
+    run("git", "init", "--bare", "--initial-branch=main", remote)
+    run("git", "clone", remote, seed)
+    run("git", "-C", seed, "config", "user.name", "Test User")
+    run("git", "-C", seed, "config", "user.email", "test@example.com")
+    (seed / "base").write_text("base\n")
+    run("git", "-C", seed, "add", "base")
+    run("git", "-C", seed, "commit", "-m", "base")
+    run("git", "-C", seed, "push", "origin", "main")
+
+    run("jj", "git", "init", "--colocate" if colocated else "--no-colocate", repo)
+    jj(repo, "config", "set", "--repo", "user.name", "Test User")
+    jj(repo, "config", "set", "--repo", "user.email", "test@example.com")
+    jj(repo, "config", "set", "--repo", "stack.remote", "origin")
+    jj(
+        repo,
+        "config",
+        "set",
+        "--repo",
+        'revset-aliases."immutable_heads()"',
+        "trunk() | tags() | untracked_remote_bookmarks() | untracked_remote_tags()",
+    )
+    jj(repo, "git", "remote", "add", "origin", os.fspath(remote))
+    jj(repo, "git", "fetch", "--remote", "origin")
+    jj(repo, "new", "main@origin")
+    (repo / "change").write_text("published\n")
+    jj(repo, "describe", "-m", "Published title\n\nPublished body")
+    branch = "arbitrary/publication-name"
+    commit_id = jj(
+        repo, "--ignore-working-copy", "log", "-r", "@", "--no-graph", "-T", "commit_id"
+    )
+    if setup is sync.BookmarkSetup.KEEP:
+        jj(repo, "bookmark", "create", branch, "-r", commit_id)
+    local = sync.observe_local(
+        repo,
+        revision=f"main@origin | {commit_id}",
+        config_keys=("stack.remote",),
+    )
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    operation = sync.prepare_standalone_first_publication(
+        repo,
+        local,
+        sync.ToolStateRead(None, sync.EMPTY_STATE, None),
+        repository,
+        os.fspath(remote),
+        "origin",
+        "main",
+        sync.PublicationAssignment(commit_id, branch),
+        slot_id="slot-native",
+    )
+    assert isinstance(operation, sync.FirstPublication)
+    assert operation.slots[0].bookmark_setup is setup
+
+    (repo / "change").write_text("dirty but unsnapshotted\n")
+    before = (
+        jj(
+            repo,
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            "@",
+            "--no-graph",
+            "-T",
+            "commit_id ++ '\t' ++ change_id",
+        ),
+        jj(
+            repo,
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            "all()",
+            "--no-graph",
+            "-T",
+            "commit_id ++ '\t' ++ change_id ++ '\n'",
+        ),
+        jj(
+            repo,
+            "--ignore-working-copy",
+            "workspace",
+            "list",
+            "-T",
+            "name ++ '\t' ++ target.commit_id() ++ '\n'",
+        ),
+        (repo / "change").read_bytes(),
+    )
+    monkeypatch.setattr(
+        sync,
+        "create_slot_pull_request",
+        lambda *_args: (_ for _ in ()).throw(
+            sync.SourceUnavailable("stop before GitHub")
+        ),
+    )
+    monkeypatch.setattr(sync, "find_slot_pull_requests", lambda *_args, **_kwargs: ())
+
+    sync.start_first_publication(operation, repo)
+    stopped = sync.resume_first_publication(repo)
+
+    assert isinstance(stopped, sync.Stopped)
+    assert stopped.stage == "create-pr"
+    observed = sync.observe_local(
+        repo, revision=commit_id, config_keys=("stack.remote",)
+    )
+    assert (
+        sync.LocalBookmark(branch, sync.CommitTarget(commit_id))
+        in observed.local_bookmarks
+    )
+    assert (
+        sync.JjRemoteBookmark(
+            "origin", branch, sync.CommitTarget(commit_id), sync.TrackingState.TRACKED
+        )
+        in observed.remote_bookmarks
+    )
+    assert (
+        sync.observe_live_refs(
+            os.fspath(remote), repository.identity, (f"refs/heads/{branch}",)
+        )[0].commit_id
+        == commit_id
+    )
+    after = (
+        jj(
+            repo,
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            "@",
+            "--no-graph",
+            "-T",
+            "commit_id ++ '\t' ++ change_id",
+        ),
+        jj(
+            repo,
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            "all()",
+            "--no-graph",
+            "-T",
+            "commit_id ++ '\t' ++ change_id ++ '\n'",
+        ),
+        jj(
+            repo,
+            "--ignore-working-copy",
+            "workspace",
+            "list",
+            "-T",
+            "name ++ '\t' ++ target.commit_id() ++ '\n'",
+        ),
+        (repo / "change").read_bytes(),
+    )
+    assert after == before
+
+
 def multi_head_plan(*, merged_prefix: int = 0) -> tuple[sync.Snapshot, sync.Apply]:
     observed, selected = stacked_snapshot(
         count=merged_prefix + 2, merged_prefix=merged_prefix
@@ -2558,7 +3166,9 @@ def test_publication_assignment_explicit_mapping_wins_and_must_be_complete() -> 
     commits = ("1" * 40, "2" * 40)
     explicit = tuple(
         sync.PublicationAssignment(commit, name)
-        for commit, name in zip(commits, ("generated-one", "generated-two"), strict=True)
+        for commit, name in zip(
+            commits, ("generated-one", "generated-two"), strict=True
+        )
     )
     observed = publication_assignment_input(
         bookmarks=(
@@ -2576,7 +3186,9 @@ def test_publication_assignment_explicit_mapping_wins_and_must_be_complete() -> 
     assert blocked.reasons[0].code == "incomplete-explicit-assignment"
 
 
-def test_publication_assignment_mixes_unique_bookmark_and_template_per_revision() -> None:
+def test_publication_assignment_mixes_unique_bookmark_and_template_per_revision() -> (
+    None
+):
     commits = ("1" * 40, "2" * 40)
     observed = publication_assignment_input(
         bookmarks=(sync.LocalBookmark("intentional", sync.CommitTarget(commits[0])),),
