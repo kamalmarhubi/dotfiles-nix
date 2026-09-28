@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Collection, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TypeVar
@@ -17,6 +17,8 @@ class FakeGitHubServer:
         self._locators: dict[str, sync.GitHubRepositoryId] = {}
         self._pull_requests: dict[sync.PullRequestId, sync.GitHubPullRequest] = {}
         self._stacks: dict[sync.GitHubStackId, sync.GitHubStack] = {}
+        self._branches: dict[tuple[sync.GitHubRepositoryId, str], str] = {}
+        self._next_pull_request: dict[sync.GitHubRepositoryId, int] = {}
 
     def seed_repository(
         self, repository: sync.GitHubRepository, *, aliases: Sequence[str] = ()
@@ -29,6 +31,7 @@ class FakeGitHubServer:
         self._repositories[repository.identity] = repository
         for locator in locators:
             self._locators[locator] = repository.identity
+        self._next_pull_request[repository.identity] = 1
 
     def seed_pull_request(self, pull_request: sync.GitHubPullRequest) -> None:
         if pull_request.identity.repository not in self._repositories:
@@ -38,6 +41,20 @@ class FakeGitHubServer:
         if pull_request.stack is not None:
             raise ValueError("seed stack membership through seed_stack")
         self._pull_requests[pull_request.identity] = pull_request
+        self._next_pull_request[pull_request.identity.repository] = max(
+            self._next_pull_request[pull_request.identity.repository],
+            pull_request.identity.number + 1,
+        )
+
+    def seed_branch(
+        self, repository: sync.GitHubRepositoryId, branch: str, oid: str
+    ) -> None:
+        if repository not in self._repositories:
+            raise ValueError("branch repository is not seeded")
+        key = (repository, branch)
+        if not branch or key in self._branches:
+            raise ValueError("branch must be nonempty and unseeded")
+        self._branches[key] = oid
 
     def seed_stack(self, stack: sync.GitHubStack) -> None:
         if stack.identity.repository not in self._repositories:
@@ -69,6 +86,8 @@ class FakeGitHubServer:
         frozen._locators = self._locators.copy()
         frozen._pull_requests = self._pull_requests.copy()
         frozen._stacks = self._stacks.copy()
+        frozen._branches = self._branches.copy()
+        frozen._next_pull_request = self._next_pull_request.copy()
         return frozen
 
     def read_repository(
@@ -114,6 +133,73 @@ class FakeGitHubServer:
             raise ValueError("stack identity belongs to another repository")
         stack = self._stacks.get(identity)
         return None if stack is None else dataclasses.replace(stack)
+
+    def read_find_pull_requests(
+        self,
+        repository: sync.GitHubRepositoryId,
+        *,
+        head_branches: Sequence[str] = (),
+        base_branches: Sequence[str] = (),
+        states: Collection[sync.PullRequestState] | None = None,
+    ) -> tuple[sync.GitHubPullRequest, ...]:
+        heads = set(head_branches)
+        bases = set(base_branches)
+        if not heads and not bases:
+            raise ValueError("pull request search requires a head or base branch")
+        if "" in heads or "" in bases:
+            raise ValueError("pull request search branches must be nonempty")
+        selected_states = set(sync.PullRequestState) if states is None else set(states)
+        if not selected_states:
+            raise ValueError("pull request search states must be nonempty")
+        return self.read_pull_requests(
+            tuple(
+                pull_request.identity
+                for pull_request in self._pull_requests.values()
+                if pull_request.identity.repository == repository
+                and pull_request.state in selected_states
+                and (
+                    pull_request.head_branch in heads
+                    or pull_request.base_branch in bases
+                )
+            )
+        )
+
+    def apply_create_pull_request(
+        self,
+        repository: sync.GitHubRepository,
+        *,
+        head_branch: str,
+        base_branch: str,
+        title: str,
+        body: str,
+        draft: bool,
+    ) -> sync.PullRequestId:
+        if not head_branch or not base_branch or not title:
+            raise ValueError("pull request branches and title must be nonempty")
+        head_oid = self._branches.get((repository.identity, head_branch))
+        base_oid = self._branches.get((repository.identity, base_branch))
+        if head_oid is None or base_oid is None:
+            raise sync.IncompleteSource("pull request branch is unavailable")
+        number = self._next_pull_request[repository.identity]
+        self._next_pull_request[repository.identity] += 1
+        identity = sync.PullRequestId(repository.identity, number)
+        self._pull_requests[identity] = sync.GitHubPullRequest(
+            identity,
+            f"PR_{repository.identity.node_id}_{number}",
+            sync.PullRequestState.OPEN,
+            draft,
+            repository.identity,
+            head_branch,
+            head_oid,
+            base_branch,
+            base_oid,
+            False,
+            False,
+            title,
+            body,
+            None,
+        )
+        return identity
 
     def apply_update_pull_request(
         self,
@@ -233,7 +319,10 @@ class _WriteFault:
 class FakeGitHubClient:
     """GitHub client fake with transport and scheduling fault injection."""
 
-    _MUTATIONS = {sync.GitHubClient.update_pull_request}
+    _MUTATIONS = {
+        sync.GitHubClient.create_pull_request,
+        sync.GitHubClient.update_pull_request,
+    }
 
     def __init__(self, server: FakeGitHubServer) -> None:
         self._server = server
@@ -350,6 +439,44 @@ class FakeGitHubClient:
         identity: sync.GitHubStackId,
     ) -> sync.GitHubStack | None:
         return self._reader().read_stack(repository, identity)
+
+    def find_pull_requests(
+        self,
+        repository: sync.GitHubRepositoryId,
+        *,
+        head_branches: Sequence[str] = (),
+        base_branches: Sequence[str] = (),
+        states: Collection[sync.PullRequestState] | None = None,
+    ) -> tuple[sync.GitHubPullRequest, ...]:
+        return self._reader().read_find_pull_requests(
+            repository,
+            head_branches=tuple(head_branches),
+            base_branches=tuple(base_branches),
+            states=None if states is None else tuple(states),
+        )
+
+    def create_pull_request(
+        self,
+        repository: sync.GitHubRepository,
+        *,
+        head_branch: str,
+        base_branch: str,
+        title: str,
+        body: str,
+        draft: bool,
+    ) -> sync.PullRequestId:
+        return self._mutation(
+            sync.GitHubClient.create_pull_request,
+            None,
+            lambda: self._server.apply_create_pull_request(
+                repository,
+                head_branch=head_branch,
+                base_branch=base_branch,
+                title=title,
+                body=body,
+                draft=draft,
+            ),
+        )
 
     def update_pull_request(
         self,

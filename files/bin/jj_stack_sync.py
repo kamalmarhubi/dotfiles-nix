@@ -10,13 +10,14 @@ import http.client
 import json
 import os
 import re
+import secrets
 import socket
 import ssl
 import subprocess
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
@@ -291,6 +292,26 @@ class GitHubClient(Protocol):
     def stack(
         self, repository: GitHubRepository, identity: GitHubStackId
     ) -> GitHubStack | None: ...
+
+    def find_pull_requests(
+        self,
+        repository: GitHubRepositoryId,
+        *,
+        head_branches: Sequence[str] = (),
+        base_branches: Sequence[str] = (),
+        states: Collection[PullRequestState] | None = None,
+    ) -> tuple[GitHubPullRequest, ...]: ...
+
+    def create_pull_request(
+        self,
+        repository: GitHubRepository,
+        *,
+        head_branch: str,
+        base_branch: str,
+        title: str,
+        body: str,
+        draft: bool,
+    ) -> PullRequestId: ...
 
     def update_pull_request(
         self,
@@ -579,6 +600,69 @@ class AdoptionVerified:
     adopted_heads: tuple[LastAdoptedHead, ...]
 
 
+class BookmarkSetup(StrEnum):
+    CREATE = "create"
+    KEEP = "keep"
+
+
+class NewPRPhase(StrEnum):
+    NOT_ATTEMPTED = "not-attempted"
+    PUBLICATION_POSSIBLY_SENT = "publication-possibly-sent"
+    READY = "ready"
+    POSSIBLY_SENT = "possibly-sent"
+    BOUND = "bound"
+    VERIFIED = "verified"
+
+
+class FirstPublicationPhase(StrEnum):
+    PREPARING_BOOKMARKS = "preparing-bookmarks"
+    PUBLISHING = "publishing"
+    CREATING_PRS = "creating-prs"
+    COMMITTING = "committing"
+
+
+@dataclass(frozen=True)
+class NewPRSlot:
+    slot_id: str
+    branch: str
+    commit_id: str
+    bookmark_setup: BookmarkSetup
+    base_branch: str
+    title: str
+    body: str
+    phase: NewPRPhase = NewPRPhase.NOT_ATTEMPTED
+    pr_identity: PullRequestId | None = None
+
+    @property
+    def marker(self) -> str:
+        return f"<!-- jj-stack-slot:{self.slot_id} -->"
+
+    @property
+    def initial_body(self) -> str:
+        return f"{self.body}\n\n{self.marker}" if self.body else self.marker
+
+
+@dataclass(frozen=True)
+class FirstPublication:
+    repository: GitHubRepositoryId
+    repository_name: str
+    push_url: str
+    remote: str
+    effective_config: tuple[tuple[str, str], ...]
+    workspace_targets: tuple[tuple[str, str], ...]
+    base_branch: str
+    expected_state_oid: str | None
+    slots: tuple[NewPRSlot, ...]
+    phase: FirstPublicationPhase = FirstPublicationPhase.PREPARING_BOOKMARKS
+    final_state_json: str | None = None
+    final_state_oid: str | None = None
+
+
+@dataclass(frozen=True)
+class FirstPublicationVerified:
+    ordered_prs: tuple[PullRequestId, ...]
+
+
 @dataclass(frozen=True)
 class PlannedHeadUpdate:
     ref: RemoteBranchRef
@@ -633,6 +717,7 @@ class Stopped:
 
 ApplyResult = Verified | Stopped
 AdoptionResult = AdoptionVerified | Stopped
+FirstPublicationResult = FirstPublicationVerified | Stopped
 
 
 def _run(
@@ -949,7 +1034,7 @@ def _resolve_github_repository(
     )
 
 
-_PR_SOURCE_FIELDS = {
+_PULL_REQUEST_FIELDS = {
     "id",
     "number",
     "state",
@@ -966,30 +1051,38 @@ _PR_SOURCE_FIELDS = {
     "stack",
 }
 
-_PR_SOURCE_QUERY = """
-query($owner: String!, $name: String!, $number: Int!) {
-  repository(owner: $owner, name: $name) {
+_PULL_REQUEST_QUERY_FIELDS = """
+id number state isDraft
+headRepository { id }
+headRefName headRefOid baseRefName baseRefOid
+autoMergeRequest { enabledAt }
+mergeQueueEntry { id }
+title body
+stack { id number baseRefName }
+"""
+
+_PULL_REQUEST_QUERY = f"""
+query($owner: String!, $name: String!, $number: Int!) {{
+  repository(owner: $owner, name: $name) {{
     id
-    pullRequest(number: $number) {
-      id number state isDraft
-      headRepository { id }
-      headRefName headRefOid baseRefName baseRefOid
-      autoMergeRequest { enabledAt }
-      mergeQueueEntry { id }
-      title body
-      stack { id number baseRefName }
-    }
-  }
-}
+    pullRequest(number: $number) {{ {_PULL_REQUEST_QUERY_FIELDS} }}
+  }}
+}}
 """
 
 
-def _parse_github_pull_request(
-    value: object, repository: GitHubRepository, expected_number: int
+def _parse_pull_request(
+    value: object,
+    repository: GitHubRepository,
+    expected_number: int | None = None,
 ) -> GitHubPullRequest:
-    raw = _exact_record(value, _PR_SOURCE_FIELDS, "pull request")
+    raw = _exact_record(value, _PULL_REQUEST_FIELDS, "pull request")
     number = raw["number"]
-    if type(number) is not int or number <= 0 or number != expected_number:
+    if (
+        type(number) is not int
+        or number <= 0
+        or (expected_number is not None and number != expected_number)
+    ):
         raise SourceMismatch("GitHub returned a different pull request number")
     try:
         state = PullRequestState(_text(raw["state"], "pull request state"))
@@ -1071,7 +1164,7 @@ def _read_github_pull_request(
     response = _exact_record(
         _github_graphql(
             repository.identity.host,
-            _PR_SOURCE_QUERY,
+            _PULL_REQUEST_QUERY,
             {"owner": owner, "name": name, "number": number},
             cwd=cwd,
         ),
@@ -1093,7 +1186,7 @@ def _read_github_pull_request(
     pull_request = repository_record["pullRequest"]
     if pull_request is None:
         raise IncompleteSource(f"pull request #{number} is unavailable")
-    return _parse_github_pull_request(pull_request, repository, number)
+    return _parse_pull_request(pull_request, repository, number)
 
 
 def _github_repository_path(name_with_owner: str) -> str:
@@ -1204,6 +1297,154 @@ class GitHubAPI:
             return None
         value = _github_json_response(response, "GitHub stack response")
         return _parse_github_stack(value, repository.identity, identity)
+
+    def find_pull_requests(
+        self,
+        repository: GitHubRepositoryId,
+        *,
+        head_branches: Sequence[str] = (),
+        base_branches: Sequence[str] = (),
+        states: Collection[PullRequestState] | None = None,
+    ) -> tuple[GitHubPullRequest, ...]:
+        heads = tuple(dict.fromkeys(head_branches))
+        bases = tuple(dict.fromkeys(base_branches))
+        if not heads and not bases:
+            raise ValueError("pull request search requires a head or base branch")
+        if any(not branch for branch in heads + bases):
+            raise ValueError("pull request search branches must be nonempty")
+        selected_states = (
+            tuple(PullRequestState) if states is None else tuple(dict.fromkeys(states))
+        )
+        if not selected_states:
+            raise ValueError("pull request search states must be nonempty")
+        if any(not isinstance(state, PullRequestState) for state in selected_states):
+            raise ValueError("pull request search states are invalid")
+
+        resolved = self.resolve_repository(repository)
+        owner, separator, name = resolved.name_with_owner.partition("/")
+        if not separator or not owner or not name or "/" in name:
+            raise ValueError("repository name must have owner/name form")
+        declarations = [
+            "$owner: String!",
+            "$name: String!",
+            "$states: [PullRequestState!]!",
+        ]
+        variables: dict[str, object] = {
+            "owner": owner,
+            "name": name,
+            "states": [state.value for state in selected_states],
+        }
+        connections: list[str] = []
+        aliases: list[str] = []
+        for prefix, argument, branches in (
+            ("head", "headRefName", heads),
+            ("base", "baseRefName", bases),
+        ):
+            for index, branch in enumerate(branches):
+                alias = f"{prefix}{index}"
+                declarations.append(f"${alias}: String!")
+                variables[alias] = branch
+                aliases.append(alias)
+                connections.append(
+                    f"""
+                    {alias}: pullRequests(
+                      first: 100, states: $states, {argument}: ${alias}
+                    ) {{
+                      nodes {{ {_PULL_REQUEST_QUERY_FIELDS} }}
+                      pageInfo {{ hasNextPage }}
+                    }}
+                    """
+                )
+        response = _exact_record(
+            _github_graphql(
+                repository.host,
+                f"""
+                query({', '.join(declarations)}) {{
+                  repository(owner: $owner, name: $name) {{
+                    id
+                    {''.join(connections)}
+                  }}
+                }}
+                """,
+                variables,
+                cwd=self.workspace,
+            ),
+            {"data"},
+            "pull request search response",
+        )
+        data = _exact_record(response["data"], {"repository"}, "search data")
+        if data["repository"] is None:
+            raise IncompleteSource("GitHub repository is unavailable")
+        raw_repository = _exact_record(
+            data["repository"], {"id", *aliases}, "search repository"
+        )
+        if raw_repository["id"] != repository.node_id:
+            raise SourceMismatch("pull request search returned another repository")
+        found: dict[PullRequestId, GitHubPullRequest] = {}
+        for alias in aliases:
+            connection = _exact_record(
+                raw_repository[alias], {"nodes", "pageInfo"}, "search connection"
+            )
+            page = _exact_record(
+                connection["pageInfo"], {"hasNextPage"}, "search page info"
+            )
+            if page["hasNextPage"] is not False:
+                raise IncompleteSource("pull request search was truncated")
+            nodes = connection["nodes"]
+            if not isinstance(nodes, list):
+                raise MalformedSource("pull request search nodes must be an array")
+            for node in nodes:
+                pull_request = _parse_pull_request(node, resolved)
+                previous = found.get(pull_request.identity)
+                if previous is not None and previous != pull_request:
+                    raise SourceMismatch(
+                        "pull request search returned contradictory observations"
+                    )
+                found[pull_request.identity] = pull_request
+        return tuple(found.values())
+
+    def create_pull_request(
+        self,
+        repository: GitHubRepository,
+        *,
+        head_branch: str,
+        base_branch: str,
+        title: str,
+        body: str,
+        draft: bool,
+    ) -> PullRequestId:
+        if not head_branch or not base_branch or not title:
+            raise ValueError("pull request branches and title must be nonempty")
+        response = github_http_request(
+            repository.identity.host,
+            "POST",
+            f"/{_github_repository_path(repository.name_with_owner)}/pulls",
+            body=json.dumps(
+                {
+                    "head": head_branch,
+                    "base": base_branch,
+                    "title": title,
+                    "body": body,
+                    "draft": draft,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode(),
+            cwd=self.workspace,
+        )
+        value = _github_json_response(response, "create pull request response")
+        if not isinstance(value, dict):
+            raise MalformedSource("create pull request response must be an object")
+        number = value.get("number")
+        base = value.get("base")
+        if type(number) is not int or number <= 0 or not isinstance(base, dict):
+            raise MalformedSource("created pull request identity is malformed")
+        raw_repository = base.get("repo")
+        if not isinstance(raw_repository, dict):
+            raise MalformedSource("created pull request repository is malformed")
+        if raw_repository.get("node_id") != repository.identity.node_id:
+            raise SourceMismatch("GitHub created a pull request in another repository")
+        return PullRequestId(repository.identity, number)
 
     def update_pull_request(
         self,
@@ -1918,6 +2159,299 @@ def cas_write_state(
     return new_oid
 
 
+def _validate_first_publication(operation: FirstPublication) -> None:
+    if (
+        not operation.repository.host
+        or not operation.repository.node_id
+        or not operation.repository_name
+        or not operation.push_url
+        or not operation.remote
+        or not operation.base_branch
+        or len(operation.slots) != 1
+    ):
+        raise ValueError(
+            "standalone first-publication identity and goal must be nonempty"
+        )
+    owner, separator, name = operation.repository_name.partition("/")
+    if not separator or not owner or not name or "/" in name:
+        raise ValueError("first-publication repository name must be owner/name")
+    if len({key for key, _value in operation.effective_config}) != len(
+        operation.effective_config
+    ) or any(not key for key, _value in operation.effective_config):
+        raise ValueError("first-publication effective config must have unique keys")
+    if (
+        not operation.workspace_targets
+        or len({name for name, _target in operation.workspace_targets})
+        != len(operation.workspace_targets)
+        or any(not name or not target for name, target in operation.workspace_targets)
+    ):
+        raise ValueError("first-publication workspace targets must be complete")
+    if len({slot.slot_id for slot in operation.slots}) != len(operation.slots):
+        raise ValueError("first-publication slot IDs must be unique")
+    if len({slot.branch for slot in operation.slots}) != len(operation.slots):
+        raise ValueError("first-publication branches must be unique")
+    for slot in operation.slots:
+        if (
+            not slot.slot_id
+            or not slot.branch
+            or not slot.commit_id
+            or not slot.base_branch
+            or not slot.title
+            or slot.marker in slot.body
+        ):
+            raise ValueError("first-publication slot is malformed")
+        bound = slot.phase in {NewPRPhase.BOUND, NewPRPhase.VERIFIED}
+        if bound != (slot.pr_identity is not None):
+            raise ValueError("slot binding does not match its phase")
+        if (
+            slot.pr_identity is not None
+            and slot.pr_identity.repository != operation.repository
+        ):
+            raise ValueError("slot PR belongs to another repository")
+    phases = {slot.phase for slot in operation.slots}
+    if operation.phase is FirstPublicationPhase.PREPARING_BOOKMARKS and phases != {
+        NewPRPhase.NOT_ATTEMPTED
+    }:
+        raise ValueError("bookmark preparation cannot follow publication effects")
+    if operation.phase is FirstPublicationPhase.PUBLISHING and not phases <= {
+        NewPRPhase.NOT_ATTEMPTED,
+        NewPRPhase.PUBLICATION_POSSIBLY_SENT,
+        NewPRPhase.READY,
+    }:
+        raise ValueError("publishing phase has invalid slot progress")
+    if operation.phase is FirstPublicationPhase.CREATING_PRS and not phases <= {
+        NewPRPhase.READY,
+        NewPRPhase.POSSIBLY_SENT,
+        NewPRPhase.BOUND,
+        NewPRPhase.VERIFIED,
+    }:
+        raise ValueError("PR creation phase has invalid slot progress")
+    if operation.phase is FirstPublicationPhase.COMMITTING and phases != {
+        NewPRPhase.VERIFIED
+    }:
+        raise ValueError("committing requires every slot verified")
+    committing = operation.phase is FirstPublicationPhase.COMMITTING
+    if committing != (
+        operation.final_state_json is not None and operation.final_state_oid is not None
+    ):
+        raise ValueError("committing phase must freeze the exact final state blob")
+    if committing:
+        assert operation.final_state_json is not None
+        parse_state(operation.final_state_json)
+
+
+def first_publication_to_json(operation: FirstPublication) -> str:
+    _validate_first_publication(operation)
+    payload = asdict(operation)
+    payload["operation_kind"] = "first-publication"
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def parse_first_publication(data: str) -> FirstPublication:
+    def exact(value: object, names: set[str], context: str) -> dict[str, object]:
+        if not isinstance(value, dict) or set(value) != names:
+            raise ValueError(f"{context} has unexpected fields")
+        return value
+
+    def text(value: object, context: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{context} must be nonempty text")
+        return value
+
+    def optional_text(value: object, context: str) -> str | None:
+        return None if value is None else text(value, context)
+
+    def repository(value: object, context: str) -> GitHubRepositoryId:
+        raw = exact(value, {"host", "node_id"}, context)
+        return GitHubRepositoryId(
+            text(raw["host"], f"{context}.host"),
+            text(raw["node_id"], f"{context}.node_id"),
+        )
+
+    def pr(value: object, context: str) -> PullRequestId:
+        raw = exact(value, {"repository", "number"}, context)
+        number = raw["number"]
+        if type(number) is not int or number <= 0:
+            raise ValueError(f"{context}.number must be a positive integer")
+        return PullRequestId(
+            repository(raw["repository"], f"{context}.repository"),
+            number,
+        )
+
+    try:
+        raw = exact(
+            json.loads(data),
+            {
+                "operation_kind",
+                "repository",
+                "repository_name",
+                "push_url",
+                "remote",
+                "effective_config",
+                "workspace_targets",
+                "base_branch",
+                "expected_state_oid",
+                "slots",
+                "phase",
+                "final_state_json",
+                "final_state_oid",
+            },
+            "operation",
+        )
+        if raw["operation_kind"] != "first-publication":
+            raise ValueError("operation kind is invalid")
+        raw_slots = raw["slots"]
+        raw_config = raw["effective_config"]
+        raw_workspaces = raw["workspace_targets"]
+        if (
+            not isinstance(raw_slots, list)
+            or not isinstance(raw_config, list)
+            or not isinstance(raw_workspaces, list)
+        ):
+            raise ValueError("operation slots, config, and workspaces must be arrays")
+
+        def pairs(value: list[object], context: str) -> tuple[tuple[str, str], ...]:
+            parsed: list[tuple[str, str]] = []
+            for index, item in enumerate(value):
+                if (
+                    not isinstance(item, list)
+                    or len(item) != 2
+                    or not all(isinstance(part, str) for part in item)
+                ):
+                    raise ValueError(f"{context}[{index}] must be a text pair")
+                parsed.append((item[0], item[1]))  # type: ignore[arg-type]
+            return tuple(parsed)
+
+        slots: list[NewPRSlot] = []
+        for index, value in enumerate(raw_slots):
+            context = f"slots[{index}]"
+            slot = exact(
+                value,
+                {
+                    "slot_id",
+                    "branch",
+                    "commit_id",
+                    "bookmark_setup",
+                    "base_branch",
+                    "title",
+                    "body",
+                    "phase",
+                    "pr_identity",
+                },
+                context,
+            )
+            slots.append(
+                NewPRSlot(
+                    text(slot["slot_id"], f"{context}.slot_id"),
+                    text(slot["branch"], f"{context}.branch"),
+                    text(slot["commit_id"], f"{context}.commit_id"),
+                    BookmarkSetup(
+                        text(slot["bookmark_setup"], f"{context}.bookmark_setup")
+                    ),
+                    text(slot["base_branch"], f"{context}.base_branch"),
+                    text(slot["title"], f"{context}.title"),
+                    slot["body"] if isinstance(slot["body"], str) else None,  # type: ignore[arg-type]
+                    NewPRPhase(text(slot["phase"], f"{context}.phase")),
+                    (
+                        None
+                        if slot["pr_identity"] is None
+                        else pr(slot["pr_identity"], f"{context}.pr_identity")
+                    ),
+                )
+            )
+            if slots[-1].body is None:
+                raise ValueError(f"{context}.body must be text")
+        expected_oid = raw["expected_state_oid"]
+        if expected_oid is not None and not isinstance(expected_oid, str):
+            raise ValueError("expected_state_oid must be text or null")
+        operation = FirstPublication(
+            repository(raw["repository"], "operation.repository"),
+            text(raw["repository_name"], "operation.repository_name"),
+            text(raw["push_url"], "operation.push_url"),
+            text(raw["remote"], "operation.remote"),
+            pairs(raw_config, "effective_config"),
+            pairs(raw_workspaces, "workspace_targets"),
+            text(raw["base_branch"], "operation.base_branch"),
+            expected_oid,
+            tuple(slots),
+            FirstPublicationPhase(text(raw["phase"], "operation.phase")),
+            optional_text(raw["final_state_json"], "operation.final_state_json"),
+            optional_text(raw["final_state_oid"], "operation.final_state_oid"),
+        )
+        _validate_first_publication(operation)
+        return operation
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise Error(f"invalid refs/jj-stack/operation payload: {exc}") from exc
+
+
+def read_first_publication(
+    workspace: str | Path,
+) -> tuple[str, FirstPublication]:
+    oid = read_ref_oid(workspace, OPERATION_REF)
+    if oid is None:
+        raise Error("there is no active first-publication operation")
+    common = git_common_dir(workspace)
+    payload = _run(["git", f"--git-dir={common}", "cat-file", "blob", oid])
+    return oid, parse_first_publication(payload)
+
+
+def cas_write_first_publication(
+    workspace: str | Path,
+    expected_oid: str | None,
+    operation: FirstPublication,
+) -> str:
+    common = git_common_dir(workspace)
+    new_oid = _run(
+        ["git", f"--git-dir={common}", "hash-object", "-w", "--stdin"],
+        stdin=first_publication_to_json(operation),
+    ).strip()
+    expected = expected_oid or ("0" * len(new_oid))
+    result = subprocess.run(
+        [
+            "git",
+            f"--git-dir={common}",
+            "update-ref",
+            OPERATION_REF,
+            new_oid,
+            expected,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        if read_ref_oid(workspace, OPERATION_REF) != expected_oid:
+            raise ConcurrentUpdate("operation ref changed during compare-and-swap")
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise Error(
+            "could not update operation ref" + (f": {detail}" if detail else "")
+        )
+    return new_oid
+
+
+def cas_delete_operation(workspace: str | Path, expected_oid: str) -> None:
+    common = git_common_dir(workspace)
+    result = subprocess.run(
+        [
+            "git",
+            f"--git-dir={common}",
+            "update-ref",
+            "-d",
+            OPERATION_REF,
+            expected_oid,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        if read_ref_oid(workspace, OPERATION_REF) != expected_oid:
+            raise ConcurrentUpdate(
+                "operation ref changed during compare-and-swap delete"
+            )
+        raise Error("could not delete completed operation fence")
+
+
 @contextmanager
 def repository_lock(workspace: str | Path) -> Iterator[None]:
     path = git_common_dir(workspace) / "jj-stack.lock"
@@ -1953,9 +2487,7 @@ def _valid_publication_branch(name: str) -> bool:
     ):
         return False
     return all(
-        component
-        and not component.startswith(".")
-        and not component.endswith(".lock")
+        component and not component.startswith(".") and not component.endswith(".lock")
         for component in name.split("/")
     )
 
@@ -2048,7 +2580,9 @@ def resolve_publication_assignments(
                 "target, managed, or protected branch names cannot be published",
             )
         same_name = tuple(
-            bookmark for bookmark in observed.local.local_bookmarks if bookmark.name == name
+            bookmark
+            for bookmark in observed.local.local_bookmarks
+            if bookmark.name == name
         )
         if len(same_name) > 1 or any(
             not isinstance(bookmark.target, CommitTarget)
@@ -2164,6 +2698,102 @@ def _metadata(description: str) -> tuple[str, str] | None:
     if separator:
         body = _reflow_markdown(body.removeprefix("\n"))
     return title, body
+
+
+def prepare_standalone_first_publication(
+    workspace: str | Path,
+    local: LocalObservation,
+    tool_state: ToolStateRead,
+    repository: GitHubRepository,
+    push_url: str,
+    remote: str,
+    base_branch: str,
+    assignment: PublicationAssignment,
+    *,
+    slot_id: str | None = None,
+) -> FirstPublication | Blocked:
+    """Freeze one resolved unpublished revision and its exact bookmark setup."""
+    if tool_state.operation_blob_oid is not None:
+        return _block("operation-fenced", OPERATION_REF, "another operation is active")
+    commit_id = assignment.commit_id
+    commits = tuple(commit for commit in local.commits if commit.commit_id == commit_id)
+    if len(commits) != 1 or commits[0].has_conflicts:
+        return _block(
+            "commit-unavailable",
+            commit_id,
+            "revision is absent, duplicated, or conflicted",
+        )
+    metadata = _metadata(commits[0].description)
+    if metadata is None:
+        return _block("title-missing", commit_id, "revision has no description title")
+    base_name = f"refs/heads/{base_branch}"
+    base_observation = observe_live_refs(
+        push_url, repository.identity, (base_name,), cwd=workspace
+    )[0]
+    if (
+        base_observation.commit_id is None
+        or not _comparison_is_nonempty_linear_and_conflict_free(
+            local.commits, base_observation.commit_id, commit_id
+        )
+    ):
+        return _block(
+            "invalid-comparison",
+            commit_id,
+            "base-to-revision segment is empty, nonlinear, incomplete, or conflicted",
+        )
+    nonce = slot_id or secrets.token_hex(16)
+    branch = assignment.branch_name
+    local_matches = tuple(item for item in local.local_bookmarks if item.name == branch)
+    if not local_matches:
+        bookmark_setup = BookmarkSetup.CREATE
+    elif (
+        len(local_matches) == 1
+        and isinstance(local_matches[0].target, CommitTarget)
+        and local_matches[0].target.commit_id == commit_id
+    ):
+        bookmark_setup = BookmarkSetup.KEEP
+    else:
+        return _block(
+            "bookmark-setup-changed",
+            branch,
+            "resolved publication bookmark is no longer absent or exact",
+        )
+    try:
+        observed_push_url = resolve_push_url(local, remote)
+    except Error as exc:
+        return _block("push-remote-unavailable", remote, str(exc))
+    if observed_push_url != push_url:
+        return _block("push-url-changed", remote, "publication remote changed")
+    head = observe_live_refs(
+        push_url,
+        repository.identity,
+        (f"refs/heads/{branch}",),
+        cwd=workspace,
+    )[0]
+    if head.commit_id is not None:
+        return _block("branch-collision", branch, "generated branch exists remotely")
+    title, body = metadata
+    return FirstPublication(
+        repository.identity,
+        repository.name_with_owner,
+        push_url,
+        remote,
+        local.effective_config,
+        local.workspace_targets,
+        base_branch,
+        tool_state.state_blob_oid,
+        (
+            NewPRSlot(
+                nonce,
+                branch,
+                commit_id,
+                bookmark_setup,
+                base_branch,
+                title,
+                body,
+            ),
+        ),
+    )
 
 
 def _complete_selection(
@@ -2862,6 +3492,243 @@ def push_exact_head_updates(
     )
 
 
+def _slot_pr_matches(
+    repository: GitHubRepositoryId,
+    slot: NewPRSlot,
+    pr: GitHubPullRequest,
+    *,
+    initial: bool,
+) -> bool:
+    return (
+        pr.identity.repository == repository
+        and pr.head_repository == repository
+        and pr.head_branch == slot.branch
+        and pr.head_oid == slot.commit_id
+        and pr.base_branch == slot.base_branch
+        and pr.title == slot.title
+        and pr.body == (slot.initial_body if initial else slot.body)
+        and pr.stack is None
+        and not pr.auto_merge_enabled
+        and not pr.in_merge_queue
+        and pr.state is PullRequestState.OPEN
+        and pr.draft
+    )
+
+
+@dataclass(frozen=True)
+class PublicationSlotReadback:
+    slot_id: str
+    local_target: BookmarkTarget | None
+    remote_target: BookmarkTarget | None
+    remote_tracking: TrackingState | None
+    live_commit_id: str | None
+
+
+class PublicationRecoveryAction(StrEnum):
+    PUSH = "push"
+    TRACK = "track"
+    READY = "ready"
+
+
+def _exact_target(target: BookmarkTarget | None, commit_id: str) -> bool:
+    return isinstance(target, CommitTarget) and target.commit_id == commit_id
+
+
+def _absent_target(target: BookmarkTarget | None) -> bool:
+    return target is None or isinstance(target, AbsentBookmarkTarget)
+
+
+def classify_publication_recovery(
+    operation: FirstPublication,
+    readbacks: Sequence[PublicationSlotReadback],
+) -> tuple[PublicationRecoveryAction, ...] | Stopped:
+    """Classify every slot from durable progress plus authoritative readback."""
+    if len(readbacks) != len(operation.slots):
+        return Stopped("publish", "publication readback is incomplete")
+    actions: list[PublicationRecoveryAction] = []
+    for slot, readback in zip(operation.slots, readbacks, strict=True):
+        if readback.slot_id != slot.slot_id:
+            return Stopped("publish", "publication readback identifies another slot")
+        if not _exact_target(readback.local_target, slot.commit_id):
+            return Stopped(
+                "bookmark", f"local bookmark {slot.branch} moved or conflicted"
+            )
+        live = readback.live_commit_id
+        remote = readback.remote_target
+        if slot.phase is NewPRPhase.NOT_ATTEMPTED:
+            if live is not None:
+                return Stopped(
+                    "publish",
+                    f"destination {slot.branch} existed before the first attempt",
+                )
+            if not _absent_target(remote):
+                return Stopped(
+                    "tracking",
+                    f"remote bookmark {slot.branch}@{operation.remote} is stale or conflicted",
+                )
+            actions.append(PublicationRecoveryAction.PUSH)
+            continue
+        if slot.phase is NewPRPhase.PUBLICATION_POSSIBLY_SENT:
+            if live == slot.commit_id:
+                if _exact_target(remote, slot.commit_id):
+                    actions.append(
+                        PublicationRecoveryAction.READY
+                        if readback.remote_tracking is TrackingState.TRACKED
+                        else PublicationRecoveryAction.TRACK
+                    )
+                elif _absent_target(remote):
+                    actions.append(PublicationRecoveryAction.PUSH)
+                else:
+                    return Stopped(
+                        "tracking",
+                        f"remote bookmark {slot.branch}@{operation.remote} is foreign",
+                    )
+                continue
+            if live is None and _absent_target(remote):
+                actions.append(PublicationRecoveryAction.PUSH)
+                continue
+            return Stopped(
+                "publish",
+                f"destination or remote bookmark for {slot.branch} is foreign",
+            )
+        if slot.phase is NewPRPhase.READY:
+            if (
+                live == slot.commit_id
+                and _exact_target(remote, slot.commit_id)
+                and readback.remote_tracking is TrackingState.TRACKED
+            ):
+                actions.append(PublicationRecoveryAction.READY)
+                continue
+            return Stopped(
+                "publish",
+                f"established publication {slot.branch} drifted",
+            )
+        return Stopped("publish", f"slot {slot.slot_id} is past publication recovery")
+    return tuple(actions)
+
+
+def _observe_publication_local(
+    workspace: str | Path, operation: FirstPublication
+) -> LocalObservation:
+    local = observe_local(
+        workspace,
+        revision=" | ".join(slot.commit_id for slot in operation.slots),
+        config_keys=tuple(key for key, _value in operation.effective_config),
+    )
+    if local.effective_config != operation.effective_config:
+        raise SourceMismatch("effective configuration changed during publication")
+    if local.workspace_targets != operation.workspace_targets:
+        raise SourceMismatch("workspace target changed during publication")
+    if resolve_push_url(local, operation.remote) != operation.push_url:
+        raise SourceMismatch("publication remote push URL changed")
+    commits = {commit.commit_id for commit in local.commits}
+    if commits != {slot.commit_id for slot in operation.slots}:
+        raise SourceMismatch("frozen publication commits are unavailable")
+    return local
+
+
+def _one_local_bookmark(local: LocalObservation, name: str) -> BookmarkTarget | None:
+    matches = tuple(item.target for item in local.local_bookmarks if item.name == name)
+    if len(matches) > 1:
+        raise SourceMismatch(f"local bookmark {name} is ambiguous")
+    return matches[0] if matches else None
+
+
+def _one_remote_bookmark(
+    local: LocalObservation, remote: str, name: str
+) -> tuple[BookmarkTarget | None, TrackingState | None]:
+    matches = tuple(
+        item
+        for item in local.remote_bookmarks
+        if item.remote == remote and item.name == name
+    )
+    if len(matches) > 1:
+        raise SourceMismatch(f"remote bookmark {name}@{remote} is ambiguous")
+    if not matches:
+        return None, None
+    return matches[0].target, matches[0].tracking_state
+
+
+def observe_publication_slots(
+    workspace: str | Path, operation: FirstPublication
+) -> tuple[LocalObservation, tuple[PublicationSlotReadback, ...]]:
+    local = _observe_publication_local(workspace, operation)
+    live = _observe_slot_refs(operation, workspace)
+    if len(live) != len(operation.slots):
+        raise SourceMismatch("publication destination readback is incomplete")
+    readbacks: list[PublicationSlotReadback] = []
+    for slot, destination in zip(operation.slots, live, strict=True):
+        expected = RemoteBranchRef(operation.repository, f"refs/heads/{slot.branch}")
+        if destination.ref != expected:
+            raise SourceMismatch("publication destination readback is misordered")
+        remote_target, tracking = _one_remote_bookmark(
+            local, operation.remote, slot.branch
+        )
+        readbacks.append(
+            PublicationSlotReadback(
+                slot.slot_id,
+                _one_local_bookmark(local, slot.branch),
+                remote_target,
+                tracking,
+                destination.commit_id,
+            )
+        )
+    return local, tuple(readbacks)
+
+
+def _run_jj_publication(
+    workspace: str | Path, *arguments: str
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "jj",
+            "--color=never",
+            "--repository",
+            os.fspath(workspace),
+            "--ignore-working-copy",
+            "--config",
+            "git.sign-on-push=false",
+            *arguments,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def create_publication_bookmark(
+    workspace: str | Path, slot: NewPRSlot
+) -> subprocess.CompletedProcess[str]:
+    return _run_jj_publication(
+        workspace, "bookmark", "create", slot.branch, "-r", slot.commit_id
+    )
+
+
+def track_publication_bookmark(
+    workspace: str | Path, operation: FirstPublication, slot: NewPRSlot
+) -> subprocess.CompletedProcess[str]:
+    return _run_jj_publication(
+        workspace, "bookmark", "track", f"{slot.branch}@{operation.remote}"
+    )
+
+
+def push_new_slot_refs(
+    workspace: str | Path,
+    operation: FirstPublication,
+    slots: Sequence[NewPRSlot],
+) -> subprocess.CompletedProcess[str]:
+    if not slots:
+        raise ValueError("new-ref publication requires at least one pending slot")
+    return _run_jj_publication(
+        workspace,
+        "git",
+        "push",
+        "--remote",
+        operation.remote,
+        *(argument for slot in slots for argument in ("--bookmark", slot.branch)),
+    )
+
+
 def _expected_final_prs(plan: NoOp | Apply) -> tuple[GitHubPullRequest, ...]:
     desired = {item.pr_identity: item for item in plan.desired.active}
     final_refs = {
@@ -3489,6 +4356,501 @@ def adopt_remote_restack(
                 final_state_verified=True,
             )
         return AdoptionVerified(receipts)
+
+
+def start_first_publication(operation: FirstPublication, workspace: str | Path) -> str:
+    """Install the durable fence before the first publication side effect."""
+    _validate_first_publication(operation)
+    if operation.phase is not FirstPublicationPhase.PREPARING_BOOKMARKS:
+        raise ValueError("a new first-publication operation must start before effects")
+    with repository_lock(workspace):
+        state_oid, _state = read_state(workspace)
+        if state_oid != operation.expected_state_oid:
+            raise ConcurrentUpdate("private state changed before operation start")
+        if read_ref_oid(workspace, OPERATION_REF) is not None:
+            raise ConcurrentUpdate("another operation is already active")
+        _local, readbacks = observe_publication_slots(workspace, operation)
+        for slot, readback in zip(operation.slots, readbacks, strict=True):
+            local_absent = readback.local_target is None
+            local_exact = _exact_target(readback.local_target, slot.commit_id)
+            if slot.bookmark_setup is BookmarkSetup.CREATE and not local_absent:
+                raise ConcurrentUpdate(
+                    f"CREATE bookmark {slot.branch} is no longer absent"
+                )
+            if slot.bookmark_setup is BookmarkSetup.KEEP and not local_exact:
+                raise ConcurrentUpdate(f"KEEP bookmark {slot.branch} moved")
+            if readback.live_commit_id is not None:
+                raise ConcurrentUpdate(
+                    f"publication destination {slot.branch} is no longer absent"
+                )
+            if not _absent_target(readback.remote_target):
+                raise ConcurrentUpdate(
+                    f"publication remote bookmark {slot.branch} is not absent"
+                )
+        return cas_write_first_publication(workspace, None, operation)
+
+
+def _replace_slot(
+    operation: FirstPublication, index: int, slot: NewPRSlot, **changes: object
+) -> FirstPublication:
+    slots = list(operation.slots)
+    slots[index] = slot
+    return replace(operation, slots=tuple(slots), **changes)
+
+
+def _observe_slot_refs(
+    operation: FirstPublication, workspace: str | Path
+) -> tuple[LiveRemoteRef, ...]:
+    return observe_live_refs(
+        operation.push_url,
+        operation.repository,
+        tuple(f"refs/heads/{slot.branch}" for slot in operation.slots),
+        cwd=workspace,
+    )
+
+
+def _verify_first_publication_external(
+    operation: FirstPublication, workspace: str | Path, github: GitHubClient
+) -> str | None:
+    try:
+        _local, readbacks = observe_publication_slots(workspace, operation)
+        for slot, readback in zip(operation.slots, readbacks, strict=True):
+            if (
+                not _exact_target(readback.local_target, slot.commit_id)
+                or readback.live_commit_id != slot.commit_id
+                or not _exact_target(readback.remote_target, slot.commit_id)
+                or readback.remote_tracking is not TrackingState.TRACKED
+            ):
+                return f"publication readiness changed for {slot.branch}"
+        for slot in operation.slots:
+            assert slot.pr_identity is not None
+            prs = github.find_pull_requests(
+                operation.repository, head_branches=(slot.branch,)
+            )
+            matches = tuple(pr for pr in prs if pr.identity == slot.pr_identity)
+            if len(matches) != 1 or not _slot_pr_matches(
+                operation.repository, slot, matches[0], initial=False
+            ):
+                return f"pull request for slot {slot.slot_id} does not match the goal"
+    except Error as exc:
+        return str(exc)
+    return None
+
+
+def _build_first_publication_state(
+    operation: FirstPublication, state: TrackedState
+) -> TrackedState:
+    identities = tuple(slot.pr_identity for slot in operation.slots)
+    if any(identity is None for identity in identities):
+        raise Error("cannot commit first publication before every slot is bound")
+    new_prs = tuple(identity for identity in identities if identity is not None)
+    ordered = new_prs
+    if len(set(ordered)) != len(ordered):
+        raise Error("first-publication final membership contains duplicate PRs")
+    if any(
+        stack.repository == operation.repository
+        and set(stack.ordered_prs).intersection(ordered)
+        for stack in state.stacks
+    ):
+        raise Error("new PR membership overlaps an existing tracked stack")
+    stacks = state.stacks
+    final_stack = TrackedStack(operation.repository, operation.base_branch, ordered)
+    refs = tuple(
+        RemoteBranchRef(operation.repository, f"refs/heads/{slot.branch}")
+        for slot in operation.slots
+    )
+    keys = set(zip(new_prs, refs, strict=True))
+    publications = tuple(
+        item for item in state.last_published_heads if (item.pr, item.ref) not in keys
+    ) + tuple(
+        LastPublishedHead(pr, ref, slot.commit_id)
+        for pr, ref, slot in zip(new_prs, refs, operation.slots, strict=True)
+    )
+    adoptions = tuple(
+        item for item in state.last_adopted_heads if (item.pr, item.ref) not in keys
+    )
+    return TrackedState(stacks + (final_stack,), publications, adoptions)
+
+
+def _finish_first_publication(
+    operation_oid: str,
+    operation: FirstPublication,
+    workspace: str | Path,
+    github: GitHubClient,
+) -> FirstPublicationResult:
+    state_oid, state = read_state(workspace)
+    if operation.phase is not FirstPublicationPhase.COMMITTING:
+        if state_oid != operation.expected_state_oid:
+            return Stopped("state", "private state changed before final commit")
+        external_error = _verify_first_publication_external(
+            operation, workspace, github
+        )
+        if external_error is not None:
+            return Stopped("verify", external_error)
+        final_state = _build_first_publication_state(operation, state)
+        final_json = state_to_json(final_state)
+        common = git_common_dir(workspace)
+        final_oid = _run(
+            ["git", f"--git-dir={common}", "hash-object", "-w", "--stdin"],
+            stdin=final_json,
+        ).strip()
+        operation = replace(
+            operation,
+            phase=FirstPublicationPhase.COMMITTING,
+            final_state_json=final_json,
+            final_state_oid=final_oid,
+        )
+        operation_oid = cas_write_first_publication(workspace, operation_oid, operation)
+    assert operation.final_state_json is not None
+    assert operation.final_state_oid is not None
+    current_state_oid = read_ref_oid(workspace, STATE_REF)
+    if current_state_oid == operation.expected_state_oid:
+        external_error = _verify_first_publication_external(
+            operation, workspace, github
+        )
+        if external_error is not None:
+            return Stopped("verify", external_error)
+        final_state = parse_state(operation.final_state_json)
+        written = cas_write_state(workspace, operation.expected_state_oid, final_state)
+        if written != operation.final_state_oid:
+            return Stopped("state", "final state blob differs from the frozen payload")
+    elif current_state_oid != operation.final_state_oid:
+        return Stopped("state", "private state is neither pre-commit nor final")
+    try:
+        cas_delete_operation(workspace, operation_oid)
+    except Error as exc:
+        return Stopped(
+            "fence",
+            f"state committed but operation fence cleanup failed: {exc}",
+            final_state_verified=True,
+            authority_persisted=True,
+            tracking_persisted=True,
+        )
+    return FirstPublicationVerified(
+        tuple(
+            slot.pr_identity for slot in operation.slots if slot.pr_identity is not None
+        )
+    )
+
+
+def _prepare_publication_bookmarks(
+    workspace: str | Path, operation: FirstPublication
+) -> Stopped | None:
+    for slot in operation.slots:
+        try:
+            _local, readbacks = observe_publication_slots(workspace, operation)
+        except Error as exc:
+            return Stopped("bookmark", str(exc))
+        readback = readbacks[operation.slots.index(slot)]
+        if slot.bookmark_setup is BookmarkSetup.KEEP:
+            if not _exact_target(readback.local_target, slot.commit_id):
+                return Stopped("bookmark", f"KEEP bookmark {slot.branch} moved")
+            continue
+        if readback.local_target is None:
+            create_publication_bookmark(workspace, slot)
+            try:
+                _local, readbacks = observe_publication_slots(workspace, operation)
+            except Error as exc:
+                return Stopped("bookmark", f"bookmark result is unknown: {exc}")
+            readback = readbacks[operation.slots.index(slot)]
+        if not _exact_target(readback.local_target, slot.commit_id):
+            return Stopped(
+                "bookmark",
+                f"CREATE bookmark {slot.branch} is absent, moved, or conflicted",
+            )
+    return None
+
+
+def _other_remote_is_tracked(
+    local: LocalObservation, operation: FirstPublication, slot: NewPRSlot
+) -> bool:
+    return any(
+        item.name == slot.branch
+        and item.remote != operation.remote
+        and item.tracking_state is TrackingState.TRACKED
+        for item in local.remote_bookmarks
+    )
+
+
+def _prepare_publication_tracking(
+    workspace: str | Path,
+    operation: FirstPublication,
+) -> Stopped | None:
+    """Narrowly pre-track an absent destination only when another remote requires it."""
+    try:
+        local, readbacks = observe_publication_slots(workspace, operation)
+    except Error as exc:
+        return Stopped("tracking", str(exc))
+    for index, slot in enumerate(operation.slots):
+        if slot.phase is not NewPRPhase.NOT_ATTEMPTED:
+            continue
+        readback = readbacks[index]
+        if not _other_remote_is_tracked(local, operation, slot):
+            continue
+        if readback.live_commit_id is not None or not _absent_target(
+            readback.remote_target
+        ):
+            return Stopped(
+                "tracking",
+                f"cannot prepare tracking for non-absent destination {slot.branch}",
+            )
+        if readback.remote_tracking is not TrackingState.TRACKED:
+            track_publication_bookmark(workspace, operation, slot)
+            try:
+                local, readbacks = observe_publication_slots(workspace, operation)
+            except Error as exc:
+                return Stopped("tracking", f"tracking result is unknown: {exc}")
+            readback = readbacks[index]
+        if (
+            not _absent_target(readback.remote_target)
+            or readback.remote_tracking is not TrackingState.TRACKED
+        ):
+            return Stopped(
+                "tracking",
+                f"absent destination {slot.branch}@{operation.remote} is not tracked",
+            )
+    return None
+
+
+def _publication_readiness_error(
+    workspace: str | Path, operation: FirstPublication
+) -> str | None:
+    try:
+        _local, readbacks = observe_publication_slots(workspace, operation)
+    except Error as exc:
+        return str(exc)
+    for slot, readback in zip(operation.slots, readbacks, strict=True):
+        if (
+            not _exact_target(readback.local_target, slot.commit_id)
+            or readback.live_commit_id != slot.commit_id
+            or not _exact_target(readback.remote_target, slot.commit_id)
+            or readback.remote_tracking is not TrackingState.TRACKED
+        ):
+            return f"slot {slot.slot_id} is not publication-ready"
+    return None
+
+
+def resume_first_publication(
+    workspace: str | Path, github: GitHubClient
+) -> FirstPublicationResult:
+    """Continue only the exact frozen goal stored in the operation ref."""
+    with repository_lock(workspace):
+        try:
+            operation_oid, operation = read_first_publication(workspace)
+        except Error as exc:
+            return Stopped("operation", str(exc))
+        if operation.phase is FirstPublicationPhase.COMMITTING:
+            return _finish_first_publication(
+                operation_oid, operation, workspace, github
+            )
+        state_oid, _state = read_state(workspace)
+        if state_oid != operation.expected_state_oid:
+            return Stopped("state", "private state changed while operation is active")
+
+        if operation.phase is FirstPublicationPhase.PREPARING_BOOKMARKS:
+            stopped = _prepare_publication_bookmarks(workspace, operation)
+            if stopped is not None:
+                return stopped
+            operation = replace(operation, phase=FirstPublicationPhase.PUBLISHING)
+            operation_oid = cas_write_first_publication(
+                workspace, operation_oid, operation
+            )
+
+        if operation.phase is FirstPublicationPhase.PUBLISHING:
+            stopped = _prepare_publication_tracking(workspace, operation)
+            if stopped is not None:
+                return stopped
+            try:
+                _local, readbacks = observe_publication_slots(workspace, operation)
+            except Error as exc:
+                return Stopped("publish", str(exc))
+            actions = classify_publication_recovery(operation, readbacks)
+            if isinstance(actions, Stopped):
+                return actions
+            first_attempt = tuple(
+                slot
+                for slot, action in zip(operation.slots, actions, strict=True)
+                if slot.phase is NewPRPhase.NOT_ATTEMPTED
+                and action is PublicationRecoveryAction.PUSH
+            )
+            if first_attempt:
+                operation = replace(
+                    operation,
+                    slots=tuple(
+                        replace(slot, phase=NewPRPhase.PUBLICATION_POSSIBLY_SENT)
+                        if slot in first_attempt
+                        else slot
+                        for slot in operation.slots
+                    ),
+                )
+                operation_oid = cas_write_first_publication(
+                    workspace, operation_oid, operation
+                )
+                push_new_slot_refs(workspace, operation, first_attempt)
+            else:
+                retries = tuple(
+                    slot
+                    for slot, action in zip(operation.slots, actions, strict=True)
+                    if action is PublicationRecoveryAction.PUSH
+                )
+                if retries:
+                    push_new_slot_refs(workspace, operation, retries)
+            try:
+                _local, readbacks = observe_publication_slots(workspace, operation)
+            except Error as exc:
+                return Stopped("publish", f"publication result is unknown: {exc}")
+            actions = classify_publication_recovery(operation, readbacks)
+            if isinstance(actions, Stopped):
+                return actions
+            for slot, action in zip(operation.slots, actions, strict=True):
+                if action is PublicationRecoveryAction.TRACK:
+                    track_publication_bookmark(workspace, operation, slot)
+            if PublicationRecoveryAction.TRACK in actions:
+                try:
+                    _local, readbacks = observe_publication_slots(workspace, operation)
+                except Error as exc:
+                    return Stopped("tracking", f"tracking result is unknown: {exc}")
+                actions = classify_publication_recovery(operation, readbacks)
+                if isinstance(actions, Stopped):
+                    return actions
+            if any(action is not PublicationRecoveryAction.READY for action in actions):
+                return Stopped(
+                    "publish",
+                    "publication did not establish every exact tracked remote bookmark",
+                )
+            operation = replace(
+                operation,
+                slots=tuple(
+                    replace(slot, phase=NewPRPhase.READY) for slot in operation.slots
+                ),
+                phase=FirstPublicationPhase.CREATING_PRS,
+            )
+            operation_oid = cas_write_first_publication(
+                workspace, operation_oid, operation
+            )
+
+        for index, slot in enumerate(operation.slots):
+            readiness_error = _publication_readiness_error(workspace, operation)
+            if readiness_error is not None:
+                return Stopped("readiness", readiness_error)
+            if slot.phase is NewPRPhase.READY:
+                slot = replace(slot, phase=NewPRPhase.POSSIBLY_SENT)
+                operation = _replace_slot(operation, index, slot)
+                operation_oid = cas_write_first_publication(
+                    workspace, operation_oid, operation
+                )
+                returned: GitHubPullRequest | None = None
+                try:
+                    repository = github.resolve_repository(operation.repository)
+                    created = github.create_pull_request(
+                        repository,
+                        head_branch=slot.branch,
+                        base_branch=slot.base_branch,
+                        title=slot.title,
+                        body=slot.initial_body,
+                        draft=True,
+                    )
+                    candidate = github.pull_requests((created,))[0]
+                    if _slot_pr_matches(
+                        operation.repository, slot, candidate, initial=True
+                    ):
+                        returned = candidate
+                except Error:
+                    # The request may have reached GitHub. Resolve only by marker.
+                    pass
+                if returned is not None:
+                    matches = (returned,)
+                else:
+                    try:
+                        matches = tuple(
+                            pr
+                            for pr in github.find_pull_requests(
+                                operation.repository,
+                                head_branches=(slot.branch,),
+                            )
+                            if slot.marker in pr.body
+                        )
+                    except Error as exc:
+                        return Stopped(
+                            "create-pr", f"possibly sent; lookup failed: {exc}"
+                        )
+            elif slot.phase is NewPRPhase.POSSIBLY_SENT:
+                try:
+                    matches = tuple(
+                        pr
+                        for pr in github.find_pull_requests(
+                            operation.repository,
+                            head_branches=(slot.branch,),
+                        )
+                        if slot.marker in pr.body
+                    )
+                except Error as exc:
+                    return Stopped("create-pr", f"possibly sent; lookup failed: {exc}")
+            else:
+                matches = ()
+            if slot.phase is NewPRPhase.POSSIBLY_SENT:
+                valid = tuple(
+                    pr
+                    for pr in matches
+                    if _slot_pr_matches(
+                        operation.repository, slot, pr, initial=True
+                    )
+                )
+                if len(valid) != 1:
+                    return Stopped(
+                        "create-pr",
+                        "possibly sent; marker lookup did not find exactly one matching PR",
+                    )
+                slot = replace(
+                    slot,
+                    phase=NewPRPhase.BOUND,
+                    pr_identity=valid[0].identity,
+                )
+                operation = _replace_slot(operation, index, slot)
+                operation_oid = cas_write_first_publication(
+                    workspace, operation_oid, operation
+                )
+            if slot.phase is NewPRPhase.BOUND:
+                assert slot.pr_identity is not None
+                readiness_error = _publication_readiness_error(workspace, operation)
+                if readiness_error is not None:
+                    return Stopped("readiness", readiness_error)
+                try:
+                    observed = github.find_pull_requests(
+                        operation.repository, head_branches=(slot.branch,)
+                    )
+                    matches = tuple(
+                        pr for pr in observed if pr.identity == slot.pr_identity
+                    )
+                    if len(matches) != 1:
+                        return Stopped("metadata", "bound PR is not uniquely observable")
+                    repository = github.resolve_repository(operation.repository)
+                    github.update_pull_request(
+                        repository,
+                        slot.pr_identity,
+                        title=slot.title,
+                        body=slot.body,
+                    )
+                    observed = github.find_pull_requests(
+                        operation.repository, head_branches=(slot.branch,)
+                    )
+                except Error as exc:
+                    return Stopped("metadata", str(exc))
+                matches = tuple(
+                    pr for pr in observed if pr.identity == slot.pr_identity
+                )
+                if len(matches) != 1 or not _slot_pr_matches(
+                    operation.repository, slot, matches[0], initial=False
+                ):
+                    return Stopped("metadata", "bound PR did not reach frozen metadata")
+                slot = replace(slot, phase=NewPRPhase.VERIFIED)
+                operation = _replace_slot(operation, index, slot)
+                operation_oid = cas_write_first_publication(
+                    workspace, operation_oid, operation
+                )
+        if any(slot.phase is not NewPRPhase.VERIFIED for slot in operation.slots):
+            return Stopped("create-pr", "not every first-publication slot is verified")
+        return _finish_first_publication(operation_oid, operation, workspace, github)
 
 
 def apply(
