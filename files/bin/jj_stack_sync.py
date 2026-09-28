@@ -350,6 +350,15 @@ class LastPublishedHead:
 
 
 @dataclass(frozen=True)
+class LastAdoptedHead:
+    """Last adopted GitHub restack whose change IDs and patch IDs matched."""
+
+    pr: PullRequestId
+    ref: RemoteBranchRef
+    verified_commit_id: str
+
+
+@dataclass(frozen=True)
 class TrackedStack:
     repository: GitHubRepositoryId
     base_branch: str
@@ -360,9 +369,10 @@ class TrackedStack:
 class TrackedState:
     stacks: tuple[TrackedStack, ...]
     last_published_heads: tuple[LastPublishedHead, ...]
+    last_adopted_heads: tuple[LastAdoptedHead, ...] = ()
 
 
-EMPTY_STATE = TrackedState((), ())
+EMPTY_STATE = TrackedState((), (), ())
 
 
 @dataclass(frozen=True)
@@ -386,6 +396,7 @@ class Snapshot:
     pull_requests: tuple[GitHubPullRequest, ...]
     membership: PullRequestMembership
     live_refs: tuple[LiveRemoteRef, ...]
+    fetch_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -457,7 +468,50 @@ class MatchesLastPublication:
     publication: LastPublishedHead
 
 
-Authority = FastForward | MatchesLastPublication
+@dataclass(frozen=True)
+class MatchesLastAdoption:
+    adoption: LastAdoptedHead
+
+
+Authority = FastForward | MatchesLastPublication | MatchesLastAdoption
+
+
+@dataclass(frozen=True)
+class RewriteCommitPair:
+    old_commit_id: str
+    new_commit_id: str
+    change_id: str
+    patch_id: str
+
+
+@dataclass(frozen=True)
+class RemoteRestackBoundary:
+    pr_identity: PullRequestId
+    branch: str
+    local_commit_id: str
+    tracked_commit_id: str
+    remote_commit_id: str
+    rewrite: tuple[RewriteCommitPair, ...]
+
+
+@dataclass(frozen=True)
+class RemoteRestackAdoption:
+    repository: GitHubRepositoryId
+    remote: str
+    fetch_url: str
+    effective_config: tuple[tuple[str, str], ...]
+    state_blob_oid: str | None
+    operation_blob_oid: str | None
+    membership: PullRequestMembership
+    prs: tuple[GitHubPullRequest, ...]
+    live_refs: tuple[LiveRemoteRef, ...]
+    boundaries: tuple[RemoteRestackBoundary, ...]
+    workspace_change_ids: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
+class AdoptionVerified:
+    adopted_heads: tuple[LastAdoptedHead, ...]
 
 
 @dataclass(frozen=True)
@@ -513,6 +567,7 @@ class Stopped:
 
 
 ApplyResult = Verified | Stopped
+AdoptionResult = AdoptionVerified | Stopped
 
 
 def _run(
@@ -1307,23 +1362,30 @@ def observe_local(
     )
 
 
-def resolve_push_url(local: LocalObservation, remote: str) -> str:
+def resolve_remote_url(
+    local: LocalObservation, remote: str, *, push: bool = False
+) -> str:
     if not remote:
-        raise ValueError("push remote must be nonempty")
-    urls = _run(
-        [
-            "git",
-            f"--git-dir={local.git_common_dir}",
-            "remote",
-            "get-url",
-            "--push",
-            "--all",
-            remote,
-        ]
-    ).splitlines()
-    if len(urls) != 1 or not urls[0]:
+        raise ValueError("remote must be nonempty")
+    command = [
+        "git",
+        f"--git-dir={local.git_common_dir}",
+        "remote",
+        "get-url",
+    ]
+    if push:
+        command.extend(("--push", "--all"))
+    command.append(remote)
+    urls = _run(command).splitlines()
+    if not urls or any(not url for url in urls):
+        raise SourceMismatch("selected remote URL is unavailable")
+    if push and len(urls) != 1:
         raise SourceMismatch("selected remote does not have one unambiguous push URL")
     return urls[0]
+
+
+def resolve_push_url(local: LocalObservation, remote: str) -> str:
+    return resolve_remote_url(local, remote, push=True)
 
 
 def observe_live_refs(
@@ -1374,6 +1436,7 @@ def observe_snapshot(
     """Assemble complete source facts for one explicitly selected PR's stack."""
     local = observe_local(workspace, revision=revision, config_keys=config_keys)
     push_url = resolve_push_url(local, remote)
+    fetch_url = resolve_remote_url(local, remote)
     repository = observe_github_repository(push_url, cwd=workspace)
     source = observe_github_pull_request(repository, selected_pr_number, cwd=workspace)
     selected_pr = source.pr
@@ -1426,6 +1489,7 @@ def observe_snapshot(
         pull_requests,
         membership,
         live_refs,
+        fetch_url,
     )
 
 
@@ -1511,10 +1575,32 @@ def parse_state(data: str) -> TrackedState:
             text(raw.get("verified_commit_id"), f"{context}.verified_commit_id"),
         )
 
+    def last_adopted_head(value: object, index: int) -> LastAdoptedHead:
+        context = f"last_adopted_heads[{index}]"
+        raw = fields(
+            record(value, context),
+            {"pr", "ref", "verified_commit_id"},
+            context,
+        )
+        ref_context = f"{context}.ref"
+        ref = fields(
+            record(raw.get("ref"), ref_context),
+            {"repository", "full_name"},
+            ref_context,
+        )
+        return LastAdoptedHead(
+            pull_request(raw.get("pr"), f"{context}.pr"),
+            RemoteBranchRef(
+                repository(ref.get("repository"), f"{ref_context}.repository"),
+                text(ref.get("full_name"), f"{ref_context}.full_name"),
+            ),
+            text(raw.get("verified_commit_id"), f"{context}.verified_commit_id"),
+        )
+
     try:
         raw = fields(
             record(json.loads(data), "root"),
-            {"stacks", "last_published_heads"},
+            {"stacks", "last_published_heads", "last_adopted_heads"},
             "root",
         )
         stacks = tuple(
@@ -1527,7 +1613,13 @@ def parse_state(data: str) -> TrackedState:
                 array(raw.get("last_published_heads"), "last_published_heads")
             )
         )
-        state = TrackedState(stacks, publications)
+        adoptions = tuple(
+            last_adopted_head(value, index)
+            for index, value in enumerate(
+                array(raw.get("last_adopted_heads"), "last_adopted_heads")
+            )
+        )
+        state = TrackedState(stacks, publications, adoptions)
         _validate_state(state)
         return state
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -1539,7 +1631,7 @@ def _validate_state(state: TrackedState) -> None:
         if any(not isinstance(value, str) or not value for value in values):
             raise ValueError("state identity fields must be nonempty strings")
 
-    publication_keys: set[tuple[GitHubRepositoryId, PullRequestId, str]] = set()
+    authority_keys: set[tuple[GitHubRepositoryId, PullRequestId, str]] = set()
     memberships: set[tuple[GitHubRepositoryId, PullRequestId]] = set()
     for stack in state.stacks:
         require_text(
@@ -1557,25 +1649,25 @@ def _validate_state(state: TrackedState) -> None:
             if membership in memberships:
                 raise ValueError("overlapping tracked stack membership")
             memberships.add(membership)
-    for publication in state.last_published_heads:
+    for authority in (*state.last_published_heads, *state.last_adopted_heads):
         require_text(
-            publication.pr.repository.host,
-            publication.pr.repository.node_id,
-            publication.pr.node_id,
-            publication.ref.repository.host,
-            publication.ref.repository.node_id,
-            publication.ref.full_name,
-            publication.verified_commit_id,
+            authority.pr.repository.host,
+            authority.pr.repository.node_id,
+            authority.pr.node_id,
+            authority.ref.repository.host,
+            authority.ref.repository.node_id,
+            authority.ref.full_name,
+            authority.verified_commit_id,
         )
         if (
-            publication.pr.repository != publication.ref.repository
-            or not publication.ref.full_name.startswith("refs/heads/")
+            authority.pr.repository != authority.ref.repository
+            or not authority.ref.full_name.startswith("refs/heads/")
         ):
-            raise ValueError("invalid last-published head")
-        key = (publication.ref.repository, publication.pr, publication.ref.full_name)
-        if key in publication_keys:
-            raise ValueError("ambiguous last-published head")
-        publication_keys.add(key)
+            raise ValueError("invalid head authority")
+        key = (authority.ref.repository, authority.pr, authority.ref.full_name)
+        if key in authority_keys:
+            raise ValueError("ambiguous head authority")
+        authority_keys.add(key)
 
 
 def read_state(workspace: str | Path) -> tuple[str | None, TrackedState]:
@@ -2069,17 +2161,28 @@ def _plan_publication(
         and item.verified_commit_id == head.commit_id
     )
     if len(publications) != 1:
-        return _block(
-            "replacement-unauthorized",
-            head.ref.full_name,
-            "live head is neither an ancestor nor one unambiguous last publication",
+        adoptions = tuple(
+            item
+            for item in snapshot.tool_state.state.last_adopted_heads
+            if item.pr == wanted.pr_identity
+            and item.ref == head.ref
+            and item.verified_commit_id == head.commit_id
         )
+        if len(adoptions) != 1:
+            return _block(
+                "replacement-unauthorized",
+                head.ref.full_name,
+                "live head is neither an ancestor nor one unambiguous verified authority",
+            )
+        authority: Authority = MatchesLastAdoption(adoptions[0])
+    else:
+        authority = MatchesLastPublication(publications[0])
     return (
         PlannedHeadUpdate(
             head.ref,
             head.commit_id,
             wanted.desired_commit_id,
-            MatchesLastPublication(publications[0]),
+            authority,
         ),
     )
 
@@ -2501,8 +2604,545 @@ def record_verified_state(
     return cas_write_state(
         workspace,
         expected_state_oid,
-        TrackedState(stacks, retained + tuple(publications)),
+        TrackedState(
+            stacks,
+            retained + tuple(publications),
+            state.last_adopted_heads,
+        ),
     )
+
+
+def _one_bookmark_target(
+    local: LocalObservation, remote: str | None, name: str
+) -> str | None:
+    values = (
+        tuple(item.target for item in local.local_bookmarks if item.name == name)
+        if remote is None
+        else tuple(
+            item.target
+            for item in local.remote_bookmarks
+            if item.remote == remote
+            and item.name == name
+            and item.tracking_state is TrackingState.TRACKED
+        )
+    )
+    if len(values) != 1 or not isinstance(values[0], CommitTarget):
+        return None
+    return values[0].commit_id
+
+
+def _commit_fingerprint(git_dir: str | Path, commit_id: str) -> tuple[str, str]:
+    payload = _run(["git", f"--git-dir={git_dir}", "cat-file", "-p", commit_id])
+    header, _separator, _message = payload.partition("\n\n")
+    change_ids = tuple(
+        line.removeprefix("change-id ")
+        for line in header.splitlines()
+        if line.startswith("change-id ")
+    )
+    if len(change_ids) != 1 or not change_ids[0]:
+        raise SourceMismatch(f"commit {commit_id} has no unique raw jj change ID")
+    patch = _run(
+        [
+            "git",
+            f"--git-dir={git_dir}",
+            "show",
+            "--pretty=format:",
+            "--no-ext-diff",
+            "--binary",
+            commit_id,
+        ]
+    )
+    patch_id_output = _run(["git", "patch-id", "--stable"], stdin=patch).split()
+    if len(patch_id_output) != 2 or not re.fullmatch(
+        r"[0-9a-f]{40}", patch_id_output[0]
+    ):
+        raise SourceMismatch(f"commit {commit_id} has no stable patch ID")
+    return change_ids[0], patch_id_output[0]
+
+
+def _linear_segment(
+    git_dir: str | Path, base_commit_id: str, head_commit_id: str
+) -> tuple[str, ...]:
+    commits = tuple(
+        _run(
+            [
+                "git",
+                f"--git-dir={git_dir}",
+                "rev-list",
+                "--reverse",
+                "--ancestry-path",
+                f"{base_commit_id}..{head_commit_id}",
+            ]
+        ).splitlines()
+    )
+    if not commits:
+        raise SourceMismatch("restack segment is empty or disconnected")
+    predecessor = base_commit_id
+    for commit_id in commits:
+        fields = _run(
+            [
+                "git",
+                f"--git-dir={git_dir}",
+                "rev-list",
+                "--parents",
+                "-n",
+                "1",
+                commit_id,
+            ]
+        ).split()
+        if len(fields) != 2 or fields[1] != predecessor:
+            raise SourceMismatch("restack segment is not a complete linear chain")
+        predecessor = commit_id
+    if commits[-1] != head_commit_id:
+        raise SourceMismatch("restack segment does not end at the expected head")
+    return commits
+
+
+def _inspection_namespace(operation_id: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", operation_id):
+        raise SourceMismatch("jj operation ID is unsafe for a private inspection ref")
+    return f"refs/jj-stack-inspect/{operation_id}"
+
+
+def _git_refs(git_dir: str | Path, *prefixes: str) -> str:
+    return _run(
+        [
+            "git",
+            f"--git-dir={git_dir}",
+            "for-each-ref",
+            "--format=%(refname)%09%(objectname)",
+            *prefixes,
+        ]
+    )
+
+
+def _cleanup_inspection_refs(git_dir: str | Path, namespace: str) -> None:
+    rows = _git_refs(git_dir, namespace).splitlines()
+    for row in rows:
+        fields = row.split("\t")
+        if len(fields) != 2 or not all(fields):
+            raise Error("could not parse private inspection ref during cleanup")
+        ref, oid = fields
+        result = subprocess.run(
+            ["git", f"--git-dir={git_dir}", "update-ref", "-d", ref, oid],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise Error(
+                f"could not delete private inspection ref {ref}"
+                + (f": {detail}" if detail else "")
+            )
+    if _git_refs(git_dir, namespace):
+        raise Error("private inspection refs remain after cleanup")
+
+
+def _fetch_inspection_refs(
+    git_dir: str | Path,
+    fetch_url: str,
+    namespace: str,
+    branch_names: Sequence[str],
+) -> None:
+    _run(
+        [
+            "git",
+            f"--git-dir={git_dir}",
+            "fetch",
+            "--no-tags",
+            "--no-write-fetch-head",
+            fetch_url,
+            *(f"+refs/heads/{name}:{namespace}/{name}" for name in branch_names),
+        ]
+    )
+
+
+def inspect_remote_restack(
+    snapshot: Snapshot, remote: str
+) -> RemoteRestackAdoption | Blocked:
+    """Match every old/new change ID and patch ID, then freeze adoption."""
+    if remote != snapshot.remote:
+        return _block("remote-changed", remote, "selected remote differs from observation")
+    if not snapshot.fetch_url:
+        return _block("fetch-url-missing", remote, "fetch transport was not observed")
+    try:
+        fetch_repository = observe_github_repository(
+            snapshot.fetch_url, cwd=snapshot.local.workspace
+        )
+    except Error as exc:
+        return _block("fetch-repository-unavailable", remote, str(exc))
+    if fetch_repository.identity != snapshot.repository:
+        return _block(
+            "fetch-repository-changed",
+            remote,
+            "fetch and authoritative push transports identify different repositories",
+        )
+    tracked_stacks = tuple(
+        stack
+        for stack in snapshot.tool_state.state.stacks
+        if stack.repository == snapshot.repository
+        and stack.ordered_prs == tuple(pr.identity for pr in snapshot.pull_requests)
+    )
+    if len(tracked_stacks) != 1:
+        return _block(
+            "untracked-membership",
+            "stack",
+            "adoption requires exact tracked membership",
+        )
+    active = tuple(
+        pr for pr in snapshot.pull_requests if pr.state is PullRequestState.OPEN
+    )
+    if not active:
+        return _block("empty-suffix", "stack", "there is no open suffix to adopt")
+    live_by_name = {item.ref.full_name: item.commit_id for item in snapshot.live_refs}
+    raw_boundaries: list[tuple[GitHubPullRequest, str, str, str]] = []
+    moved = False
+    for pr in active:
+        local = _one_bookmark_target(snapshot.local, None, pr.head_branch)
+        tracked = _one_bookmark_target(snapshot.local, remote, pr.head_branch)
+        live = live_by_name.get(f"refs/heads/{pr.head_branch}")
+        if local is None or tracked is None or live is None:
+            return _block(
+                "boundary-unavailable",
+                pr.head_branch,
+                "L, T, and R must each be unique",
+            )
+        if local != tracked:
+            return _block(
+                "local-moved",
+                pr.head_branch,
+                "local bookmark differs from tracked baseline",
+            )
+        if live != pr.reported_head_commit_id:
+            return _block(
+                "remote-moved",
+                pr.head_branch,
+                "live ref and pull request head disagree",
+            )
+        moved |= tracked != live
+        raw_boundaries.append((pr, local, tracked, live))
+    if not moved:
+        return _block("remote-unchanged", "stack", "no remote rewrite needs adoption")
+
+    base_name = tracked_stacks[0].base_branch
+    base = live_by_name.get(f"refs/heads/{base_name}")
+    if base is None:
+        return _block("base-unavailable", base_name, "stack base ref is unavailable")
+    git_dir = snapshot.local.git_common_dir
+    try:
+        namespace = _inspection_namespace(snapshot.local.operation_id)
+        if _git_refs(git_dir, namespace):
+            raise SourceMismatch("private inspection namespace is already in use")
+        ordinary_refs = _git_refs(git_dir, "refs/heads", "refs/remotes")
+        names = (base_name, *(pr.head_branch for pr in active))
+        expected = {
+            base_name: base,
+            **{pr.head_branch: live for pr, _local, _tracked, live in raw_boundaries},
+        }
+        try:
+            _fetch_inspection_refs(
+                git_dir,
+                snapshot.fetch_url,
+                namespace,
+                names,
+            )
+            for name, wanted in expected.items():
+                fetched = _run(
+                    [
+                        "git",
+                        f"--git-dir={git_dir}",
+                        "rev-parse",
+                        f"{namespace}/{name}",
+                    ]
+                ).strip()
+                if fetched != wanted:
+                    raise SourceMismatch(
+                        f"remote branch {name} moved during private inspection"
+                    )
+            if _git_refs(git_dir, "refs/heads", "refs/remotes") != ordinary_refs:
+                raise SourceMismatch("private inspection moved an ordinary Git ref")
+            if pin_operation(snapshot.local.workspace) != snapshot.local.operation_id:
+                raise SourceMismatch(
+                    "jj did not ignore the private inspection ref namespace"
+                )
+            old_base = base
+            new_base = base
+            boundaries: list[RemoteRestackBoundary] = []
+            for pr, local, tracked, live in raw_boundaries:
+                old_segment = _linear_segment(git_dir, old_base, tracked)
+                new_segment = _linear_segment(git_dir, new_base, live)
+                if len(old_segment) != len(new_segment):
+                    raise SourceMismatch(
+                        "old and rewritten segments have different lengths"
+                    )
+                pairs: list[RewriteCommitPair] = []
+                for old, new in zip(old_segment, new_segment, strict=True):
+                    old_change, old_patch = _commit_fingerprint(git_dir, old)
+                    new_change, new_patch = _commit_fingerprint(git_dir, new)
+                    if (old_change, old_patch) != (new_change, new_patch):
+                        raise SourceMismatch(
+                            "remote rewrite changed a jj change ID or stable patch ID"
+                        )
+                    pairs.append(RewriteCommitPair(old, new, old_change, old_patch))
+                boundaries.append(
+                    RemoteRestackBoundary(
+                        pr.identity,
+                        pr.head_branch,
+                        local,
+                        tracked,
+                        live,
+                        tuple(pairs),
+                    )
+                )
+                old_base = tracked
+                new_base = live
+        finally:
+            _cleanup_inspection_refs(git_dir, namespace)
+    except Error as exc:
+        return _block("rewrite-unverified", "stack", str(exc))
+    commits = {item.commit_id: item for item in snapshot.local.commits}
+    workspace_change_ids: list[tuple[str, str]] = []
+    for name, target in snapshot.local.workspace_targets:
+        commit = commits.get(target)
+        if commit is None or commit.has_conflicts:
+            return _block(
+                "workspace-unverified", name, "workspace target is absent or conflicted"
+            )
+        workspace_change_ids.append((name, commit.change_id))
+    return RemoteRestackAdoption(
+        snapshot.repository,
+        remote,
+        snapshot.fetch_url,
+        tuple(
+            item for item in snapshot.local.effective_config if item[0] != "git.push"
+        ),
+        snapshot.tool_state.state_blob_oid,
+        snapshot.tool_state.operation_blob_oid,
+        snapshot.membership,
+        snapshot.pull_requests,
+        snapshot.live_refs,
+        tuple(boundaries),
+        tuple(workspace_change_ids),
+    )
+
+
+def _adoption_pre_fetch_revision(plan: RemoteRestackAdoption) -> str:
+    old = " | ".join(boundary.local_commit_id for boundary in plan.boundaries)
+    return f"all() & ({old})::"
+
+
+def _adoption_post_fetch_revision(plan: RemoteRestackAdoption) -> str:
+    old = " | ".join(boundary.local_commit_id for boundary in plan.boundaries)
+    new = " | ".join(boundary.remote_commit_id for boundary in plan.boundaries)
+    return f"all() & (({old}):: | ({new})::)"
+
+
+def _reobserve_adoption(
+    workspace: str | Path, plan: RemoteRestackAdoption, revision: str
+) -> Snapshot:
+    selected = (
+        plan.membership.pr
+        if isinstance(plan.membership, StandalonePullRequest)
+        else plan.membership.selected_pr
+    )
+    selected_pr = next((pr for pr in plan.prs if pr.identity == selected), None)
+    if selected_pr is None:
+        raise SourceMismatch("selected PR is absent from frozen membership")
+    return observe_snapshot(
+        workspace,
+        revision=revision,
+        config_keys=tuple(key for key, _value in plan.effective_config),
+        remote=plan.remote,
+        selected_pr_number=selected_pr.number,
+    )
+
+
+def reobserve_for_adoption(
+    workspace: str | Path, plan: RemoteRestackAdoption
+) -> Snapshot:
+    """Revalidate pre-fetch state without resolving remote-only commit IDs."""
+    return _reobserve_adoption(workspace, plan, _adoption_pre_fetch_revision(plan))
+
+
+def reobserve_after_adoption(
+    workspace: str | Path, plan: RemoteRestackAdoption
+) -> Snapshot:
+    """Observe old and newly fetched commit closures for final verification."""
+    return _reobserve_adoption(workspace, plan, _adoption_post_fetch_revision(plan))
+
+
+def _validate_adoption_prestate(
+    plan: RemoteRestackAdoption, fresh: Snapshot
+) -> str | None:
+    if (
+        fresh.repository != plan.repository
+        or fresh.fetch_url != plan.fetch_url
+        or fresh.local.effective_config != plan.effective_config
+        or fresh.tool_state.state_blob_oid != plan.state_blob_oid
+        or fresh.tool_state.operation_blob_oid != plan.operation_blob_oid
+        or fresh.membership != plan.membership
+        or fresh.pull_requests != plan.prs
+        or fresh.live_refs != plan.live_refs
+    ):
+        return "frozen repository, transport, state, membership, PRs, or refs changed"
+    for boundary in plan.boundaries:
+        if (
+            _one_bookmark_target(fresh.local, None, boundary.branch)
+            != boundary.local_commit_id
+            or _one_bookmark_target(fresh.local, plan.remote, boundary.branch)
+            != boundary.tracked_commit_id
+        ):
+            return f"L/T changed for {boundary.branch}"
+    return None
+
+
+def _validate_adoption_poststate(
+    plan: RemoteRestackAdoption, fresh: Snapshot
+) -> str | None:
+    if (
+        fresh.repository != plan.repository
+        or fresh.fetch_url != plan.fetch_url
+        or fresh.local.effective_config != plan.effective_config
+        or fresh.tool_state.state_blob_oid != plan.state_blob_oid
+        or fresh.tool_state.operation_blob_oid != plan.operation_blob_oid
+        or fresh.membership != plan.membership
+        or fresh.pull_requests != plan.prs
+        or fresh.live_refs != plan.live_refs
+    ):
+        return "remote or frozen local dependencies changed during adoption"
+    commits = {commit.commit_id: commit for commit in fresh.local.commits}
+    visible_by_change: dict[str, list[ObservedCommit]] = {}
+    for commit in fresh.local.commits:
+        if not commit.is_hidden:
+            visible_by_change.setdefault(commit.change_id, []).append(commit)
+    for boundary in plan.boundaries:
+        if (
+            _one_bookmark_target(fresh.local, None, boundary.branch)
+            != boundary.remote_commit_id
+            or _one_bookmark_target(fresh.local, plan.remote, boundary.branch)
+            != boundary.remote_commit_id
+        ):
+            return f"native jj fetch did not adopt {boundary.branch} exactly"
+        if boundary.local_commit_id != boundary.remote_commit_id:
+            superseded = commits.get(boundary.local_commit_id)
+            if superseded is None:
+                return f"superseded commit is absent for {boundary.branch}"
+            if not superseded.is_hidden:
+                return f"superseded commit remains visible for {boundary.branch}"
+        adopted = commits.get(boundary.remote_commit_id)
+        if adopted is None or adopted.is_hidden or adopted.has_conflicts:
+            return f"adopted boundary is absent, hidden, or conflicted for {boundary.branch}"
+    for workspace, change_id in plan.workspace_change_ids:
+        targets = tuple(
+            target
+            for name, target in fresh.local.workspace_targets
+            if name == workspace
+        )
+        visible = visible_by_change.get(change_id, [])
+        if len(targets) != 1 or len(visible) != 1:
+            return f"workspace {workspace} was not reconciled by jj"
+        if visible[0].commit_id != targets[0] or visible[0].has_conflicts:
+            return f"workspace {workspace} is divergent or conflicted"
+    return None
+
+
+def record_verified_adoptions(
+    workspace: str | Path,
+    expected_state_oid: str | None,
+    state: TrackedState,
+    adoptions: Sequence[LastAdoptedHead],
+) -> str:
+    keys = {(item.pr, item.ref) for item in adoptions}
+    if any((item.pr, item.ref) in keys for item in state.last_published_heads):
+        publications = tuple(
+            item
+            for item in state.last_published_heads
+            if (item.pr, item.ref) not in keys
+        )
+    else:
+        publications = state.last_published_heads
+    retained = tuple(
+        item for item in state.last_adopted_heads if (item.pr, item.ref) not in keys
+    )
+    return cas_write_state(
+        workspace,
+        expected_state_oid,
+        TrackedState(state.stacks, publications, retained + tuple(adoptions)),
+    )
+
+
+def adopt_remote_restack(
+    plan: RemoteRestackAdoption, workspace: str | Path
+) -> AdoptionResult:
+    """Adopt one frozen restack whose change IDs and patch IDs matched."""
+    with repository_lock(workspace):
+        try:
+            before = reobserve_for_adoption(workspace, plan)
+        except Error as exc:
+            return Stopped("reobserve", str(exc))
+        drift = _validate_adoption_prestate(plan, before)
+        if drift is not None:
+            return Stopped("revalidate", drift)
+        result = subprocess.run(
+            [
+                "jj",
+                "git",
+                "fetch",
+                "--remote",
+                plan.remote,
+                *(
+                    argument
+                    for boundary in plan.boundaries
+                    for argument in ("--branch", boundary.branch)
+                ),
+            ],
+            cwd=workspace,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode:
+            detail = result.stderr.strip() or result.stdout.strip()
+            return Stopped("fetch", detail or "native jj fetch failed")
+        try:
+            after = reobserve_after_adoption(workspace, plan)
+        except Error as exc:
+            return Stopped(
+                "verify",
+                f"local adoption may have completed: {exc}",
+                head_published=False,
+            )
+        mismatch = _validate_adoption_poststate(plan, after)
+        if mismatch is not None:
+            return Stopped("verify", f"local adoption may have completed: {mismatch}")
+        pr_by_id = {pr.identity: pr for pr in plan.prs}
+        receipts = tuple(
+            LastAdoptedHead(
+                boundary.pr_identity,
+                RemoteBranchRef(
+                    plan.repository,
+                    f"refs/heads/{pr_by_id[boundary.pr_identity].head_branch}",
+                ),
+                boundary.remote_commit_id,
+            )
+            for boundary in plan.boundaries
+            if boundary.remote_commit_id != boundary.tracked_commit_id
+        )
+        try:
+            record_verified_adoptions(
+                workspace,
+                plan.state_blob_oid,
+                after.tool_state.state,
+                receipts,
+            )
+        except Error as exc:
+            return Stopped(
+                "receipt",
+                f"local adoption verified but authority persistence failed: {exc}",
+                final_state_verified=True,
+            )
+        return AdoptionVerified(receipts)
 
 
 def apply(plan: SyncPlan, workspace: str | Path) -> ApplyResult:
