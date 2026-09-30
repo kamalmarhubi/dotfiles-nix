@@ -378,6 +378,27 @@ class TrackedState:
     last_adopted_heads: tuple[LastAdoptedHead, ...] = ()
 
 
+@dataclass(frozen=True)
+class DetachedAssociation:
+    """One bounded cleanup association; it conveys no publication authority."""
+
+    repository: GitHubRepositoryId
+    base_branch: str
+    pr: PullRequestId
+
+    def __post_init__(self) -> None:
+        if not self.base_branch:
+            raise ValueError("detached association base branch must be nonempty")
+        if self.pr.repository != self.repository:
+            raise ValueError("detached association PR belongs to another repository")
+
+
+@dataclass(frozen=True)
+class DetachedAssociationResult:
+    association: DetachedAssociation
+    state_blob_oid: str
+
+
 EMPTY_STATE = TrackedState((), (), ())
 
 
@@ -2031,6 +2052,216 @@ def cas_write_state(
         detail = result.stderr.strip() or result.stdout.strip()
         raise Error("could not update state ref" + (f": {detail}" if detail else ""))
     return new_oid
+
+
+def list_detached_associations(
+    workspace: str | Path,
+) -> tuple[DetachedAssociation, ...]:
+    """List all locally bounded detached PRs without contacting GitHub."""
+    _oid, state = read_state(workspace)
+    return tuple(
+        DetachedAssociation(stack.repository, stack.base_branch, pr)
+        for stack in state.stacks
+        for pr in stack.detached_prs
+    )
+
+
+def _selected_detached_stack(
+    state: TrackedState, selected: DetachedAssociation
+) -> tuple[int, TrackedStack]:
+    matches = tuple(
+        (index, stack)
+        for index, stack in enumerate(state.stacks)
+        if stack.repository == selected.repository
+        and stack.base_branch == selected.base_branch
+        and selected.pr in stack.detached_prs
+    )
+    if len(matches) != 1:
+        raise Error("selected detached association is absent, foreign, or ambiguous")
+    return matches[0]
+
+
+def _remove_detached_association(
+    state: TrackedState, selected: DetachedAssociation
+) -> TrackedState:
+    index, stack = _selected_detached_stack(state, selected)
+    updated = replace(
+        stack,
+        detached_prs=tuple(pr for pr in stack.detached_prs if pr != selected.pr),
+    )
+    stacks = list(state.stacks)
+    if updated.ordered_prs or updated.detached_prs:
+        stacks[index] = updated
+    else:
+        del stacks[index]
+    return replace(state, stacks=tuple(stacks))
+
+
+_CLOSE_DETACHED_PR_MUTATION = """
+mutation($id: ID!) {
+  closePullRequest(input: {pullRequestId: $id}) {
+    pullRequest { id state repository { id } }
+  }
+}
+"""
+
+_DETACHED_PR_STATE_QUERY = """
+query($id: ID!) {
+  node(id: $id) {
+    ... on PullRequest { id state repository { id } }
+  }
+}
+"""
+
+_DETACHED_PR_NUMBER_QUERY = """
+query($id: ID!) {
+  node(id: $id) {
+    ... on PullRequest { id number repository { id } }
+  }
+}
+"""
+
+
+def _detached_pr_graphql(
+    workspace: str | Path, association: DetachedAssociation, query: str
+) -> object:
+    return _command_json(
+        [
+            "gh", "api", "--hostname", association.repository.host,
+            "graphql", "--input", "-",
+        ],
+        cwd=workspace,
+        stdin=json.dumps(
+            {"query": query, "variables": {"id": association.pr.node_id}}
+        ),
+    )
+
+
+def resolve_detached_association(
+    workspace: str | Path, pr_number: int
+) -> DetachedAssociation | Blocked:
+    """Resolve a human PR number only within locally bounded associations."""
+    if type(pr_number) is not int or pr_number <= 0:
+        raise Error("pull request number must be a positive integer")
+    matches = []
+    for association in list_detached_associations(workspace):
+        response = _exact_record(
+            _detached_pr_graphql(workspace, association, _DETACHED_PR_NUMBER_QUERY),
+            {"data"},
+            "detached pull request lookup response",
+        )
+        data = _exact_record(
+            response["data"], {"node"}, "detached pull request lookup data"
+        )
+        if data["node"] is None:
+            raise IncompleteSource("detached pull request is unavailable")
+        node = _exact_record(
+            data["node"], {"id", "number", "repository"}, "detached pull request"
+        )
+        repository = _exact_record(
+            node["repository"], {"id"}, "detached pull request repository"
+        )
+        number = node["number"]
+        if (
+            _text(node["id"], "detached pull request ID") != association.pr.node_id
+            or _text(repository["id"], "detached pull request repository ID")
+            != association.repository.node_id
+        ):
+            raise SourceMismatch("GitHub returned a foreign pull request")
+        if type(number) is not int or number <= 0:
+            raise MalformedSource("pull request number must be a positive integer")
+        if number == pr_number:
+            matches.append(association)
+    if len(matches) != 1:
+        return _block(
+            "detached-pr-resolution",
+            f"PR #{pr_number}",
+            "no unique bounded detached association has that PR number",
+        )
+    return matches[0]
+
+
+def _parse_detached_pr_state(
+    value: object, association: DetachedAssociation, context: str
+) -> PullRequestState:
+    record = _exact_record(value, {"id", "state", "repository"}, context)
+    repository = _exact_record(
+        record["repository"], {"id"}, f"{context} repository"
+    )
+    if (
+        _text(record["id"], f"{context} ID") != association.pr.node_id
+        or _text(repository["id"], f"{context} repository ID")
+        != association.repository.node_id
+    ):
+        raise SourceMismatch("GitHub returned a foreign pull request")
+    try:
+        return PullRequestState(_text(record["state"], f"{context} state"))
+    except ValueError as exc:
+        raise MalformedSource("pull request state is unsupported") from exc
+
+
+def _close_detached_pr(
+    workspace: str | Path, association: DetachedAssociation
+) -> None:
+    response = _exact_record(
+        _detached_pr_graphql(workspace, association, _CLOSE_DETACHED_PR_MUTATION),
+        {"data"},
+        "close pull request response",
+    )
+    data = _exact_record(response["data"], {"closePullRequest"}, "close data")
+    closed = _exact_record(
+        data["closePullRequest"], {"pullRequest"}, "close result"
+    )
+    _parse_detached_pr_state(closed["pullRequest"], association, "closed pull request")
+
+
+def _observe_detached_pr_state(
+    workspace: str | Path, association: DetachedAssociation
+) -> PullRequestState:
+    response = _exact_record(
+        _detached_pr_graphql(workspace, association, _DETACHED_PR_STATE_QUERY),
+        {"data"},
+        "pull request readback response",
+    )
+    data = _exact_record(response["data"], {"node"}, "pull request readback data")
+    if data["node"] is None:
+        raise IncompleteSource("detached pull request is unavailable")
+    return _parse_detached_pr_state(data["node"], association, "detached pull request")
+
+
+def forget_detached_association(
+    workspace: str | Path, selected: DetachedAssociation
+) -> DetachedAssociationResult:
+    """Forget one local cleanup association without making a remote call."""
+    with repository_lock(workspace):
+        state_oid, state = read_state(workspace)
+        if read_ref_oid(workspace, OPERATION_REF) is not None:
+            raise ConcurrentUpdate("another operation is already active")
+        written = cas_write_state(
+            workspace, state_oid, _remove_detached_association(state, selected)
+        )
+        return DetachedAssociationResult(selected, written)
+
+
+def close_detached_association(
+    workspace: str | Path, selected: DetachedAssociation
+) -> DetachedAssociationResult:
+    """Close exactly one bounded detached PR, verify it, then forget it."""
+    with repository_lock(workspace):
+        state_oid, state = read_state(workspace)
+        if read_ref_oid(workspace, OPERATION_REF) is not None:
+            raise ConcurrentUpdate("another operation is already active")
+        _selected_detached_stack(state, selected)
+        try:
+            _close_detached_pr(workspace, selected)
+        except Error:
+            pass
+        if _observe_detached_pr_state(workspace, selected) is not PullRequestState.CLOSED:
+            raise Error("detached pull request is not closed")
+        written = cas_write_state(
+            workspace, state_oid, _remove_detached_association(state, selected)
+        )
+        return DetachedAssociationResult(selected, written)
 
 
 def _validate_first_publication(operation: FirstPublication) -> None:

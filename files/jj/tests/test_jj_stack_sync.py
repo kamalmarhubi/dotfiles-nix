@@ -1647,6 +1647,108 @@ def test_topology_cleanup_foreign_ref_retains_operation_fence(monkeypatch) -> No
     assert deleted == []
 
 
+def test_detached_association_list_and_forget_are_local_only(monkeypatch) -> None:
+    repository = sync.GitHubRepositoryId("github.com", "R")
+    active = sync.PullRequestId(repository, "PR_active")
+    detached = sync.PullRequestId(repository, "PR_detached")
+    authority = sync.LastPublishedHead(
+        active, sync.RemoteBranchRef(repository, "refs/heads/active"), "a" * 40
+    )
+    state = sync.TrackedState(
+        (sync.TrackedStack(repository, "main", (active,), (detached,)),),
+        (authority,),
+    )
+    selected = sync.DetachedAssociation(repository, "main", detached)
+    written = []
+    monkeypatch.setattr(sync, "read_state", lambda _workspace: ("old", state))
+    monkeypatch.setattr(sync, "read_ref_oid", lambda *_args: None)
+    monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
+    monkeypatch.setattr(
+        sync,
+        "cas_write_state",
+        lambda _workspace, expected, value: written.append((expected, value)) or "new",
+    )
+    monkeypatch.setattr(
+        sync, "_command_json", lambda *_args, **_kwargs: pytest.fail("remote call")
+    )
+
+    assert sync.list_detached_associations("/work") == (selected,)
+    result = sync.forget_detached_association("/work", selected)
+
+    assert result == sync.DetachedAssociationResult(selected, "new")
+    assert written[0][1].stacks == (
+        sync.TrackedStack(repository, "main", (active,), ()),
+    )
+    assert written[0][1].last_published_heads == (authority,)
+
+
+def test_detached_number_resolution_queries_only_bounded_nodes(monkeypatch) -> None:
+    first_repo = sync.GitHubRepositoryId("github.com", "R_first")
+    second_repo = sync.GitHubRepositoryId("github.example", "R_second")
+    first = sync.DetachedAssociation(
+        first_repo, "main", sync.PullRequestId(first_repo, "PR_first")
+    )
+    second = sync.DetachedAssociation(
+        second_repo, "trunk", sync.PullRequestId(second_repo, "PR_second")
+    )
+    calls = []
+    monkeypatch.setattr(
+        sync, "list_detached_associations", lambda _workspace: (first, second)
+    )
+
+    def query(workspace, association, graphql):
+        calls.append((workspace, association, graphql))
+        number = 12 if association is first else 42
+        return {
+            "data": {
+                "node": {
+                    "id": association.pr.node_id,
+                    "number": number,
+                    "repository": {"id": association.repository.node_id},
+                }
+            }
+        }
+
+    monkeypatch.setattr(sync, "_detached_pr_graphql", query)
+
+    assert sync.resolve_detached_association("/work", 42) is second
+    assert [item[1].repository.host for item in calls] == [
+        "github.com",
+        "github.example",
+    ]
+    assert isinstance(sync.resolve_detached_association("/work", 99), sync.Blocked)
+
+
+def test_close_detached_accepts_lost_response_after_closed_readback(monkeypatch) -> None:
+    repository = sync.GitHubRepositoryId("github.example", "R")
+    detached = sync.PullRequestId(repository, "PR_detached")
+    state = sync.TrackedState(
+        (sync.TrackedStack(repository, "main", (), (detached,)),), ()
+    )
+    selected = sync.DetachedAssociation(repository, "main", detached)
+    written = []
+    monkeypatch.setattr(sync, "read_state", lambda _workspace: ("old", state))
+    monkeypatch.setattr(sync, "read_ref_oid", lambda *_args: None)
+    monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
+    monkeypatch.setattr(
+        sync,
+        "_close_detached_pr",
+        lambda *_args: (_ for _ in ()).throw(sync.SourceUnavailable("lost")),
+    )
+    monkeypatch.setattr(
+        sync, "_observe_detached_pr_state", lambda *_args: sync.PullRequestState.CLOSED
+    )
+    monkeypatch.setattr(
+        sync,
+        "cas_write_state",
+        lambda _workspace, expected, value: written.append((expected, value)) or "new",
+    )
+
+    sync.close_detached_association("/work", selected)
+
+    assert written == [("old", sync.EMPTY_STATE)]
+
+
 @pytest.mark.parametrize("case", ("missing", "duplicate", "wrong"))
 def test_derive_rejects_unavailable_selected_pr(case: str) -> None:
     observed, pr = snapshot(desired="1" * 40, live="1" * 40, parent="0" * 40)
