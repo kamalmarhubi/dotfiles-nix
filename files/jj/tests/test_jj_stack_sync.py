@@ -1866,6 +1866,108 @@ def test_topology_cleanup_foreign_ref_retains_operation_fence(monkeypatch) -> No
     assert deleted == []
 
 
+def test_detached_association_list_and_forget_are_local_only(monkeypatch) -> None:
+    repository = sync.GitHubRepositoryId("github.com", "R")
+    active = sync.PullRequestId(repository, 1)
+    detached = sync.PullRequestId(repository, 2)
+    authority = sync.LastPublishedHead(
+        active, sync.RemoteBranchRef(repository, "refs/heads/active"), "a" * 40
+    )
+    state = sync.TrackedState(
+        (sync.TrackedStack(repository, "main", (active,), (detached,)),),
+        (authority,),
+    )
+    selected = sync.DetachedAssociation(repository, "main", detached)
+    written = []
+    monkeypatch.setattr(sync, "read_state", lambda _workspace: ("old", state))
+    monkeypatch.setattr(sync, "read_ref_oid", lambda *_args: None)
+    monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
+    monkeypatch.setattr(
+        sync,
+        "cas_write_state",
+        lambda _workspace, expected, value: written.append((expected, value)) or "new",
+    )
+    assert sync.list_detached_associations("/work") == (selected,)
+    result = sync.forget_detached_association("/work", selected)
+
+    assert result == sync.DetachedAssociationResult(selected, "new")
+    assert written[0][1].stacks == (
+        sync.TrackedStack(repository, "main", (active,), ()),
+    )
+    assert written[0][1].last_published_heads == (authority,)
+
+
+def test_detached_number_resolution_is_local_and_bounded(monkeypatch) -> None:
+    first_repo = sync.GitHubRepositoryId("github.com", "R_first")
+    second_repo = sync.GitHubRepositoryId("github.example", "R_second")
+    first = sync.DetachedAssociation(
+        first_repo, "main", sync.PullRequestId(first_repo, 12)
+    )
+    second = sync.DetachedAssociation(
+        second_repo, "trunk", sync.PullRequestId(second_repo, 42)
+    )
+    monkeypatch.setattr(
+        sync, "list_detached_associations", lambda _workspace: (first, second)
+    )
+    assert sync.resolve_detached_association("/work", 42) is second
+    assert isinstance(sync.resolve_detached_association("/work", 99), sync.Blocked)
+
+
+def test_close_detached_accepts_lost_response_after_closed_readback(monkeypatch) -> None:
+    repository = sync.GitHubRepositoryId("github.example", "R")
+    detached = sync.PullRequestId(repository, 42)
+    state = sync.TrackedState(
+        (sync.TrackedStack(repository, "main", (), (detached,)),), ()
+    )
+    selected = sync.DetachedAssociation(repository, "main", detached)
+    server = FakeGitHubServer()
+    server.seed_repository(
+        sync.GitHubRepository(
+            repository,
+            "owner/repo",
+            "https://github.example/owner/repo",
+            "main",
+        )
+    )
+    server.seed_pull_request(
+        sync.GitHubPullRequest(
+            detached,
+            "PR_42",
+            sync.PullRequestState.OPEN,
+            False,
+            repository,
+            "topic",
+            "1" * 40,
+            "main",
+            "0" * 40,
+            False,
+            False,
+            "Detached",
+            "",
+            None,
+        )
+    )
+    client = FakeGitHubClient(server)
+    written = []
+    monkeypatch.setattr(sync, "read_state", lambda _workspace: ("old", state))
+    monkeypatch.setattr(sync, "read_ref_oid", lambda *_args: None)
+    monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
+    monkeypatch.setattr(
+        sync,
+        "cas_write_state",
+        lambda _workspace, expected, value: written.append((expected, value)) or "new",
+    )
+
+    with client.lose_response(sync.GitHubClient.update_pull_request, pr=detached):
+        sync.close_detached_association("/work", client, selected)
+
+    assert written == [("old", sync.EMPTY_STATE)]
+    assert (
+        server.read_pull_requests((detached,))[0].state
+        is sync.PullRequestState.CLOSED
+    )
+
+
 @pytest.mark.parametrize("case", ("missing", "duplicate", "wrong"))
 def test_derive_rejects_unavailable_selected_pr(case: str) -> None:
     observed, pr = snapshot(desired="1" * 40, live="1" * 40, parent="0" * 40)

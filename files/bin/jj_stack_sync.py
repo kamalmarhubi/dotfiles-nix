@@ -458,6 +458,27 @@ class TrackedState:
     last_adopted_heads: tuple[LastAdoptedHead, ...] = ()
 
 
+@dataclass(frozen=True)
+class DetachedAssociation:
+    """One bounded cleanup association; it conveys no publication authority."""
+
+    repository: GitHubRepositoryId
+    base_branch: str
+    pr: PullRequestId
+
+    def __post_init__(self) -> None:
+        if not self.base_branch:
+            raise ValueError("detached association base branch must be nonempty")
+        if self.pr.repository != self.repository:
+            raise ValueError("detached association PR belongs to another repository")
+
+
+@dataclass(frozen=True)
+class DetachedAssociationResult:
+    association: DetachedAssociation
+    state_blob_oid: str
+
+
 EMPTY_STATE = TrackedState((), (), ())
 
 
@@ -2496,6 +2517,116 @@ def cas_write_state(
         detail = result.stderr.strip() or result.stdout.strip()
         raise Error("could not update state ref" + (f": {detail}" if detail else ""))
     return new_oid
+
+
+def list_detached_associations(
+    workspace: str | Path,
+) -> tuple[DetachedAssociation, ...]:
+    """List all locally bounded detached PRs without contacting GitHub."""
+    _oid, state = read_state(workspace)
+    return tuple(
+        DetachedAssociation(stack.repository, stack.base_branch, pr)
+        for stack in state.stacks
+        for pr in stack.detached_prs
+    )
+
+
+def _selected_detached_stack(
+    state: TrackedState, selected: DetachedAssociation
+) -> tuple[int, TrackedStack]:
+    matches = tuple(
+        (index, stack)
+        for index, stack in enumerate(state.stacks)
+        if stack.repository == selected.repository
+        and stack.base_branch == selected.base_branch
+        and selected.pr in stack.detached_prs
+    )
+    if len(matches) != 1:
+        raise Error("selected detached association is absent, foreign, or ambiguous")
+    return matches[0]
+
+
+def _remove_detached_association(
+    state: TrackedState, selected: DetachedAssociation
+) -> TrackedState:
+    index, stack = _selected_detached_stack(state, selected)
+    updated = replace(
+        stack,
+        detached_prs=tuple(pr for pr in stack.detached_prs if pr != selected.pr),
+    )
+    stacks = list(state.stacks)
+    if updated.ordered_prs or updated.detached_prs:
+        stacks[index] = updated
+    else:
+        del stacks[index]
+    return replace(state, stacks=tuple(stacks))
+
+
+def resolve_detached_association(
+    workspace: str | Path, pr_number: int
+) -> DetachedAssociation | Blocked:
+    """Resolve a human PR number only within locally bounded associations."""
+    if type(pr_number) is not int or pr_number <= 0:
+        raise Error("pull request number must be a positive integer")
+    matches = [
+        association
+        for association in list_detached_associations(workspace)
+        if association.pr.number == pr_number
+    ]
+    if len(matches) != 1:
+        return _block(
+            "detached-pr-resolution",
+            f"PR #{pr_number}",
+            "no unique bounded detached association has that PR number",
+        )
+    return matches[0]
+
+
+def forget_detached_association(
+    workspace: str | Path, selected: DetachedAssociation
+) -> DetachedAssociationResult:
+    """Forget one local cleanup association without making a remote call."""
+    with repository_lock(workspace):
+        state_oid, state = read_state(workspace)
+        if read_ref_oid(workspace, OPERATION_REF) is not None:
+            raise ConcurrentUpdate("another operation is already active")
+        written = cas_write_state(
+            workspace, state_oid, _remove_detached_association(state, selected)
+        )
+        return DetachedAssociationResult(selected, written)
+
+
+def close_detached_association(
+    workspace: str | Path, github: GitHubClient, selected: DetachedAssociation
+) -> DetachedAssociationResult:
+    """Close exactly one bounded detached PR, verify it, then forget it."""
+    with repository_lock(workspace):
+        state_oid, state = read_state(workspace)
+        if read_ref_oid(workspace, OPERATION_REF) is not None:
+            raise ConcurrentUpdate("another operation is already active")
+        _selected_detached_stack(state, selected)
+        repository = github.resolve_repository(selected.repository)
+        observed = github.pull_requests((selected.pr,))[0]
+        if observed.identity != selected.pr:
+            raise SourceMismatch("GitHub returned a foreign pull request")
+        if observed.state is PullRequestState.OPEN:
+            try:
+                github.update_pull_request(
+                    repository,
+                    selected.pr,
+                    state=PullRequestUpdateState.CLOSED,
+                )
+            except Error:
+                pass
+        elif observed.state is not PullRequestState.CLOSED:
+            raise Error("detached pull request cannot be closed")
+        observed = github.pull_requests((selected.pr,))[0]
+        if observed.state is not PullRequestState.CLOSED:
+            raise Error("detached pull request is not closed")
+        written = cas_write_state(
+            workspace, state_oid, _remove_detached_association(state, selected)
+        )
+        return DetachedAssociationResult(selected, written)
 
 
 def _validate_first_publication(operation: FirstPublication) -> None:
