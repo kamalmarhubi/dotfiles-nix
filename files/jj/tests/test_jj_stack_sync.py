@@ -1512,6 +1512,141 @@ def test_topology_planning_is_pure_and_checks_both_base_maps(monkeypatch) -> Non
     assert desired_result.reasons[0].code == "invalid-desired-comparison"
 
 
+def test_topology_operation_round_trip_is_strict_and_exact() -> None:
+    plan = sync.plan_topology(topology_input((2, 1)))
+    assert isinstance(plan, sync.TopologyPlan)
+    operation = sync.TopologyRepair(plan)
+
+    encoded = sync.topology_repair_to_json(operation)
+    payload = json.loads(encoded)
+
+    assert payload["operation_kind"] == "topology-repair"
+    assert payload["plan"]["dependencies"]["source"]["source_kind"] == "server-stack"
+    assert sync.parse_operation(encoded) == operation
+    del payload["operation_kind"]
+    with pytest.raises(sync.Error, match="unknown operation_kind"):
+        sync.parse_operation(json.dumps(payload))
+
+
+@pytest.mark.parametrize("initial", ("absent", "exact"))
+def test_topology_creation_reconciles_complete_readback(
+    monkeypatch, initial: str
+) -> None:
+    plan = sync.plan_topology(topology_input((2, 1)))
+    assert isinstance(plan, sync.TopologyPlan)
+    operation = sync.TopologyRepair(plan)
+    old = tuple(item.old_base_commit_id for item in plan.temporary_bases)
+    absent = (None,) * len(old)
+    observations = [absent if initial == "absent" else old]
+    if initial == "absent":
+        observations.append(old)
+    pushes: list[tuple[sync.PlannedTemporaryBase, ...]] = []
+
+    monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
+    monkeypatch.setattr(sync, "read_operation", lambda _workspace: ("op", operation))
+    monkeypatch.setattr(sync, "_frozen_repository", lambda *a, **k: object())
+    monkeypatch.setattr(sync, "cas_write_topology_repair", lambda *a, **k: "next")
+    monkeypatch.setattr(
+        sync,
+        "_topology_refs",
+        lambda plan, workspace, refs: tuple(
+            sync.LiveRemoteRef(ref, oid)
+            for ref, oid in zip(refs, observations.pop(0), strict=True)
+        ),
+    )
+    monkeypatch.setattr(
+        sync,
+        "create_temporary_bases",
+        lambda workspace, push_url, bases: pushes.append(tuple(bases)),
+    )
+    monkeypatch.setattr(
+        sync,
+        "_observe_source_association",
+        lambda *a, **k: (_ for _ in ()).throw(sync.Error("stop after creation")),
+    )
+
+    result = sync.resume_topology_repair(".")
+
+    assert isinstance(result, sync.Stopped)
+    assert result.stage == sync.TopologyRepairPhase.UNSTACKING.value
+    assert len(pushes) == (1 if initial == "absent" else 0)
+
+
+def test_topology_publication_exact_readback_advances_without_repush(
+    monkeypatch,
+) -> None:
+    plan = sync.plan_topology(topology_input((2, 1)))
+    assert isinstance(plan, sync.TopologyPlan)
+    operation = sync.TopologyRepair(plan, sync.TopologyRepairPhase.PUBLISHING)
+    desired = tuple(item.new_commit_id for item in plan.head_updates) + tuple(
+        item.new_base_commit_id for item in plan.temporary_bases
+    )
+    repushes: list[object] = []
+
+    monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
+    monkeypatch.setattr(sync, "read_operation", lambda _workspace: ("op", operation))
+    monkeypatch.setattr(sync, "_frozen_repository", lambda *a, **k: object())
+    monkeypatch.setattr(sync, "cas_write_topology_repair", lambda *a, **k: "next")
+    monkeypatch.setattr(
+        sync,
+        "_observe_topology_pr",
+        lambda repository, pr, **kwargs: sync.GitHubPullRequestSource(pr, None, None),
+    )
+    monkeypatch.setattr(
+        sync,
+        "_topology_refs",
+        lambda plan, workspace, refs: tuple(
+            sync.LiveRemoteRef(ref, oid) for ref, oid in zip(refs, desired, strict=True)
+        ),
+    )
+    monkeypatch.setattr(sync, "move_temporary_bases", lambda *a: repushes.append(a))
+    monkeypatch.setattr(
+        sync,
+        "_topology_desired_bases",
+        lambda _plan: (_ for _ in ()).throw(sync.Error("stop after publishing")),
+    )
+
+    result = sync.resume_topology_repair(".")
+
+    assert isinstance(result, sync.Stopped)
+    assert result.stage == sync.TopologyRepairPhase.RELINKING.value
+    assert repushes == []
+
+
+def test_topology_cleanup_foreign_ref_retains_operation_fence(monkeypatch) -> None:
+    plan = sync.plan_topology(topology_input((2, 1)))
+    assert isinstance(plan, sync.TopologyPlan)
+    final_state = sync.state_to_json(sync.EMPTY_STATE)
+    operation = sync.TopologyRepair(
+        plan,
+        sync.TopologyRepairPhase.COMMITTING,
+        final_state_json=final_state,
+        final_state_oid="f" * 40,
+    )
+    deleted: list[str] = []
+
+    monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
+    monkeypatch.setattr(sync, "read_operation", lambda _workspace: ("op", operation))
+    monkeypatch.setattr(sync, "_frozen_repository", lambda *a, **k: object())
+    monkeypatch.setattr(sync, "read_ref_oid", lambda *a: "f" * 40)
+    monkeypatch.setattr(
+        sync,
+        "_topology_refs",
+        lambda plan, workspace, refs: tuple(
+            sync.LiveRemoteRef(ref, "9" * 40) for ref in refs
+        ),
+    )
+    monkeypatch.setattr(
+        sync, "cas_delete_operation", lambda *a: deleted.append("deleted")
+    )
+
+    result = sync.resume_topology_repair(".")
+
+    assert isinstance(result, sync.Stopped)
+    assert result.stage == "cleanup"
+    assert deleted == []
+
+
 @pytest.mark.parametrize("case", ("missing", "duplicate", "wrong"))
 def test_derive_rejects_unavailable_selected_pr(case: str) -> None:
     observed, pr = snapshot(desired="1" * 40, live="1" * 40, parent="0" * 40)

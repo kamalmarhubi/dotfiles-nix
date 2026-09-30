@@ -5,6 +5,7 @@ This module intentionally has no command-line entry point or topology mutation.
 
 from __future__ import annotations
 
+import dataclasses
 import fcntl
 import hashlib
 import http.client
@@ -21,7 +22,7 @@ import urllib.request
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
-from enum import StrEnum
+from enum import Enum, StrEnum
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
@@ -716,6 +717,16 @@ class StackEffect:
 GitHubEffect = PullRequestBaseEffect | StackEffect
 
 
+class TopologyRepairPhase(StrEnum):
+    CREATING_TEMPORARY_BASES = "creating-temporary-bases"
+    UNSTACKING = "unstacking"
+    TEMPORARY_BASES = "temporary-bases"
+    PUBLISHING = "publishing"
+    RELINKING = "relinking"
+    VERIFYING = "verifying"
+    COMMITTING = "committing"
+
+
 @dataclass(frozen=True)
 class PlannedHeadUpdate:
     ref: RemoteBranchRef
@@ -747,6 +758,30 @@ class TopologyPlan:
     @property
     def source(self) -> PullRequestMembership:
         return self.dependencies.source
+
+
+@dataclass(frozen=True)
+class TopologyRepair:
+    """Durable execution record for one approved topology plan."""
+
+    plan: TopologyPlan
+    phase: TopologyRepairPhase = TopologyRepairPhase.CREATING_TEMPORARY_BASES
+    unstack_possibly_sent: bool = False
+    temporary_bases_possibly_sent: tuple[PullRequestId, ...] = ()
+    relink_possibly_sent: bool = False
+    final_state_json: str | None = None
+    final_state_oid: str | None = None
+
+
+@dataclass(frozen=True)
+class TopologyRepairVerified:
+    ordered_prs: tuple[PullRequestId, ...]
+
+
+class StackDissolution(StrEnum):
+    ABSENT = "absent"
+    PRESENT = "present"
+    UNKNOWN = "unknown"
 
 
 @dataclass(frozen=True)
@@ -797,6 +832,8 @@ class Stopped:
 ApplyResult = Verified | Stopped
 AdoptionResult = AdoptionVerified | Stopped
 FirstPublicationResult = FirstPublicationVerified | Stopped
+TopologyRepairResult = TopologyRepairVerified | Stopped
+Operation = FirstPublication | TopologyRepair
 
 
 def _run(
@@ -2340,6 +2377,358 @@ def parse_first_publication(data: str) -> FirstPublication:
         raise Error(f"invalid refs/jj-stack/operation payload: {exc}") from exc
 
 
+def topology_repair_to_json(operation: TopologyRepair) -> str:
+    _validate_topology_repair(operation)
+    payload = asdict(operation)
+    payload["operation_kind"] = "topology-repair"
+    source = operation.plan.source
+    encoded_source = payload["plan"]["dependencies"]["source"]
+    encoded_source["source_kind"] = (
+        "standalone" if isinstance(source, StandalonePullRequest) else "server-stack"
+    )
+    for encoded, update in zip(
+        payload["plan"]["head_updates"], operation.plan.head_updates, strict=True
+    ):
+        encoded["authority"]["authority_kind"] = (
+            "fast-forward"
+            if isinstance(update.authority, FastForward)
+            else (
+                "last-publication"
+                if isinstance(update.authority, MatchesLastPublication)
+                else "last-adoption"
+            )
+        )
+    return (
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=lambda value: (
+                value.value if isinstance(value, Enum) else TypeError()
+            ),
+        )
+        + "\n"
+    )
+
+
+def _validate_topology_repair(operation: TopologyRepair) -> None:
+    plan = operation.plan
+    if (
+        not plan.remote
+        or plan.repository != plan.desired.repository
+        or not re.fullmatch(r"[^/]+/[^/]+", plan.repository_name)
+        or len({update.ref for update in plan.head_updates}) != len(plan.head_updates)
+    ):
+        raise ValueError("topology repair repository and remote must be frozen")
+    committing = operation.phase is TopologyRepairPhase.COMMITTING
+    if committing != (
+        operation.final_state_json is not None and operation.final_state_oid is not None
+    ):
+        raise ValueError("committing topology repair must freeze final state")
+    if operation.final_state_json is not None:
+        parse_state(operation.final_state_json)
+
+
+def parse_topology_repair(data: str) -> TopologyRepair:
+    """Strict decoder for the durable topology operation format."""
+
+    def record(value: object, names: set[str], where: str) -> dict[str, object]:
+        if not isinstance(value, dict) or set(value) != names:
+            raise ValueError(f"{where} has unexpected fields")
+        return value
+
+    def seq(value: object, where: str) -> list[object]:
+        if not isinstance(value, list):
+            raise ValueError(f"{where} must be an array")
+        return value
+
+    def text(value: object, where: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{where} must be nonempty text")
+        return value
+
+    def boolean(value: object, where: str) -> bool:
+        if type(value) is not bool:
+            raise ValueError(f"{where} must be boolean")
+        return value
+
+    def rid(value: object) -> GitHubRepositoryId:
+        raw = record(value, {"host", "node_id"}, "repository")
+        return GitHubRepositoryId(
+            text(raw["host"], "host"), text(raw["node_id"], "repository ID")
+        )
+
+    def pid(value: object) -> PullRequestId:
+        raw = record(value, {"repository", "node_id"}, "PR")
+        return PullRequestId(rid(raw["repository"]), text(raw["node_id"], "PR ID"))
+
+    def ref(value: object) -> RemoteBranchRef:
+        raw = record(value, {"repository", "full_name"}, "ref")
+        return RemoteBranchRef(
+            rid(raw["repository"]), text(raw["full_name"], "ref name")
+        )
+
+    def live(value: object) -> LiveRemoteRef:
+        raw = record(value, {"ref", "commit_id"}, "live ref")
+        oid = raw["commit_id"]
+        if oid is not None and not isinstance(oid, str):
+            raise ValueError("live ref OID must be text or null")
+        return LiveRemoteRef(ref(raw["ref"]), oid)
+
+    def membership(value: object) -> PullRequestMembership:
+        if not isinstance(value, dict):
+            raise ValueError("source must be an object")
+        raw = dict(value)
+        kind = raw.pop("source_kind", None)
+        if kind == "standalone":
+            return StandalonePullRequest(
+                pid(record(raw, {"pr"}, "standalone source")["pr"])
+            )
+        source = record(
+            raw, {"selected_pr", "stack", "base_branch", "ordered_prs"}, "stack source"
+        )
+        stack = record(
+            source["stack"], {"repository", "node_id", "number"}, "stack identity"
+        )
+        number = stack["number"]
+        if kind != "server-stack" or type(number) is not int:
+            raise ValueError("server stack source is invalid")
+        return ServerStackMembership(
+            pid(source["selected_pr"]),
+            ServerStackIdentity(
+                rid(stack["repository"]), text(stack["node_id"], "stack ID"), number
+            ),
+            text(source["base_branch"], "stack base"),
+            tuple(pid(item) for item in seq(source["ordered_prs"], "stack PRs")),
+        )
+
+    def receipt(value: object, adopted: bool) -> LastPublishedHead | LastAdoptedHead:
+        raw = record(value, {"pr", "ref", "verified_commit_id"}, "receipt")
+        values = (
+            pid(raw["pr"]),
+            ref(raw["ref"]),
+            text(raw["verified_commit_id"], "receipt OID"),
+        )
+        return LastAdoptedHead(*values) if adopted else LastPublishedHead(*values)
+
+    def authority(value: object) -> Authority:
+        if not isinstance(value, dict):
+            raise ValueError("authority must be an object")
+        raw = dict(value)
+        kind = raw.pop("authority_kind", None)
+        if kind == "fast-forward":
+            record(raw, set(), "fast-forward authority")
+            return FastForward()
+        field = "publication" if kind == "last-publication" else "adoption"
+        item = record(raw, {field}, "receipt authority")[field]
+        if kind == "last-publication":
+            return MatchesLastPublication(receipt(item, False))  # type: ignore[arg-type]
+        if kind == "last-adoption":
+            return MatchesLastAdoption(receipt(item, True))  # type: ignore[arg-type]
+        raise ValueError("authority kind is invalid")
+
+    try:
+        top = record(
+            json.loads(data),
+            {
+                "operation_kind",
+                "plan",
+                "phase",
+                "unstack_possibly_sent",
+                "temporary_bases_possibly_sent",
+                "relink_possibly_sent",
+                "final_state_json",
+                "final_state_oid",
+            },
+            "operation",
+        )
+        if top["operation_kind"] != "topology-repair":
+            raise ValueError("operation kind is invalid")
+        plan_raw = record(
+            top["plan"],
+            {field.name for field in dataclasses.fields(TopologyPlan)},
+            "plan",
+        )
+        desired_raw = record(
+            plan_raw["desired"], {"repository", "base_branch", "active"}, "desired"
+        )
+        desired = DesiredStack(
+            rid(desired_raw["repository"]),
+            text(desired_raw["base_branch"], "desired base"),
+            tuple(
+                DesiredExistingPR(
+                    pid(item["pr_identity"]),
+                    text(item["desired_commit_id"], "desired OID"),
+                    text(item["title"], "title"),
+                    item["body"]
+                    if isinstance(item["body"], str)
+                    else (_ for _ in ()).throw(ValueError("body must be text")),
+                )
+                for item in (
+                    record(
+                        value,
+                        {"pr_identity", "desired_commit_id", "title", "body"},
+                        "desired PR",
+                    )
+                    for value in seq(desired_raw["active"], "desired PRs")
+                )
+            ),
+        )
+        dep_raw = record(
+            plan_raw["dependencies"],
+            {field.name for field in dataclasses.fields(TopologyDependencies)},
+            "dependencies",
+        )
+        prs = tuple(
+            _parse_topology_pr(value, record, rid, pid, text, boolean)
+            for value in seq(dep_raw["prs"], "PRs")
+        )
+        dependencies = TopologyDependencies(
+            tuple(tuple(item) for item in seq(dep_raw["effective_config"], "config")),
+            text(dep_raw["push_url"], "push URL"),
+            dep_raw["state_blob_oid"],
+            dep_raw["operation_blob_oid"],
+            prs,
+            membership(dep_raw["source"]),
+            tuple(live(item) for item in seq(dep_raw["live_heads"], "heads")),
+            tuple(live(item) for item in seq(dep_raw["live_bases"], "bases")),
+        )
+        updates = tuple(
+            PlannedHeadUpdate(
+                ref(item["ref"]),
+                text(item["expected_old_commit_id"], "old OID"),
+                text(item["new_commit_id"], "new OID"),
+                authority(item["authority"]),
+            )
+            for item in (
+                record(
+                    value,
+                    {"ref", "expected_old_commit_id", "new_commit_id", "authority"},
+                    "head update",
+                )
+                for value in seq(plan_raw["head_updates"], "head updates")
+            )
+        )
+        bases = tuple(
+            PlannedTemporaryBase(
+                pid(item["pr_identity"]),
+                ref(item["ref"]),
+                text(item["old_base_commit_id"], "old base"),
+                text(item["new_base_commit_id"], "new base"),
+            )
+            for item in (
+                record(
+                    value,
+                    {"pr_identity", "ref", "old_base_commit_id", "new_base_commit_id"},
+                    "temporary base",
+                )
+                for value in seq(plan_raw["temporary_bases"], "temporary bases")
+            )
+        )
+        tracking_raw = plan_raw["tracking_update"]
+        tracking = None
+        if tracking_raw is not None:
+            item = record(
+                tracking_raw,
+                {"repository", "base_branch", "ordered_prs", "detached_prs"},
+                "tracking update",
+            )
+            tracking = TrackedStack(
+                rid(item["repository"]),
+                text(item["base_branch"], "tracked base"),
+                tuple(pid(value) for value in seq(item["ordered_prs"], "tracked PRs")),
+                tuple(
+                    pid(value) for value in seq(item["detached_prs"], "detached PRs")
+                ),
+            )
+        plan = TopologyPlan(
+            rid(plan_raw["repository"]),
+            text(plan_raw["repository_name"], "repository name"),
+            text(plan_raw["remote"], "remote"),
+            desired,
+            tuple(pid(item) for item in seq(plan_raw["detached_prs"], "detached PRs")),
+            updates,
+            bases,
+            tracking,
+            dependencies,
+        )
+        final_json, final_oid = top["final_state_json"], top["final_state_oid"]
+        if (
+            final_json is not None
+            and not isinstance(final_json, str)
+            or final_oid is not None
+            and not isinstance(final_oid, str)
+        ):
+            raise ValueError("final state fields must be text or null")
+        operation = TopologyRepair(
+            plan,
+            TopologyRepairPhase(text(top["phase"], "phase")),
+            boolean(top["unstack_possibly_sent"], "unstack marker"),
+            tuple(
+                pid(item)
+                for item in seq(
+                    top["temporary_bases_possibly_sent"], "temporary bases marker"
+                )
+            ),
+            boolean(top["relink_possibly_sent"], "relink marker"),
+            final_json,
+            final_oid,
+        )
+        _validate_topology_repair(operation)
+        return operation
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise Error(f"invalid refs/jj-stack/operation payload: {exc}") from exc
+
+
+def _parse_topology_pr(value, record, rid, pid, text, boolean) -> GitHubPullRequest:
+    raw = record(
+        value, {field.name for field in dataclasses.fields(GitHubPullRequest)}, "PR"
+    )
+    number = raw["number"]
+    if type(number) is not int or not isinstance(raw["body"], str):
+        raise ValueError("PR scalar fields are malformed")
+    return GitHubPullRequest(
+        pid(raw["identity"]),
+        number,
+        PullRequestState(text(raw["state"], "PR state")),
+        boolean(raw["draft"], "draft"),
+        rid(raw["head_repository"]),
+        text(raw["head_branch"], "head branch"),
+        text(raw["reported_head_commit_id"], "head OID"),
+        text(raw["base_branch"], "base branch"),
+        text(raw["reported_base_commit_id"], "base OID"),
+        boolean(raw["auto_merge_enabled"], "auto merge"),
+        boolean(raw["in_merge_queue"], "merge queue"),
+        text(raw["title"], "title"),
+        raw["body"],
+    )
+
+
+def parse_operation(data: str) -> Operation:
+    try:
+        raw = json.loads(data)
+    except json.JSONDecodeError as exc:
+        raise Error(f"invalid refs/jj-stack/operation payload: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise Error("invalid refs/jj-stack/operation payload: expected object")
+    kind = raw.get("operation_kind")
+    if kind == "first-publication":
+        return parse_first_publication(data)
+    if kind == "topology-repair":
+        return parse_topology_repair(data)
+    raise Error("invalid refs/jj-stack/operation payload: unknown operation_kind")
+
+
+def read_operation(workspace: str | Path) -> tuple[str, Operation]:
+    oid = read_ref_oid(workspace, OPERATION_REF)
+    if oid is None:
+        raise Error("there is no active operation")
+    payload = _run(
+        ["git", f"--git-dir={git_common_dir(workspace)}", "cat-file", "blob", oid]
+    )
+    return oid, parse_operation(payload)
+
+
 def read_first_publication(
     workspace: str | Path,
 ) -> tuple[str, FirstPublication]:
@@ -2371,6 +2760,33 @@ def cas_write_first_publication(
             new_oid,
             expected,
         ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        if read_ref_oid(workspace, OPERATION_REF) != expected_oid:
+            raise ConcurrentUpdate("operation ref changed during compare-and-swap")
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise Error(
+            "could not update operation ref" + (f": {detail}" if detail else "")
+        )
+    return new_oid
+
+
+def cas_write_topology_repair(
+    workspace: str | Path,
+    expected_oid: str | None,
+    operation: TopologyRepair,
+) -> str:
+    common = git_common_dir(workspace)
+    new_oid = _run(
+        ["git", f"--git-dir={common}", "hash-object", "-w", "--stdin"],
+        stdin=topology_repair_to_json(operation),
+    ).strip()
+    expected = expected_oid or ("0" * len(new_oid))
+    result = subprocess.run(
+        ["git", f"--git-dir={common}", "update-ref", OPERATION_REF, new_oid, expected],
         text=True,
         capture_output=True,
         check=False,
@@ -5217,6 +5633,210 @@ def start_first_publication(operation: FirstPublication, workspace: str | Path) 
         return cas_write_first_publication(workspace, None, operation)
 
 
+def _topology_refs(
+    plan: TopologyPlan, workspace: str | Path, refs: Sequence[RemoteBranchRef]
+) -> tuple[LiveRemoteRef, ...]:
+    if not refs:
+        return ()
+    return observe_live_refs(
+        plan.dependencies.push_url,
+        plan.repository,
+        tuple(ref.full_name for ref in refs),
+        cwd=workspace,
+    )
+
+
+def start_topology_repair(plan: TopologyPlan, workspace: str | Path) -> str:
+    """Reserve the complete temporary-base set before any external effect."""
+    operation = TopologyRepair(plan)
+    _validate_topology_repair(operation)
+    with repository_lock(workspace):
+        if read_ref_oid(workspace, STATE_REF) != plan.dependencies.state_blob_oid:
+            raise ConcurrentUpdate("private state changed before operation start")
+        if read_ref_oid(workspace, OPERATION_REF) is not None:
+            raise ConcurrentUpdate("another operation is already active")
+        expected = tuple(LiveRemoteRef(item.ref, None) for item in plan.temporary_bases)
+        if (
+            _topology_refs(
+                plan, workspace, tuple(item.ref for item in plan.temporary_bases)
+            )
+            != expected
+        ):
+            raise ConcurrentUpdate("a frozen temporary base branch is occupied")
+        return cas_write_topology_repair(workspace, None, operation)
+
+
+def _frozen_repository(
+    identity: GitHubRepositoryId, name: str, *, cwd: str | Path
+) -> GitHubRepository:
+    observed = observe_github_repository(f"https://{identity.host}/{name}", cwd=cwd)
+    if observed.identity != identity or observed.name_with_owner != name:
+        raise SourceMismatch("frozen GitHub repository locator changed identity")
+    return observed
+
+
+def _github_routing_env(identity: GitHubRepositoryId, name: str) -> dict[str, str]:
+    return {
+        **os.environ,
+        "GH_REPO": f"{identity.host}/{name}",
+        "GH_HOST": identity.host,
+    }
+
+
+def _observe_frozen_topology_sources(
+    plan: TopologyPlan,
+    repository: GitHubRepository,
+    *,
+    compare_head: bool = True,
+    compare_base: bool = True,
+    compare_metadata: bool = True,
+    cwd: str | Path,
+) -> tuple[GitHubPullRequestSource, ...]:
+    sources = tuple(
+        observe_github_pull_request(repository, expected.number, cwd=cwd)
+        for expected in plan.dependencies.prs
+    )
+    for expected, source in zip(plan.dependencies.prs, sources, strict=True):
+        actual = source.pr
+        if (actual.identity, actual.number, actual.state, actual.draft) != (
+            expected.identity,
+            expected.number,
+            expected.state,
+            expected.draft,
+        ):
+            raise SourceMismatch(
+                f"pull request #{expected.number} identity or state changed"
+            )
+        if compare_head and (
+            actual.head_repository,
+            actual.head_branch,
+            actual.reported_head_commit_id,
+        ) != (
+            expected.head_repository,
+            expected.head_branch,
+            expected.reported_head_commit_id,
+        ):
+            raise SourceMismatch(f"pull request #{expected.number} head changed")
+        if compare_base and (actual.base_branch, actual.reported_base_commit_id) != (
+            expected.base_branch,
+            expected.reported_base_commit_id,
+        ):
+            raise SourceMismatch(f"pull request #{expected.number} base changed")
+        if compare_metadata and (actual.title, actual.body) != (
+            expected.title,
+            expected.body,
+        ):
+            raise SourceMismatch(f"pull request #{expected.number} metadata changed")
+        if actual.auto_merge_enabled or actual.in_merge_queue:
+            raise SourceMismatch(
+                f"pull request #{expected.number} has active automation"
+            )
+    return sources
+
+
+def _observe_source_association(
+    plan: TopologyPlan,
+    repository: GitHubRepository,
+    *,
+    allow_dissolved: bool,
+    compare_head: bool = True,
+    compare_base: bool = True,
+    cwd: str | Path,
+) -> tuple[tuple[GitHubPullRequestSource, ...], GitHubStackSource | None]:
+    sources = _observe_frozen_topology_sources(
+        plan,
+        repository,
+        compare_head=compare_head,
+        compare_base=compare_base,
+        cwd=cwd,
+    )
+    if all(
+        item.stack_id is None and item.stack_base_branch is None for item in sources
+    ):
+        if allow_dissolved or isinstance(plan.source, StandalonePullRequest):
+            return sources, None
+        raise SourceMismatch("frozen server stack disappeared before unstack")
+    if not isinstance(plan.source, ServerStackMembership):
+        raise SourceMismatch("standalone source gained a stack association")
+    if any(
+        item.stack_id != plan.source.server_stack_id
+        or item.stack_base_branch != plan.source.base_branch
+        for item in sources
+    ):
+        raise SourceMismatch("frozen source stack associations changed")
+    stack = observe_github_stack(repository, plan.source.server_stack_id, cwd=cwd)
+    if (
+        stack.identity != plan.source.stack
+        or stack.base_branch != plan.source.base_branch
+        or tuple(pr.identity for pr in stack.ordered_prs) != plan.source.ordered_prs
+    ):
+        raise SourceMismatch("frozen source stack identity or membership changed")
+    return sources, stack
+
+
+def create_temporary_bases(
+    workspace: str | Path,
+    push_url: str,
+    temporary_bases: Sequence[PlannedTemporaryBase],
+) -> subprocess.CompletedProcess[str]:
+    if not temporary_bases:
+        raise ValueError("temporary-base creation requires branches")
+    return subprocess.run(
+        [
+            "git",
+            f"--git-dir={git_common_dir(workspace)}",
+            "push",
+            "--atomic",
+            "--no-follow-tags",
+            "--recurse-submodules=no",
+            *(f"--force-with-lease={item.ref.full_name}:" for item in temporary_bases),
+            push_url,
+            *(
+                f"{item.old_base_commit_id}:{item.ref.full_name}"
+                for item in temporary_bases
+            ),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
+def move_temporary_bases(
+    workspace: str | Path,
+    push_url: str,
+    heads: Sequence[PlannedHeadUpdate],
+    temporary_bases: Sequence[PlannedTemporaryBase],
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "git",
+            f"--git-dir={git_common_dir(workspace)}",
+            "push",
+            "--atomic",
+            "--no-follow-tags",
+            "--recurse-submodules=no",
+            *(
+                f"--force-with-lease={item.ref.full_name}:{item.expected_old_commit_id}"
+                for item in heads
+            ),
+            *(
+                f"--force-with-lease={item.ref.full_name}:{item.old_base_commit_id}"
+                for item in temporary_bases
+            ),
+            push_url,
+            *(f"{item.new_commit_id}:{item.ref.full_name}" for item in heads),
+            *(
+                f"{item.new_base_commit_id}:{item.ref.full_name}"
+                for item in temporary_bases
+            ),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def _replace_slot(
     operation: FirstPublication, index: int, slot: NewPRSlot, **changes: object
 ) -> FirstPublication:
@@ -5854,3 +6474,583 @@ def apply(plan: SyncPlan, workspace: str | Path) -> ApplyResult:
             bool(publications),
             plan.tracking_update is not None,
         )
+
+
+def run_stack_unstack(
+    workspace: str | Path, plan: TopologyPlan, stack_number: int
+) -> GitHubResponse:
+    source = plan.source
+    if not isinstance(source, ServerStackMembership) or source.stack.number != stack_number:
+        raise ValueError("unstack request does not match the frozen source stack")
+    effect = StackEffect(
+        StackEffectKind.UNSTACK,
+        plan.repository,
+        plan.repository_name,
+        (),
+        source.ordered_prs,
+        (),
+        source.stack,
+        GitHubEffectPhase.POSSIBLY_SENT,
+    )
+    return send_github_effect(effect, cwd=workspace)
+
+
+def prove_stack_dissolved(
+    repository: GitHubRepository, stack_number: int, *, cwd: str | Path
+) -> StackDissolution:
+    try:
+        response = github_http_request(
+            repository.identity.host,
+            "GET",
+            f"/{_github_repository_path(repository.name_with_owner)}/stacks/{stack_number}",
+            cwd=cwd,
+        )
+    except GitHubTransportFailure:
+        return StackDissolution.UNKNOWN
+    if response.status == 404:
+        return StackDissolution.ABSENT
+    if response.status == 200:
+        return StackDissolution.PRESENT
+    return StackDissolution.UNKNOWN
+
+
+def run_pr_base_edit(
+    workspace: str | Path,
+    plan: TopologyPlan,
+    identity: PullRequestId,
+    expected_base: str,
+    desired_base: str,
+) -> GitHubResponse:
+    pr = next(item for item in plan.dependencies.prs if item.identity == identity)
+    return send_github_effect(
+        PullRequestBaseEffect(
+            plan.repository,
+            plan.repository_name,
+            identity,
+            pr.number,
+            expected_base,
+            desired_base,
+            GitHubEffectPhase.POSSIBLY_SENT,
+        ),
+        cwd=workspace,
+    )
+
+
+def _topology_desired_bases(plan: TopologyPlan) -> dict[PullRequestId, str]:
+    frozen = {pr.identity: pr for pr in plan.dependencies.prs}
+    result: dict[PullRequestId, str] = {}
+    previous = plan.desired.base_branch
+    for wanted in plan.desired.active:
+        result[wanted.pr_identity] = previous
+        previous = frozen[wanted.pr_identity].head_branch
+    return result
+
+
+def run_topology_stack_link(
+    workspace: str | Path, plan: TopologyPlan
+) -> GitHubResponse:
+    frozen = {pr.identity: pr for pr in plan.dependencies.prs}
+    identities = tuple(item.pr_identity for item in plan.desired.active)
+    effect = StackEffect(
+        StackEffectKind.CREATE,
+        plan.repository,
+        plan.repository_name,
+        tuple(frozen[identity].number for identity in identities),
+        (),
+        identities,
+        phase=GitHubEffectPhase.POSSIBLY_SENT,
+    )
+    return send_github_effect(effect, cwd=workspace)
+
+
+def observe_topology_projection(
+    plan: TopologyPlan, workspace: str | Path
+) -> tuple[tuple[GitHubPullRequestSource, ...], GitHubStackSource | None]:
+    repository = _frozen_repository(
+        plan.repository, plan.repository_name, cwd=workspace
+    )
+    sources = tuple(
+        observe_github_pull_request(repository, pr.number, cwd=workspace)
+        for pr in plan.dependencies.prs
+    )
+    desired = tuple(item.pr_identity for item in plan.desired.active)
+    stack_ids = {item.stack_id for item in sources if item.stack_id is not None}
+    stack = None
+    if len(desired) >= 2 and len(stack_ids) == 1:
+        stack = observe_github_stack(repository, next(iter(stack_ids)), cwd=workspace)
+    return sources, stack
+
+
+def _topology_projection_error(
+    plan: TopologyPlan,
+    sources: Sequence[GitHubPullRequestSource],
+    stack: GitHubStackSource | None,
+) -> str | None:
+    frozen = {pr.identity: pr for pr in plan.dependencies.prs}
+    actual = {item.pr.identity: item for item in sources}
+    if set(actual) != set(frozen):
+        return "source PR identity set changed"
+    desired = tuple(item.pr_identity for item in plan.desired.active)
+    desired_by_id = {item.pr_identity: item for item in plan.desired.active}
+    bases = _topology_desired_bases(plan)
+    for identity, expected in frozen.items():
+        source = actual[identity]
+        pr = source.pr
+        if pr.state is not PullRequestState.OPEN or pr.number != expected.number:
+            return f"pull request #{expected.number} is not the frozen open PR"
+        if identity in desired_by_id:
+            wanted = desired_by_id[identity]
+            if (
+                pr.reported_head_commit_id,
+                pr.base_branch,
+                pr.title,
+                pr.body,
+                pr.draft,
+            ) != (
+                wanted.desired_commit_id,
+                bases[identity],
+                wanted.title,
+                wanted.body,
+                expected.draft,
+            ):
+                return f"pull request #{expected.number} does not match the desired projection"
+        elif source.stack_id is not None:
+            return f"detached pull request #{expected.number} is not standalone"
+    if len(desired) >= 2:
+        if stack is None or tuple(pr.identity for pr in stack.ordered_prs) != desired:
+            return "resulting stack membership or order is not exact"
+        if stack.base_branch != plan.desired.base_branch:
+            return "resulting stack base is not exact"
+    elif any(actual[identity].stack_id is not None for identity in desired):
+        return "zero/one desired PR must be standalone"
+    return None
+
+
+def _build_topology_final_state(
+    plan: TopologyPlan, state: TrackedState
+) -> TrackedState:
+    source_ids = tuple(pr.identity for pr in plan.dependencies.prs)
+    source_base = (
+        plan.dependencies.prs[0].base_branch
+        if isinstance(plan.source, StandalonePullRequest)
+        else plan.source.base_branch
+    )
+    matching = tuple(
+        stack
+        for stack in state.stacks
+        if stack.repository == plan.repository
+        and stack.base_branch == source_base
+        and stack.ordered_prs == source_ids
+    )
+    if len(matching) != 1:
+        raise Error("private state no longer contains the exact source record")
+    stacks = tuple(stack for stack in state.stacks if stack != matching[0])
+    if plan.tracking_update is not None:
+        stacks += (plan.tracking_update,)
+    publications = state.last_published_heads
+    adoptions = state.last_adopted_heads
+    frozen = {pr.identity: pr for pr in plan.dependencies.prs}
+    for update in plan.head_updates:
+        identity = next(
+            identity
+            for identity, pr in frozen.items()
+            if update.ref.full_name == f"refs/heads/{pr.head_branch}"
+        )
+        key = (identity, update.ref)
+        publications = tuple(
+            item for item in publications if (item.pr, item.ref) != key
+        ) + (LastPublishedHead(identity, update.ref, update.new_commit_id),)
+        adoptions = tuple(item for item in adoptions if (item.pr, item.ref) != key)
+    return TrackedState(stacks, publications, adoptions)
+
+
+def _delete_temporary_base_command(
+    workspace: str | Path, plan: TopologyPlan, item: PlannedTemporaryBase
+) -> list[str]:
+    return [
+        "git",
+        f"--git-dir={git_common_dir(workspace)}",
+        "push",
+        "--atomic",
+        "--no-follow-tags",
+        "--recurse-submodules=no",
+        f"--force-with-lease={item.ref.full_name}:{item.new_base_commit_id}",
+        plan.dependencies.push_url,
+        f":{item.ref.full_name}",
+    ]
+
+
+def _observe_topology_pr(
+    repository: GitHubRepository,
+    expected: GitHubPullRequest,
+    *,
+    expected_head_commit_id: str | None = None,
+    cwd: str | Path,
+) -> GitHubPullRequestSource:
+    source = observe_github_pull_request(repository, expected.number, cwd=cwd)
+    actual = source.pr
+    if (
+        actual.identity != expected.identity
+        or actual.number != expected.number
+        or actual.state is not PullRequestState.OPEN
+        or actual.draft != expected.draft
+        or actual.head_repository != expected.head_repository
+        or actual.head_branch != expected.head_branch
+        or actual.reported_head_commit_id
+        != (expected_head_commit_id or expected.reported_head_commit_id)
+        or actual.title != expected.title
+        or actual.body != expected.body
+        or actual.auto_merge_enabled
+        or actual.in_merge_queue
+    ):
+        raise SourceMismatch(f"pull request #{expected.number} changed")
+    return source
+
+
+def resume_topology_repair(workspace: str | Path) -> TopologyRepairResult:
+    """Resume the retained topology transaction from authoritative readback."""
+    with repository_lock(workspace):
+        try:
+            operation_oid, raw = read_operation(workspace)
+        except Error as exc:
+            return Stopped("operation", str(exc))
+        if not isinstance(raw, TopologyRepair):
+            return Stopped("operation", "active operation is not a topology repair")
+        operation = raw
+        plan = operation.plan
+        try:
+            repository = _frozen_repository(
+                plan.repository, plan.repository_name, cwd=workspace
+            )
+        except Error as exc:
+            return Stopped("routing", str(exc))
+
+        def save(**changes: object) -> None:
+            nonlocal operation, operation_oid
+            operation = replace(operation, **changes)
+            operation_oid = cas_write_topology_repair(
+                workspace, operation_oid, operation
+            )
+
+        try:
+            if operation.phase is TopologyRepairPhase.CREATING_TEMPORARY_BASES:
+                if plan.temporary_bases:
+                    refs = tuple(item.ref for item in plan.temporary_bases)
+                    values = tuple(
+                        item.commit_id for item in _topology_refs(plan, workspace, refs)
+                    )
+                    absent = (None,) * len(refs)
+                    exact = tuple(
+                        item.old_base_commit_id for item in plan.temporary_bases
+                    )
+                    if values == absent:
+                        create_temporary_bases(
+                            workspace,
+                            plan.dependencies.push_url,
+                            plan.temporary_bases,
+                        )
+                        values = tuple(
+                            item.commit_id
+                            for item in _topology_refs(plan, workspace, refs)
+                        )
+                    if values != exact:
+                        return Stopped(
+                            "temporary-bases",
+                            "temporary-base readback is absent, mixed, or foreign",
+                        )
+                save(phase=TopologyRepairPhase.UNSTACKING)
+
+            if operation.phase is TopologyRepairPhase.UNSTACKING:
+                _sources, stack = _observe_source_association(
+                    plan,
+                    repository,
+                    allow_dissolved=True,
+                    cwd=workspace,
+                )
+                if isinstance(plan.source, ServerStackMembership):
+                    if stack is not None and not operation.unstack_possibly_sent:
+                        save(unstack_possibly_sent=True)
+                        run_stack_unstack(
+                            workspace, plan, plan.source.server_stack_number
+                        )
+                    if (
+                        prove_stack_dissolved(
+                            repository,
+                            plan.source.server_stack_number,
+                            cwd=workspace,
+                        )
+                        is not StackDissolution.ABSENT
+                    ):
+                        return Stopped("unstack", "old stack dissolution is unproven")
+                _sources, stack = _observe_source_association(
+                    plan,
+                    repository,
+                    allow_dissolved=True,
+                    cwd=workspace,
+                )
+                if stack is not None:
+                    return Stopped("unstack", "source stack still survives")
+                save(phase=TopologyRepairPhase.TEMPORARY_BASES)
+
+            if operation.phase is TopologyRepairPhase.TEMPORARY_BASES:
+                frozen = {pr.identity: pr for pr in plan.dependencies.prs}
+                for item in plan.temporary_bases:
+                    source = _observe_topology_pr(
+                        repository, frozen[item.pr_identity], cwd=workspace
+                    )
+                    if source.stack_id is not None:
+                        return Stopped(
+                            "temporary-base", "a stack association reappeared"
+                        )
+                    name = item.ref.full_name.removeprefix("refs/heads/")
+                    if source.pr.base_branch == name:
+                        if item.pr_identity in operation.temporary_bases_possibly_sent:
+                            save(
+                                temporary_bases_possibly_sent=tuple(
+                                    identity
+                                    for identity in operation.temporary_bases_possibly_sent
+                                    if identity != item.pr_identity
+                                )
+                            )
+                        continue
+                    if source.pr.base_branch != frozen[item.pr_identity].base_branch:
+                        return Stopped(
+                            "temporary-base",
+                            "PR base is neither frozen nor the temporary base",
+                        )
+                    send_base = False
+                    if item.pr_identity not in operation.temporary_bases_possibly_sent:
+                        save(
+                            temporary_bases_possibly_sent=(
+                                *operation.temporary_bases_possibly_sent,
+                                item.pr_identity,
+                            )
+                        )
+                        send_base = True
+                    if not send_base:
+                        return Stopped(
+                            "temporary-base",
+                            "possibly sent base edit still reads as its old base",
+                        )
+                    run_pr_base_edit(
+                        workspace,
+                        plan,
+                        item.pr_identity,
+                        source.pr.base_branch,
+                        name,
+                    )
+                    verify = _observe_topology_pr(
+                        repository, frozen[item.pr_identity], cwd=workspace
+                    )
+                    if verify.pr.base_branch != name:
+                        return Stopped("temporary-base", "base edit did not read back")
+                    save(
+                        temporary_bases_possibly_sent=tuple(
+                            identity
+                            for identity in operation.temporary_bases_possibly_sent
+                            if identity != item.pr_identity
+                        )
+                    )
+                save(phase=TopologyRepairPhase.PUBLISHING)
+
+            if operation.phase is TopologyRepairPhase.PUBLISHING:
+                sources = tuple(
+                    _observe_topology_pr(repository, pr, cwd=workspace)
+                    for pr in plan.dependencies.prs
+                )
+                if any(item.stack_id is not None for item in sources):
+                    return Stopped("publish", "a stack association reappeared")
+                refs = tuple(item.ref for item in plan.head_updates) + tuple(
+                    item.ref for item in plan.temporary_bases
+                )
+                old = tuple(
+                    item.expected_old_commit_id for item in plan.head_updates
+                ) + tuple(item.old_base_commit_id for item in plan.temporary_bases)
+                desired = tuple(
+                    item.new_commit_id for item in plan.head_updates
+                ) + tuple(item.new_base_commit_id for item in plan.temporary_bases)
+                values = tuple(
+                    item.commit_id for item in _topology_refs(plan, workspace, refs)
+                )
+                if values == old and refs:
+                    move_temporary_bases(
+                        workspace,
+                        plan.dependencies.push_url,
+                        plan.head_updates,
+                        plan.temporary_bases,
+                    )
+                    values = tuple(
+                        item.commit_id for item in _topology_refs(plan, workspace, refs)
+                    )
+                if values != desired:
+                    return Stopped(
+                        "publish", "transition readback is old, mixed, or foreign"
+                    )
+                save(phase=TopologyRepairPhase.RELINKING)
+
+            if operation.phase is TopologyRepairPhase.RELINKING:
+                frozen = {pr.identity: pr for pr in plan.dependencies.prs}
+                bases = _topology_desired_bases(plan)
+                for wanted in plan.desired.active:
+                    source = _observe_topology_pr(
+                        repository,
+                        frozen[wanted.pr_identity],
+                        expected_head_commit_id=wanted.desired_commit_id,
+                        cwd=workspace,
+                    )
+                    if source.stack_id is not None:
+                        return Stopped("relink", "a stack association reappeared")
+                    if (
+                        source.pr.base_branch == bases[wanted.pr_identity]
+                        and wanted.pr_identity
+                        in operation.temporary_bases_possibly_sent
+                    ):
+                        save(
+                            temporary_bases_possibly_sent=tuple(
+                                identity
+                                for identity in operation.temporary_bases_possibly_sent
+                                if identity != wanted.pr_identity
+                            )
+                        )
+                    if source.pr.base_branch != bases[wanted.pr_identity]:
+                        send_base = False
+                        if (
+                            wanted.pr_identity
+                            not in operation.temporary_bases_possibly_sent
+                        ):
+                            save(
+                                temporary_bases_possibly_sent=(
+                                    *operation.temporary_bases_possibly_sent,
+                                    wanted.pr_identity,
+                                )
+                            )
+                            send_base = True
+                        if not send_base:
+                            return Stopped(
+                                "relink",
+                                "possibly sent final base edit still reads as its old base",
+                            )
+                        run_pr_base_edit(
+                            workspace,
+                            plan,
+                            wanted.pr_identity,
+                            source.pr.base_branch,
+                            bases[wanted.pr_identity],
+                        )
+                        source = _observe_topology_pr(
+                            repository,
+                            frozen[wanted.pr_identity],
+                            expected_head_commit_id=wanted.desired_commit_id,
+                            cwd=workspace,
+                        )
+                        if source.pr.base_branch != bases[wanted.pr_identity]:
+                            return Stopped(
+                                "relink", "final base edit did not read back"
+                            )
+                        save(
+                            temporary_bases_possibly_sent=tuple(
+                                identity
+                                for identity in operation.temporary_bases_possibly_sent
+                                if identity != wanted.pr_identity
+                            )
+                        )
+                if len(plan.desired.active) >= 2 and not operation.relink_possibly_sent:
+                    save(relink_possibly_sent=True)
+                    run_topology_stack_link(workspace, plan)
+                sources, stack = observe_topology_projection(plan, workspace)
+                error = _topology_projection_error(plan, sources, stack)
+                if error is not None:
+                    return Stopped("relink", error)
+                save(phase=TopologyRepairPhase.VERIFYING)
+
+            if operation.phase is TopologyRepairPhase.VERIFYING:
+                for _ in range(2):
+                    sources, stack = observe_topology_projection(plan, workspace)
+                    error = _topology_projection_error(plan, sources, stack)
+                    if error is not None:
+                        return Stopped("verify", error)
+                state_oid, state = read_state(workspace)
+                if state_oid != plan.dependencies.state_blob_oid:
+                    return Stopped("state", "private state changed before commit")
+                final_json = state_to_json(_build_topology_final_state(plan, state))
+                final_oid = _run(
+                    [
+                        "git",
+                        f"--git-dir={git_common_dir(workspace)}",
+                        "hash-object",
+                        "-w",
+                        "--stdin",
+                    ],
+                    stdin=final_json,
+                ).strip()
+                save(
+                    phase=TopologyRepairPhase.COMMITTING,
+                    final_state_json=final_json,
+                    final_state_oid=final_oid,
+                )
+
+            if operation.phase is TopologyRepairPhase.COMMITTING:
+                current = read_ref_oid(workspace, STATE_REF)
+                if current == plan.dependencies.state_blob_oid:
+                    sources, stack = observe_topology_projection(plan, workspace)
+                    error = _topology_projection_error(plan, sources, stack)
+                    if error is not None:
+                        return Stopped("verify", error)
+                    assert operation.final_state_json is not None
+                    if (
+                        cas_write_state(
+                            workspace, current, parse_state(operation.final_state_json)
+                        )
+                        != operation.final_state_oid
+                    ):
+                        return Stopped(
+                            "state", "committed state differs from frozen OID"
+                        )
+                elif current != operation.final_state_oid:
+                    return Stopped(
+                        "state", "private state is neither expected nor final"
+                    )
+
+                refs = tuple(item.ref for item in plan.temporary_bases)
+                live = _topology_refs(plan, workspace, refs)
+                for item, observed in zip(plan.temporary_bases, live, strict=True):
+                    if observed.commit_id is None:
+                        continue
+                    if observed.commit_id != item.new_base_commit_id:
+                        return Stopped(
+                            "cleanup", "temporary base branch moved externally"
+                        )
+                    subprocess.run(
+                        _delete_temporary_base_command(workspace, plan, item),
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    check = _topology_refs(plan, workspace, (item.ref,))
+                    if check != (LiveRemoteRef(item.ref, None),):
+                        return Stopped(
+                            "cleanup", "temporary-base deletion was not verified"
+                        )
+                if _topology_refs(plan, workspace, refs) != tuple(
+                    LiveRemoteRef(item.ref, None) for item in plan.temporary_bases
+                ):
+                    return Stopped("cleanup", "temporary-base cleanup is incomplete")
+                cas_delete_operation(workspace, operation_oid)
+                return TopologyRepairVerified(
+                    tuple(item.pr_identity for item in plan.desired.active)
+                )
+        except Error as exc:
+            return Stopped(operation.phase.value, str(exc))
+        return Stopped("operation", "topology operation reached no terminal state")
+
+
+def resume_operation(
+    workspace: str | Path,
+) -> FirstPublicationResult | TopologyRepairResult:
+    try:
+        _oid, operation = read_operation(workspace)
+    except Error as exc:
+        return Stopped("operation", str(exc))
+    if isinstance(operation, TopologyRepair):
+        return resume_topology_repair(workspace)
+    return resume_first_publication(workspace)
