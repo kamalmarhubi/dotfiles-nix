@@ -1537,6 +1537,150 @@ def topology_input(
     )
 
 
+def tracked_restore_input(
+    *, association: str = "none"
+) -> sync.TrackedRestorePlanningInput:
+    snapshot, selected = stacked_snapshot(count=3)
+    tracked = snapshot.tool_state.state.stacks[0]
+    prs = tuple(
+        dataclasses.replace(
+            pr,
+            base_branch="main",
+            base_oid="b" * 40,
+            stack=None,
+        )
+        for pr in snapshot.pull_requests
+    )
+    stack = None
+    stack_members: tuple[sync.GitHubPullRequest, ...] = ()
+    if association == "partial":
+        stack_members = prs[:2]
+    elif association == "full":
+        stack_members = prs
+    if stack_members:
+        identity = sync.GitHubStackId(snapshot.repository, 41)
+        summary = sync.GitHubStackSummary(identity, "STACK_surviving", "main")
+        stack = sync.GitHubStack(
+            identity,
+            "STACK_surviving",
+            "main",
+            tuple(pr.identity for pr in stack_members),
+        )
+        prs = tuple(
+            dataclasses.replace(
+                pr, stack=summary if pr in stack_members else None
+            )
+            for pr in prs
+        )
+    live = {
+        item.ref: item
+        for item in snapshot.live_refs
+        if item.ref.full_name == "refs/heads/main"
+        or item.ref.full_name.startswith("refs/heads/topic-")
+    }
+    desired = sync.DesiredStack(
+        snapshot.repository,
+        "main",
+        tuple(
+            sync.DesiredExistingPR(
+                assignment.pr_identity,
+                assignment.commit_id,
+                prs[index].title,
+                prs[index].body,
+            )
+            for index, assignment in enumerate(selected.ordered)
+        ),
+    )
+    observation = sync.TrackedRestoreObservation(
+        snapshot.local,
+        snapshot.tool_state,
+        sync.GitHubRepository(
+            snapshot.repository,
+            "owner/repo",
+            "https://github.com/owner/repo",
+            "main",
+        ),
+        snapshot.push_url,
+        "origin",
+        tracked,
+        prs,
+        stack,
+        tuple(live.values()),
+        desired,
+    )
+    source = sync.prepare_tracked_restore_planning(observation)
+    assert isinstance(source, sync.TrackedRestorePlanningSource)
+    completed = sync.complete_tracked_restore_planning_input(
+        source,
+        tuple(sync.LiveRemoteRef(ref, None) for ref in source.temporary_base_refs),
+    )
+    assert isinstance(completed, sync.TrackedRestorePlanningInput)
+    return completed
+
+
+@pytest.mark.parametrize("association", ("none", "partial"))
+def test_tracked_restore_plans_flattened_or_partially_surviving_stack(
+    association: str,
+) -> None:
+    plan = sync.plan_tracked_restore(tracked_restore_input(association=association))
+
+    assert isinstance(plan, sync.TopologyPlan)
+    assert isinstance(plan.source, sync.TrackedRestoreSource)
+    assert (plan.source.current_stack is None) is (association == "none")
+    assert plan.head_updates == ()
+    assert len(plan.temporary_bases) == 3
+    assert plan.tracking_update == plan.source.tracked
+    assert sync.parse_topology_repair(
+        sync.topology_repair_to_json(sync.TopologyRepair(plan))
+    ) == sync.TopologyRepair(plan)
+
+
+def test_tracked_restore_blocks_multiple_surviving_stacks() -> None:
+    value = tracked_restore_input(association="partial")
+    sources = value.observation.pull_requests
+    other = sync.GitHubStackSummary(
+        sync.GitHubStackId(value.observation.repository.identity, 99),
+        "STACK_other",
+        "main",
+    )
+    changed = dataclasses.replace(
+        value.observation,
+        pull_requests=(
+            *sources[:2],
+            dataclasses.replace(sources[2], stack=other),
+        ),
+    )
+    result = sync.plan_tracked_restore(
+        dataclasses.replace(value, observation=changed)
+    )
+    assert isinstance(result, sync.Blocked)
+    assert result.reasons[0].code == "ambiguous-membership"
+
+
+def test_tracked_restore_final_state_preserves_detached_without_head_receipts() -> None:
+    value = tracked_restore_input()
+    detached = sync.PullRequestId(value.observation.tracked.repository, 99)
+    tracked = dataclasses.replace(value.observation.tracked, detached_prs=(detached,))
+    state = dataclasses.replace(
+        value.observation.tool_state.state, stacks=(tracked,)
+    )
+    observation = dataclasses.replace(
+        value.observation,
+        tracked=tracked,
+        tool_state=dataclasses.replace(value.observation.tool_state, state=state),
+    )
+    plan = sync.plan_tracked_restore(
+        dataclasses.replace(value, observation=observation)
+    )
+    assert isinstance(plan, sync.TopologyPlan)
+    assert plan.head_updates == ()
+
+    final = sync._build_topology_final_state(plan, state)
+
+    assert final.stacks == (tracked,)
+    assert final.last_published_heads == ()
+
+
 @pytest.mark.parametrize(
     ("desired_order", "active", "detached"),
     (
