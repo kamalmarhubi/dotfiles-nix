@@ -363,7 +363,12 @@ def test_private_state_cas_and_operation_fence_work_from_linked_workspace(
         (sync.LastPublishedHead(pr, ref, "a" * 40),),
     )
     serialized_stack = json.loads(sync.state_to_json(state))["stacks"][0]
-    assert set(serialized_stack) == {"repository", "base_branch", "ordered_prs"}
+    assert set(serialized_stack) == {
+        "repository",
+        "base_branch",
+        "ordered_prs",
+        "detached_prs",
+    }
     assert serialized_stack["base_branch"] == "main"
 
     first_oid = sync.cas_write_state(workspace, None, state)
@@ -490,6 +495,44 @@ def test_state_rejects_malformed_scalars_and_duplicate_publication_authority() -
     malformed = dataclasses.replace(publication, verified_commit_id=7)
     with pytest.raises(ValueError, match="nonempty strings"):
         sync.state_to_json(sync.TrackedState((), (malformed,)))
+
+
+def test_detached_state_is_strict_and_validates_bounded_membership() -> None:
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    active = sync.PullRequestId(repository, 1)
+    detached = sync.PullRequestId(repository, 2)
+    state = sync.TrackedState(
+        (sync.TrackedStack(repository, "main", (active,), (detached,)),), ()
+    )
+    assert sync.parse_state(sync.state_to_json(state)) == state
+
+    missing = json.loads(sync.state_to_json(state))
+    del missing["stacks"][0]["detached_prs"]
+    with pytest.raises(sync.Error, match="unexpected fields"):
+        sync.parse_state(json.dumps(missing))
+    with pytest.raises(ValueError, match="overlap"):
+        sync.state_to_json(
+            sync.TrackedState(
+                (sync.TrackedStack(repository, "main", (active,), (active,)),), ()
+            )
+        )
+
+    cleanup = sync.TrackedState(
+        (sync.TrackedStack(repository, "main", (), (detached,)),), ()
+    )
+    assert sync.parse_state(sync.state_to_json(cleanup)) == cleanup
+
+    other = sync.PullRequestId(repository, 3)
+    with pytest.raises(ValueError, match="overlapping"):
+        sync.state_to_json(
+            sync.TrackedState(
+                (
+                    sync.TrackedStack(repository, "main", (active,), (detached,)),
+                    sync.TrackedStack(repository, "release", (other,), (detached,)),
+                ),
+                (),
+            )
+        )
 
 
 def test_membership_variants_reject_contradictory_server_stack_results() -> None:
@@ -1428,6 +1471,244 @@ def test_multi_pr_planner_blocks_changed_literal_base_topology() -> None:
 
     assert isinstance(plan, sync.Blocked)
     assert plan.reasons[0].code == "topology-changed"
+
+
+def topology_input(
+    desired_order: tuple[int, ...],
+) -> sync.TopologyPlanningInput | sync.Blocked:
+    observed, _ = stacked_snapshot(count=2)
+    receipts = tuple(
+        sync.LastPublishedHead(
+            pr.identity,
+            sync.RemoteBranchRef(
+                observed.repository, f"refs/heads/{pr.head_branch}"
+            ),
+            pr.head_oid,
+        )
+        for pr in observed.pull_requests
+    )
+    observed = dataclasses.replace(
+        observed,
+        tool_state=dataclasses.replace(
+            observed.tool_state,
+            state=dataclasses.replace(
+                observed.tool_state.state, last_published_heads=receipts
+            ),
+        ),
+    )
+    base = "b" * 40
+    new_commits = (
+        sync.ObservedCommit("3" * 40, (base,), "new-2", "Two", False, False),
+        sync.ObservedCommit("4" * 40, ("3" * 40,), "new-1", "One", False, False),
+    )
+    observed = dataclasses.replace(
+        observed,
+        local=dataclasses.replace(
+            observed.local, commits=observed.local.commits + new_commits
+        ),
+    )
+    wanted = {1: "4" * 40, 2: "3" * 40}
+    desired = sync.DesiredStack(
+        observed.repository,
+        "main",
+        tuple(
+            sync.DesiredExistingPR(
+                observed.pull_requests[index - 1].identity,
+                wanted[index],
+                str(index),
+                "",
+            )
+            for index in desired_order
+        ),
+    )
+    repository = sync.GitHubRepository(
+        observed.repository,
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    source = sync.prepare_topology_planning(
+        observed, repository, "origin", desired
+    )
+    assert isinstance(source, sync.TopologyPlanningSource)
+    return sync.complete_topology_planning_input(
+        source,
+        tuple(sync.LiveRemoteRef(ref, None) for ref in source.temporary_base_refs),
+    )
+
+
+@pytest.mark.parametrize(
+    ("desired_order", "active", "detached"),
+    (
+        ((2, 1), (2, 1), ()),
+        ((1,), (1,), (2,)),
+        ((), (), (1, 2)),
+    ),
+)
+def test_fully_open_topology_plans_reorder_subset_and_empty(
+    desired_order: tuple[int, ...], active: tuple[int, ...], detached: tuple[int, ...]
+) -> None:
+    plan = sync.plan_topology(topology_input(desired_order))
+
+    assert isinstance(plan, sync.TopologyPlan)
+    assert plan.tracking_update is not None
+    assert tuple(pr.number for pr in plan.tracking_update.ordered_prs) == active
+    assert tuple(pr.number for pr in plan.detached_prs) == detached
+    assert len(plan.temporary_bases) == len(active)
+    if desired_order == (2, 1):
+        assert tuple(
+            (
+                temporary_base.pr_identity.number,
+                temporary_base.old_base_commit_id,
+                temporary_base.new_base_commit_id,
+            )
+            for temporary_base in plan.temporary_bases
+        ) == (
+            (2, "1" * 40, "b" * 40),
+            (1, "b" * 40, "3" * 40),
+        )
+    rendered = sync.render_topology(plan)
+    assert "stack #17" in rendered
+    assert "STACK_node" not in rendered
+    assert "PR_" not in rendered
+    assert f"to [{', '.join(f'#{number}' for number in desired_order)}]" in rendered
+    for number in detached:
+        assert f"detach PR #{number}" in rendered
+    assert "leave open" in rendered or not detached
+
+
+def test_topology_temporary_base_names_are_stable_and_require_absence() -> None:
+    observed, _ = stacked_snapshot(count=2)
+    desired = sync.DesiredStack(
+        observed.repository,
+        "main",
+        (
+            sync.DesiredExistingPR(
+                observed.pull_requests[0].identity, "1" * 40, "T", ""
+            ),
+        ),
+    )
+    repository = sync.GitHubRepository(
+        observed.repository,
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    first = sync.prepare_topology_planning(observed, repository, "origin", desired)
+    second = sync.prepare_topology_planning(observed, repository, "origin", desired)
+    assert isinstance(first, sync.TopologyPlanningSource)
+    assert isinstance(second, sync.TopologyPlanningSource)
+    assert first.temporary_base_refs == second.temporary_base_refs
+
+    changed_goal = dataclasses.replace(
+        desired,
+        active=(
+            dataclasses.replace(desired.active[0], desired_commit_id="9" * 40),
+        ),
+    )
+    changed = sync.prepare_topology_planning(
+        observed, repository, "origin", changed_goal
+    )
+    assert isinstance(changed, sync.TopologyPlanningSource)
+    assert changed.temporary_base_refs != first.temporary_base_refs
+
+    excluded = dataclasses.replace(
+        observed,
+        local=dataclasses.replace(observed.local, operation_id="other-operation"),
+        tool_state=dataclasses.replace(
+            observed.tool_state, state_blob_oid="f" * 40, operation_blob_oid="e" * 40
+        ),
+        membership=dataclasses.replace(
+            observed.membership,
+            selected_pr=observed.pull_requests[1].identity,
+            stack=dataclasses.replace(
+                observed.membership.stack,
+                identity=dataclasses.replace(
+                    observed.membership.stack.identity, number=999
+                ),
+            ),
+        ),
+    )
+    stable = sync.prepare_topology_planning(excluded, repository, "elsewhere", desired)
+    assert isinstance(stable, sync.TopologyPlanningSource)
+    assert stable.naming_digest == first.naming_digest
+    assert stable.temporary_base_refs == first.temporary_base_refs
+    assert tuple(ref.full_name.rsplit("/", 1)[1] for ref in first.temporary_base_refs) == (
+        "1",
+    )
+    assert first.temporary_base_refs[0].full_name.startswith(
+        "refs/heads/jj-stack/temporary-bases/"
+    )
+
+    missing = sync.complete_topology_planning_input(first, ())
+    occupied = sync.complete_topology_planning_input(
+        first, (sync.LiveRemoteRef(first.temporary_base_refs[0], "9" * 40),)
+    )
+    assert isinstance(missing, sync.Blocked)
+    assert missing.reasons[0].code == "temporary-base-observation-missing"
+    assert isinstance(occupied, sync.Blocked)
+    assert occupied.reasons[0].code == "temporary-base-occupied"
+
+
+def test_topology_naming_digest_is_sensitive_to_desired_order() -> None:
+    observed, _ = stacked_snapshot(count=2)
+    active = tuple(
+        sync.DesiredExistingPR(
+            pr.identity, pr.head_oid, pr.title, pr.body
+        )
+        for pr in observed.pull_requests
+    )
+    forward = sync.DesiredStack(observed.repository, "main", active)
+    reverse = dataclasses.replace(forward, active=tuple(reversed(active)))
+
+    assert sync._topology_naming_digest(
+        observed, forward
+    ) != sync._topology_naming_digest(observed, reverse)
+
+
+def test_topology_planning_is_pure_and_checks_both_base_maps(monkeypatch) -> None:
+    value = topology_input((2, 1))
+    monkeypatch.setattr(sync.subprocess, "run", lambda *a, **k: pytest.fail("I/O"))
+    assert isinstance(sync.plan_topology(value), sync.TopologyPlan)
+    assert isinstance(value, sync.TopologyPlanningInput)
+
+    old_map_unsafe = dataclasses.replace(
+        value,
+        snapshot=dataclasses.replace(
+            value.snapshot,
+            local=dataclasses.replace(
+                value.snapshot.local,
+                commits=tuple(
+                    dataclasses.replace(c, parent_commit_ids=("b" * 40,))
+                    if c.commit_id == "2" * 40
+                    else c
+                    for c in value.snapshot.local.commits
+                ),
+            ),
+        ),
+    )
+    old_result = sync.plan_topology(old_map_unsafe)
+    assert isinstance(old_result, sync.Blocked)
+    assert old_result.reasons[0].code == "invalid-old-comparison"
+
+    desired_map_unsafe = dataclasses.replace(
+        value,
+        snapshot=dataclasses.replace(
+            value.snapshot,
+            local=dataclasses.replace(
+                value.snapshot.local,
+                commits=tuple(
+                    dataclasses.replace(c, parent_commit_ids=("b" * 40,))
+                    if c.commit_id == "4" * 40
+                    else c
+                    for c in value.snapshot.local.commits
+                ),
+            ),
+        ),
+    )
+    desired_result = sync.plan_topology(desired_map_unsafe)
+    assert isinstance(desired_result, sync.Blocked)
+    assert desired_result.reasons[0].code == "invalid-desired-comparison"
 
 
 @pytest.mark.parametrize("case", ("missing", "duplicate", "wrong"))

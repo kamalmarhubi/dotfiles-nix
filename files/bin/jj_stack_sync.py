@@ -6,6 +6,7 @@ This module intentionally has no command-line entry point or topology mutation.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import http.client
 import json
 import os
@@ -446,6 +447,7 @@ class TrackedStack:
     repository: GitHubRepositoryId
     base_branch: str
     ordered_prs: tuple[PullRequestId, ...]
+    detached_prs: tuple[PullRequestId, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -502,8 +504,8 @@ class StackSelection:
     ordered: tuple[ExistingPRAssignment, ...]
 
     def __post_init__(self) -> None:
-        if not self.base_branch or not self.ordered:
-            raise ValueError("stack selection must have a base and assignments")
+        if not self.base_branch:
+            raise ValueError("stack selection must have a base")
         identities = tuple(item.pr_identity for item in self.ordered)
         if len(set(identities)) != len(identities):
             raise ValueError("stack selection must not assign a PR more than once")
@@ -539,6 +541,30 @@ class DesiredStack:
 
 
 @dataclass(frozen=True)
+class TopologyPlanningSource:
+    """Intent resolved before temporary base names can be authoritatively observed."""
+
+    snapshot: Snapshot
+    repository: GitHubRepository
+    remote: str
+    desired: DesiredStack
+    naming_digest: str
+    temporary_base_refs: tuple[RemoteBranchRef, ...]
+
+
+@dataclass(frozen=True)
+class TopologyPlanningInput:
+    """Complete immutable topology input, including exact temporary-base absence reads."""
+
+    snapshot: Snapshot
+    repository: GitHubRepository
+    remote: str
+    desired: DesiredStack
+    naming_digest: str
+    temporary_base_observations: tuple[LiveRemoteRef, ...]
+
+
+@dataclass(frozen=True)
 class Blocker:
     code: str
     subject: str
@@ -559,6 +585,18 @@ class Dependencies:
     operation_blob_oid: str | None
     prs: tuple[GitHubPullRequest, ...]
     membership: PullRequestMembership
+    live_heads: tuple[LiveRemoteRef, ...]
+    live_bases: tuple[LiveRemoteRef, ...]
+
+
+@dataclass(frozen=True)
+class TopologyDependencies:
+    effective_config: tuple[tuple[str, str], ...]
+    push_url: str
+    state_blob_oid: str | None
+    operation_blob_oid: str | None
+    prs: tuple[GitHubPullRequest, ...]
+    source: PullRequestMembership
     live_heads: tuple[LiveRemoteRef, ...]
     live_bases: tuple[LiveRemoteRef, ...]
 
@@ -763,6 +801,31 @@ class PlannedHeadUpdate:
 
 
 @dataclass(frozen=True)
+class PlannedTemporaryBase:
+    pr_identity: PullRequestId
+    ref: RemoteBranchRef
+    old_base_commit_id: str
+    new_base_commit_id: str
+
+
+@dataclass(frozen=True)
+class TopologyPlan:
+    repository: GitHubRepositoryId
+    repository_name: str
+    remote: str
+    desired: DesiredStack
+    detached_prs: tuple[PullRequestId, ...]
+    head_updates: tuple[PlannedHeadUpdate, ...]
+    temporary_bases: tuple[PlannedTemporaryBase, ...]
+    tracking_update: TrackedStack | None
+    dependencies: TopologyDependencies
+
+    @property
+    def source(self) -> PullRequestMembership:
+        return self.dependencies.source
+
+
+@dataclass(frozen=True)
 class PRMetadataUpdate:
     pr_identity: PullRequestId
     title: str
@@ -785,6 +848,7 @@ class Apply:
 
 
 SyncPlan = Blocked | NoOp | Apply
+TopologyPlanResult = Blocked | TopologyPlan
 
 
 @dataclass(frozen=True)
@@ -2218,7 +2282,7 @@ def parse_state(data: str) -> TrackedState:
         context = f"stacks[{index}]"
         raw = fields(
             record(value, context),
-            {"repository", "base_branch", "ordered_prs"},
+            {"repository", "base_branch", "ordered_prs", "detached_prs"},
             context,
         )
         return TrackedStack(
@@ -2228,6 +2292,12 @@ def parse_state(data: str) -> TrackedState:
                 pull_request(pr, f"{context}.ordered_prs[{pr_index}]")
                 for pr_index, pr in enumerate(
                     array(raw.get("ordered_prs"), f"{context}.ordered_prs")
+                )
+            ),
+            tuple(
+                pull_request(pr, f"{context}.detached_prs[{pr_index}]")
+                for pr_index, pr in enumerate(
+                    array(raw.get("detached_prs"), f"{context}.detached_prs")
                 )
             ),
         )
@@ -2318,9 +2388,11 @@ def _validate_state(state: TrackedState) -> None:
             stack.repository.host,
             stack.repository.node_id,
         )
-        if not stack.ordered_prs:
-            raise ValueError("invalid tracked stack")
-        for pr in stack.ordered_prs:
+        if not stack.ordered_prs and not stack.detached_prs:
+            raise ValueError("exhausted tracked stack must be absent")
+        if set(stack.ordered_prs).intersection(stack.detached_prs):
+            raise ValueError("active and detached tracked identities overlap")
+        for pr in (*stack.ordered_prs, *stack.detached_prs):
             require_text(pr.repository.host, pr.repository.node_id)
             if pr.repository != stack.repository:
                 raise ValueError("stack contains a PR from another repository")
@@ -3468,6 +3540,25 @@ def _dependencies(
     )
 
 
+def _topology_dependencies(
+    snapshot: Snapshot,
+    prs: tuple[GitHubPullRequest, ...],
+    source: PullRequestMembership,
+    heads: tuple[LiveRemoteRef, ...],
+    bases: tuple[LiveRemoteRef, ...],
+) -> TopologyDependencies:
+    return TopologyDependencies(
+        snapshot.local.effective_config,
+        snapshot.push_url,
+        snapshot.tool_state.state_blob_oid,
+        snapshot.tool_state.operation_blob_oid,
+        prs,
+        source,
+        heads,
+        bases,
+    )
+
+
 def _is_ancestor(
     commits: tuple[ObservedCommit, ...],
     ancestor_commit_id: str,
@@ -3749,13 +3840,20 @@ def _tracking_update(snapshot: Snapshot) -> TrackedStack | Blocked | None:
         if isinstance(snapshot.membership, StandalonePullRequest)
         else snapshot.membership.base_branch
     )
-    candidate = TrackedStack(snapshot.repository, base_branch, ordered_prs)
-    if candidate in snapshot.tool_state.state.stacks:
+    exact = tuple(
+        stack
+        for stack in snapshot.tool_state.state.stacks
+        if stack.repository == snapshot.repository
+        and stack.base_branch == base_branch
+        and stack.ordered_prs == ordered_prs
+    )
+    if len(exact) == 1:
         return None
+    candidate = TrackedStack(snapshot.repository, base_branch, ordered_prs)
     members = set(ordered_prs)
     if any(
         stack.repository == snapshot.repository
-        and members.intersection(stack.ordered_prs)
+        and members.intersection((*stack.ordered_prs, *stack.detached_prs))
         for stack in snapshot.tool_state.state.stacks
     ):
         return _block(
@@ -3764,6 +3862,321 @@ def _tracking_update(snapshot: Snapshot) -> TrackedStack | Blocked | None:
             "observed membership overlaps a different tracked stack",
         )
     return candidate
+
+
+def _topology_naming_digest(snapshot: Snapshot, desired: DesiredStack) -> str:
+    """Hash only the minimum immutable topology naming preimage."""
+    semantic = [
+        [snapshot.repository.host, snapshot.repository.node_id],
+        [pr.number for pr in snapshot.pull_requests],
+        desired.base_branch,
+        [
+            [item.pr_identity.number, item.desired_commit_id]
+            for item in desired.active
+        ],
+    ]
+    canonical = json.dumps(semantic, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:24]
+
+
+def _topology_temporary_base_refs(
+    repository: GitHubRepositoryId,
+    desired: DesiredStack,
+    naming_digest: str,
+) -> tuple[RemoteBranchRef, ...]:
+    return tuple(
+        RemoteBranchRef(
+            repository,
+            f"refs/heads/jj-stack/temporary-bases/{naming_digest}/{ordinal}",
+        )
+        for ordinal, _item in enumerate(desired.active, 1)
+    )
+
+
+def prepare_topology_planning(
+    snapshot: Snapshot,
+    repository: GitHubRepository,
+    remote: str,
+    desired: DesiredStack | Blocked,
+) -> TopologyPlanningSource | Blocked:
+    """Freeze intent and names before authoritative temporary-base reads."""
+    if isinstance(desired, Blocked):
+        return desired
+    if desired.repository != snapshot.repository:
+        return _block(
+            "repository-mismatch",
+            desired.repository.node_id,
+            "desired repository differs",
+        )
+    if repository.identity != snapshot.repository or not remote:
+        return _block(
+            "routing-mismatch",
+            "repository",
+            "topology routing does not match the observed repository",
+        )
+    identities = tuple(item.pr_identity for item in desired.active)
+    if len(set(identities)) != len(identities):
+        return _block(
+            "duplicate-desired", "stack", "desired membership contains duplicates"
+        )
+    observed = {pr.identity for pr in snapshot.pull_requests}
+    if any(
+        identity.repository != snapshot.repository or identity not in observed
+        for identity in identities
+    ):
+        return _block(
+            "foreign-desired", "stack", "desired membership is not a source subset"
+        )
+    naming_digest = _topology_naming_digest(snapshot, desired)
+    source_order = tuple(pr.identity for pr in snapshot.pull_requests)
+    refs = ()
+    if identities != source_order:
+        refs = _topology_temporary_base_refs(
+            snapshot.repository,
+            desired,
+            naming_digest,
+        )
+    return TopologyPlanningSource(
+        snapshot, repository, remote, desired, naming_digest, refs
+    )
+
+
+def complete_topology_planning_input(
+    source: TopologyPlanningSource,
+    temporary_base_observations: Sequence[LiveRemoteRef],
+) -> TopologyPlanningInput | Blocked:
+    """Accept authoritative observations of every frozen temporary-base ref."""
+    observations = tuple(temporary_base_observations)
+    if tuple(item.ref for item in observations) != source.temporary_base_refs:
+        return _block(
+            "temporary-base-observation-missing",
+            "stack",
+            "every exact frozen temporary-base ref must be authoritatively observed once",
+        )
+    if any(item.commit_id is not None for item in observations):
+        occupied = next(item for item in observations if item.commit_id is not None)
+        return _block(
+            "temporary-base-occupied",
+            occupied.ref.full_name,
+            "temporary base branch already exists",
+        )
+    return TopologyPlanningInput(
+        source.snapshot,
+        source.repository,
+        source.remote,
+        source.desired,
+        source.naming_digest,
+        observations,
+    )
+
+
+def plan_topology(value: TopologyPlanningInput | Blocked) -> TopologyPlanResult:
+    """Purely plan a fully-open membership transition; perform no observation."""
+    if isinstance(value, Blocked):
+        return value
+    snapshot, desired = value.snapshot, value.desired
+    if snapshot.tool_state.operation_blob_oid is not None:
+        return _block(
+            "operation-fenced", OPERATION_REF, "a pending operation fences planning"
+        )
+    if any(pr.state is not PullRequestState.OPEN for pr in snapshot.pull_requests):
+        return _block(
+            "not-fully-open", "stack", "topology planning requires a fully open source"
+        )
+    source_ids = tuple(pr.identity for pr in snapshot.pull_requests)
+    membership_ids = (
+        (snapshot.membership.pr,)
+        if isinstance(snapshot.membership, StandalonePullRequest)
+        else snapshot.membership.ordered_prs
+    )
+    if source_ids != membership_ids or len(set(source_ids)) != len(source_ids):
+        return _block(
+            "incomplete-membership",
+            "stack",
+            "source observations must exactly match membership",
+        )
+    tracked = tuple(
+        stack
+        for stack in snapshot.tool_state.state.stacks
+        if stack.repository == snapshot.repository
+        and stack.base_branch == desired.base_branch
+        and stack.ordered_prs == source_ids
+    )
+    if len(tracked) != 1:
+        return _block(
+            "tracked-source-mismatch",
+            "stack",
+            "source must have one exact tracked record",
+        )
+    desired_ids = tuple(item.pr_identity for item in desired.active)
+    if len(set(desired_ids)) != len(desired_ids) or not set(desired_ids).issubset(
+        source_ids
+    ):
+        return _block(
+            "invalid-desired-membership",
+            "stack",
+            "desired identities must be a unique source subset",
+        )
+    if desired.base_branch != tracked[0].base_branch:
+        return _block(
+            "target-mismatch",
+            desired.base_branch,
+            "desired target differs from tracked source",
+        )
+
+    refs = {item.ref: item for item in snapshot.live_refs}
+    base_ref = RemoteBranchRef(snapshot.repository, f"refs/heads/{desired.base_branch}")
+    base = refs.get(base_ref)
+    if base is None or base.commit_id is None:
+        return _block(
+            "base-disagrees",
+            base_ref.full_name,
+            "target branch was not authoritatively observed",
+        )
+    previous_branch = desired.base_branch
+    for pr in snapshot.pull_requests:
+        head = refs.get(
+            RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.head_branch}")
+        )
+        literal = refs.get(
+            RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.base_branch}")
+        )
+        if (
+            head is None
+            or head.commit_id != pr.head_oid
+            or literal is None
+            or literal.commit_id != pr.base_oid
+            or pr.base_branch != previous_branch
+            or not _comparison_is_nonempty_linear_and_conflict_free(
+                snapshot.local.commits,
+                pr.base_oid,
+                pr.head_oid,
+            )
+        ):
+            return _block(
+                "invalid-old-comparison",
+                f"PR #{pr.number}",
+                "old comparison is not exact, linear, and nonempty",
+            )
+        previous_branch = pr.head_branch
+
+    desired_by_id = {item.pr_identity: item for item in desired.active}
+    predecessor = base.commit_id
+    desired_bases: dict[PullRequestId, str] = {}
+    head_updates: list[PlannedHeadUpdate] = []
+    for identity in desired_ids:
+        wanted = desired_by_id[identity]
+        if not _comparison_is_nonempty_linear_and_conflict_free(
+            snapshot.local.commits, predecessor, wanted.desired_commit_id
+        ):
+            return _block(
+                "invalid-desired-comparison",
+                f"PR #{identity.number}",
+                "desired comparison is not linear and nonempty",
+            )
+        desired_bases[identity] = predecessor
+        pr = next(pr for pr in snapshot.pull_requests if pr.identity == identity)
+        head = refs[
+            RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.head_branch}")
+        ]
+        updates = _plan_publication(snapshot, wanted, head)
+        if isinstance(updates, Blocked):
+            return updates
+        head_updates.extend(updates)
+        predecessor = wanted.desired_commit_id
+
+    expected_temporary_base_refs = _topology_temporary_base_refs(
+        snapshot.repository,
+        desired,
+        value.naming_digest,
+    )
+    if desired_ids == source_ids:
+        expected_temporary_base_refs = ()
+    if tuple(
+        item.ref for item in value.temporary_base_observations
+    ) != expected_temporary_base_refs or any(
+        item.commit_id is not None for item in value.temporary_base_observations
+    ):
+        return _block(
+            "temporary-base-observation-invalid",
+            "stack",
+            "temporary-base absence observations are incomplete or occupied",
+        )
+    temporary_bases: list[PlannedTemporaryBase] = []
+    for identity, absence in zip(
+        desired_ids, value.temporary_base_observations, strict=True
+    ):
+        pr = next(pr for pr in snapshot.pull_requests if pr.identity == identity)
+        wanted = desired_by_id[identity]
+        if not _comparison_is_nonempty_linear_and_conflict_free(
+            snapshot.local.commits,
+            pr.base_oid,
+            pr.head_oid,
+        ) or not _comparison_is_nonempty_linear_and_conflict_free(
+            snapshot.local.commits,
+            desired_bases[identity],
+            wanted.desired_commit_id,
+        ):
+            return _block(
+                "unsafe-temporary-base",
+                f"PR #{identity.number}",
+                "temporary base is unsafe under old or desired comparison maps",
+            )
+        temporary_bases.append(
+            PlannedTemporaryBase(
+                identity,
+                absence.ref,
+                pr.base_oid,
+                desired_bases[identity],
+            )
+        )
+
+    newly_detached = tuple(
+        identity for identity in source_ids if identity not in set(desired_ids)
+    )
+    detached = tuple(dict.fromkeys((*tracked[0].detached_prs, *newly_detached)))
+    final = (
+        TrackedStack(snapshot.repository, desired.base_branch, desired_ids, detached)
+        if desired_ids or detached
+        else None
+    )
+    dependencies = _topology_dependencies(
+        snapshot,
+        snapshot.pull_requests,
+        snapshot.membership,
+        tuple(
+            refs[
+                RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.head_branch}")
+            ]
+            for pr in snapshot.pull_requests
+        ),
+        tuple(
+            dict.fromkeys(
+                (
+                    base,
+                    *(
+                        refs[
+                            RemoteBranchRef(
+                                snapshot.repository, f"refs/heads/{pr.base_branch}"
+                            )
+                        ]
+                        for pr in snapshot.pull_requests
+                    ),
+                )
+            )
+        ),
+    )
+    return TopologyPlan(
+        value.repository.identity,
+        value.repository.name_with_owner,
+        value.remote,
+        desired,
+        newly_detached,
+        tuple(head_updates),
+        tuple(temporary_bases),
+        final,
+        dependencies,
+    )
 
 
 def plan_sync(
@@ -3836,6 +4249,38 @@ def render(plan: SyncPlan) -> str:
         ),
     ]
     return "apply:\n" + "\n".join(f"  - {item}" for item in consequences)
+
+
+def render_topology(plan: TopologyPlanResult) -> str:
+    if isinstance(plan, Blocked):
+        return "\n".join(
+            f"blocked [{item.code}] {item.subject}: {item.detail}"
+            for item in plan.reasons
+        )
+    pr_numbers = {pr.identity: pr.number for pr in plan.dependencies.prs}
+    source = plan.source
+    if isinstance(source, StandalonePullRequest):
+        source_label = f"standalone PR #{pr_numbers[source.pr]}"
+    else:
+        source_label = f"stack #{source.server_stack_number}"
+    desired = ", ".join(
+        f"#{pr_numbers[item.pr_identity]}" for item in plan.desired.active
+    )
+    consequences = [
+        f"reconcile {source_label} to [{desired}]",
+        *(
+            f"detach PR #{pr_numbers[item]} (leave open)"
+            for item in plan.detached_prs
+        ),
+        *(
+            f"use temporary base {item.ref.full_name} from "
+            f"{item.old_base_commit_id} to {item.new_base_commit_id}"
+            for item in plan.temporary_bases
+        ),
+    ]
+    return "topology repair:\n" + "\n".join(
+        f"  - {item}" for item in consequences
+    )
 
 
 def _apply_shape(plan: SyncPlan) -> Stopped | None:
