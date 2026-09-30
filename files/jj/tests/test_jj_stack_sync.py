@@ -2486,6 +2486,207 @@ def test_record_verified_state_combines_tracking_and_replaces_matching_authority
     )
 
 
+def publication_assignment_input(
+    *,
+    bookmarks: tuple[sync.LocalBookmark, ...] = (),
+    explicit: tuple[sync.PublicationAssignment, ...] | None = None,
+    templates: tuple[sync.PublicationAssignment, ...] = (),
+    names: tuple[str, ...] = ("generated-one", "generated-two"),
+    destinations: tuple[sync.LiveRemoteRef, ...] | None = None,
+    history: tuple[sync.GitHubPullRequest, ...] = (),
+) -> sync.PublicationAssignmentInput:
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    commits = ("1" * 40, "2" * 40)
+    local = sync.LocalObservation(
+        "/repo",
+        "op",
+        (),
+        (("default", commits[-1]),),
+        bookmarks,
+        (),
+        (),
+        tuple(
+            sync.ObservedCommit(commit, (), f"change-{index}", "title", False, False)
+            for index, commit in enumerate(commits)
+        ),
+        "/git",
+    )
+    if destinations is None:
+        destinations = tuple(
+            sync.LiveRemoteRef(
+                sync.RemoteBranchRef(repository, f"refs/heads/{name}"), None
+            )
+            for name in names
+        )
+    return sync.PublicationAssignmentInput(
+        repository,
+        commits,
+        local,
+        explicit,
+        templates,
+        ("main", "dev", "jj-stack/managed"),
+        destinations,
+        history,
+    )
+
+
+def historical_pr(
+    *, head: str, base: str, fork: bool = False
+) -> sync.GitHubPullRequest:
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    head_repository = (
+        sync.GitHubRepositoryId("github.com", "R_fork") if fork else repository
+    )
+    return sync.GitHubPullRequest(
+        sync.PullRequestId(repository, f"PR_{head}_{base}_{fork}"),
+        7,
+        sync.PullRequestState.CLOSED,
+        False,
+        head_repository,
+        head,
+        "9" * 40,
+        base,
+        "0" * 40,
+        False,
+        False,
+        "old",
+        "",
+    )
+
+
+def test_publication_assignment_explicit_mapping_wins_and_must_be_complete() -> None:
+    commits = ("1" * 40, "2" * 40)
+    explicit = tuple(
+        sync.PublicationAssignment(commit, name)
+        for commit, name in zip(commits, ("generated-one", "generated-two"), strict=True)
+    )
+    observed = publication_assignment_input(
+        bookmarks=(
+            sync.LocalBookmark("alias-a", sync.CommitTarget(commits[0])),
+            sync.LocalBookmark("alias-b", sync.CommitTarget(commits[0])),
+        ),
+        explicit=explicit,
+    )
+
+    assert sync.resolve_publication_assignments(observed) == explicit
+
+    incomplete = dataclasses.replace(observed, explicit=explicit[:1])
+    blocked = sync.resolve_publication_assignments(incomplete)
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "incomplete-explicit-assignment"
+
+
+def test_publication_assignment_mixes_unique_bookmark_and_template_per_revision() -> None:
+    commits = ("1" * 40, "2" * 40)
+    observed = publication_assignment_input(
+        bookmarks=(sync.LocalBookmark("intentional", sync.CommitTarget(commits[0])),),
+        templates=(sync.PublicationAssignment(commits[1], "generated-two"),),
+        names=("intentional", "generated-two"),
+    )
+
+    assert sync.resolve_publication_assignments(observed) == (
+        sync.PublicationAssignment(commits[0], "intentional"),
+        sync.PublicationAssignment(commits[1], "generated-two"),
+    )
+
+
+def test_publication_assignment_blocks_alias_ambiguity_without_fallback() -> None:
+    commit = "1" * 40
+    observed = publication_assignment_input(
+        bookmarks=(
+            sync.LocalBookmark("one", sync.CommitTarget(commit)),
+            sync.LocalBookmark("two", sync.CommitTarget(commit)),
+        ),
+        templates=(sync.PublicationAssignment(commit, "generated-one"),),
+    )
+
+    blocked = sync.resolve_publication_assignments(observed)
+
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "ambiguous-local-bookmark"
+
+
+@pytest.mark.parametrize(
+    ("assignment", "bookmarks", "code"),
+    (
+        ("main", (), "protected-publication-branch"),
+        ("bad..name", (), "invalid-publication-branch"),
+        (
+            "generated-one",
+            (sync.LocalBookmark("generated-one", sync.AbsentBookmarkTarget()),),
+            "local-publication-collision",
+        ),
+        (
+            "generated-one",
+            (sync.LocalBookmark("generated-one", sync.CommitTarget("2" * 40)),),
+            "local-publication-collision",
+        ),
+    ),
+)
+def test_publication_assignment_validates_names_and_local_collisions(
+    assignment: str,
+    bookmarks: tuple[sync.LocalBookmark, ...],
+    code: str,
+) -> None:
+    commits = ("1" * 40, "2" * 40)
+    explicit = (
+        sync.PublicationAssignment(commits[0], assignment),
+        sync.PublicationAssignment(commits[1], "generated-two"),
+    )
+    observed = publication_assignment_input(
+        bookmarks=bookmarks,
+        explicit=explicit,
+        names=(assignment, "generated-two"),
+    )
+
+    blocked = sync.resolve_publication_assignments(observed)
+
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == code
+
+
+def test_publication_assignment_requires_absent_authoritative_destination() -> None:
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    occupied = sync.LiveRemoteRef(
+        sync.RemoteBranchRef(repository, "refs/heads/generated-one"), "9" * 40
+    )
+    missing = publication_assignment_input(destinations=(occupied,))
+    explicit = tuple(
+        sync.PublicationAssignment(commit, name)
+        for commit, name in zip(
+            missing.ordered_commit_ids,
+            ("generated-one", "generated-two"),
+            strict=True,
+        )
+    )
+    missing = dataclasses.replace(missing, explicit=explicit)
+
+    blocked = sync.resolve_publication_assignments(missing)
+
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "remote-publication-collision"
+
+
+def test_publication_assignment_blocks_historical_base_and_same_repo_head_use() -> None:
+    commits = ("1" * 40, "2" * 40)
+    explicit = (
+        sync.PublicationAssignment(commits[0], "generated-one"),
+        sync.PublicationAssignment(commits[1], "generated-two"),
+    )
+    for old in (
+        historical_pr(head="old", base="generated-one"),
+        historical_pr(head="generated-one", base="main"),
+    ):
+        observed = publication_assignment_input(explicit=explicit, history=(old,))
+        blocked = sync.resolve_publication_assignments(observed)
+        assert isinstance(blocked, sync.Blocked)
+        assert blocked.reasons[0].code == "pull-request-branch-collision"
+
+    fork = historical_pr(head="generated-one", base="main", fork=True)
+    observed = publication_assignment_input(explicit=explicit, history=(fork,))
+    assert sync.resolve_publication_assignments(observed) == explicit
+
+
 def test_observations_are_deeply_immutable() -> None:
     observed, _pr = snapshot(desired="1" * 40, live="1" * 40, parent="0" * 40)
     with pytest.raises(dataclasses.FrozenInstanceError):

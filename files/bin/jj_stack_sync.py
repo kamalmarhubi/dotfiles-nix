@@ -427,6 +427,28 @@ class StackSelection:
 
 
 @dataclass(frozen=True)
+class PublicationAssignment:
+    """One exact selected commit and the branch chosen before publication planning."""
+
+    commit_id: str
+    branch_name: str
+
+
+@dataclass(frozen=True)
+class PublicationAssignmentInput:
+    """Complete read-only evidence for resolving first-publication branch names."""
+
+    repository: GitHubRepositoryId
+    ordered_commit_ids: tuple[str, ...]
+    local: LocalObservation
+    explicit: tuple[PublicationAssignment, ...] | None
+    template_results: tuple[PublicationAssignment, ...]
+    protected_branch_names: tuple[str, ...]
+    destinations: tuple[LiveRemoteRef, ...]
+    historical_pull_requests: tuple[GitHubPullRequest, ...]
+
+
+@dataclass(frozen=True)
 class DesiredStack:
     repository: GitHubRepositoryId
     base_branch: str
@@ -1729,6 +1751,181 @@ def repository_lock(workspace: str | Path) -> Iterator[None]:
 
 def _block(code: str, subject: str, detail: str) -> Blocked:
     return Blocked((Blocker(code, subject, detail),))
+
+
+def _valid_publication_branch(name: str) -> bool:
+    """Pure equivalent of git-check-ref-format rules for refs/heads/<name>."""
+    if (
+        not name
+        or name == "@"
+        or name.startswith("/")
+        or name.endswith(("/", "."))
+        or "//" in name
+        or ".." in name
+        or "@{" in name
+        or any(ord(character) < 32 or ord(character) == 127 for character in name)
+        or any(character in " ~^:?*[\\" for character in name)
+    ):
+        return False
+    return all(
+        component
+        and not component.startswith(".")
+        and not component.endswith(".lock")
+        for component in name.split("/")
+    )
+
+
+def resolve_publication_assignments(
+    observed: PublicationAssignmentInput,
+) -> tuple[PublicationAssignment, ...] | Blocked:
+    """Choose exact names without mutating jj, Git, GitHub, or durable state."""
+    commits = observed.ordered_commit_ids
+    if not commits or len(set(commits)) != len(commits):
+        return _block(
+            "invalid-publication-selection",
+            "selection",
+            "selected commits must be nonempty and unique",
+        )
+    local_commits = {commit.commit_id: commit for commit in observed.local.commits}
+    if len(local_commits) != len(observed.local.commits) or any(
+        commit_id not in local_commits or local_commits[commit_id].has_conflicts
+        for commit_id in commits
+    ):
+        return _block(
+            "commit-unavailable",
+            "selection",
+            "every selected commit must be observed exactly once and conflict-free",
+        )
+
+    if observed.explicit is not None:
+        assignments = observed.explicit
+        if tuple(item.commit_id for item in assignments) != commits:
+            return _block(
+                "incomplete-explicit-assignment",
+                "selection",
+                "explicit publication assignments must exactly cover the ordered selection",
+            )
+    else:
+        template_by_commit: dict[str, str] = {}
+        for item in observed.template_results:
+            if item.commit_id not in commits or item.commit_id in template_by_commit:
+                return _block(
+                    "invalid-template-result",
+                    item.commit_id,
+                    "template results must uniquely identify selected commits",
+                )
+            template_by_commit[item.commit_id] = item.branch_name
+        protected = set(observed.protected_branch_names)
+        chosen: list[PublicationAssignment] = []
+        for commit_id in commits:
+            aliases = tuple(
+                bookmark.name
+                for bookmark in observed.local.local_bookmarks
+                if bookmark.name not in protected
+                and isinstance(bookmark.target, CommitTarget)
+                and bookmark.target.commit_id == commit_id
+            )
+            if len(aliases) > 1:
+                return _block(
+                    "ambiguous-local-bookmark",
+                    commit_id,
+                    "selected revision has multiple eligible exact-target bookmarks",
+                )
+            if aliases:
+                branch_name = aliases[0]
+            else:
+                branch_name = template_by_commit.get(commit_id, "")
+                if not branch_name:
+                    return _block(
+                        "template-name-unavailable",
+                        commit_id,
+                        "no eligible bookmark or evaluated push-template name is available",
+                    )
+            chosen.append(PublicationAssignment(commit_id, branch_name))
+        assignments = tuple(chosen)
+
+    names = tuple(item.branch_name for item in assignments)
+    if len(set(names)) != len(names):
+        return _block(
+            "duplicate-publication-branch",
+            "selection",
+            "publication branch names must be unique",
+        )
+    protected = set(observed.protected_branch_names)
+    for item in assignments:
+        name = item.branch_name
+        if not _valid_publication_branch(name):
+            return _block("invalid-publication-branch", name, "branch name is invalid")
+        if name in protected:
+            return _block(
+                "protected-publication-branch",
+                name,
+                "target, managed, or protected branch names cannot be published",
+            )
+        same_name = tuple(
+            bookmark for bookmark in observed.local.local_bookmarks if bookmark.name == name
+        )
+        if len(same_name) > 1 or any(
+            not isinstance(bookmark.target, CommitTarget)
+            or bookmark.target.commit_id != item.commit_id
+            for bookmark in same_name
+        ):
+            return _block(
+                "local-publication-collision",
+                name,
+                "local bookmark is deleted, conflicted, or targets another commit",
+            )
+
+    destinations: dict[str, LiveRemoteRef] = {}
+    for destination in observed.destinations:
+        if destination.ref.repository != observed.repository:
+            return _block(
+                "destination-repository-mismatch",
+                destination.ref.full_name,
+                "destination observation belongs to another repository",
+            )
+        name = destination.ref.full_name.removeprefix("refs/heads/")
+        if name in destinations:
+            return _block(
+                "ambiguous-destination",
+                name,
+                "destination branch was observed more than once",
+            )
+        destinations[name] = destination
+    for name in names:
+        destination = destinations.get(name)
+        if destination is None:
+            return _block(
+                "destination-unavailable",
+                name,
+                "authoritative destination absence was not observed",
+            )
+        if destination.commit_id is not None:
+            return _block(
+                "remote-publication-collision",
+                name,
+                "destination branch already exists",
+            )
+
+    for pull_request in observed.historical_pull_requests:
+        if pull_request.identity.repository != observed.repository:
+            return _block(
+                "history-repository-mismatch",
+                pull_request.identity.node_id,
+                "historical pull request observation belongs to another repository",
+            )
+        for name in names:
+            same_repository_head = (
+                pull_request.head_repository == observed.repository
+                and pull_request.head_branch == name
+            )
+            if same_repository_head or pull_request.base_branch == name:
+                return _block(
+                    "pull-request-branch-collision",
+                    name,
+                    "branch name has historical same-repository pull request use",
+                )
+    return assignments
 
 
 def _record_newline(state: StateInline, silent: bool) -> bool:
