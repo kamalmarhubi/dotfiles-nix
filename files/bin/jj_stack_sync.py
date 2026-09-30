@@ -372,6 +372,17 @@ class TrackedStack:
 
 
 @dataclass(frozen=True)
+class TrackedRestoreSource:
+    """Tracked intent plus the only surviving server stack, when one exists."""
+
+    tracked: TrackedStack
+    current_stack: ServerStackMembership | None
+
+
+TopologySource = PullRequestMembership | TrackedRestoreSource
+
+
+@dataclass(frozen=True)
 class TrackedState:
     stacks: tuple[TrackedStack, ...]
     last_published_heads: tuple[LastPublishedHead, ...]
@@ -507,6 +518,34 @@ class TopologyPlanningInput:
 
 
 @dataclass(frozen=True)
+class TrackedRestoreObservation:
+    local: LocalObservation
+    tool_state: ToolStateRead
+    repository: GitHubRepository
+    push_url: str
+    remote: str
+    tracked: TrackedStack
+    pr_sources: tuple[GitHubPullRequestSource, ...]
+    current_stack: GitHubStackSource | None
+    live_refs: tuple[LiveRemoteRef, ...]
+    desired: DesiredStack
+
+
+@dataclass(frozen=True)
+class TrackedRestorePlanningSource:
+    observation: TrackedRestoreObservation
+    naming_digest: str
+    temporary_base_refs: tuple[RemoteBranchRef, ...]
+
+
+@dataclass(frozen=True)
+class TrackedRestorePlanningInput:
+    observation: TrackedRestoreObservation
+    naming_digest: str
+    temporary_base_observations: tuple[LiveRemoteRef, ...]
+
+
+@dataclass(frozen=True)
 class Blocker:
     code: str
     subject: str
@@ -538,7 +577,7 @@ class TopologyDependencies:
     state_blob_oid: str | None
     operation_blob_oid: str | None
     prs: tuple[GitHubPullRequest, ...]
-    source: PullRequestMembership
+    source: TopologySource
     live_heads: tuple[LiveRemoteRef, ...]
     live_bases: tuple[LiveRemoteRef, ...]
 
@@ -777,7 +816,7 @@ class TopologyPlan:
     dependencies: TopologyDependencies
 
     @property
-    def source(self) -> PullRequestMembership:
+    def source(self) -> TopologySource:
         return self.dependencies.source
 
 
@@ -1219,6 +1258,23 @@ query($owner: String!, $name: String!, $number: Int!) {
 }
 """
 
+_PR_NODE_SOURCE_QUERY = """
+query($id: ID!) {
+  node(id: $id) {
+    ... on PullRequest {
+      repository { id }
+      id number state isDraft
+      headRepository { id }
+      headRefName headRefOid baseRefName baseRefOid
+      autoMergeRequest { enabledAt }
+      mergeQueueEntry { id }
+      title body
+      stack { id baseRefName }
+    }
+  }
+}
+"""
+
 
 def _parse_pr_source(
     value: object, repository: GitHubRepository, expected_number: int
@@ -1318,6 +1374,44 @@ def observe_github_pull_request(
     if pull_request is None:
         raise IncompleteSource(f"pull request #{number} is unavailable")
     return _parse_pr_source(pull_request, repository, number)
+
+
+def observe_github_pull_request_by_id(
+    repository: GitHubRepository,
+    identity: PullRequestId,
+    *,
+    cwd: str | Path | None = None,
+) -> GitHubPullRequestSource:
+    """Observe one PR by immutable node ID without stack enumeration."""
+    if identity.repository != repository.identity:
+        raise ValueError("pull request identity belongs to another repository")
+    response = _exact_record(
+        _command_json(
+            ["gh", "api", "--hostname", repository.identity.host, "graphql", "--input", "-"],
+            cwd=cwd,
+            stdin=json.dumps(
+                {"query": _PR_NODE_SOURCE_QUERY, "variables": {"id": identity.node_id}}
+            ),
+        ),
+        {"data"},
+        "GitHub PR node response",
+    )
+    data = _exact_record(response["data"], {"node"}, "PR node GraphQL data")
+    if data["node"] is None:
+        raise IncompleteSource(f"pull request node {identity.node_id} is unavailable")
+    raw = _exact_record(
+        data["node"], _PR_SOURCE_FIELDS | {"repository"}, "pull request node"
+    )
+    raw_repository = _exact_record(raw.pop("repository"), {"id"}, "PR repository")
+    if _text(raw_repository["id"], "PR repository ID") != repository.identity.node_id:
+        raise SourceMismatch("pull request node belongs to another repository")
+    number = raw["number"]
+    if type(number) is not int or number <= 0:
+        raise MalformedSource("pull request number must be a positive integer")
+    source = _parse_pr_source(raw, repository, number)
+    if source.pr.identity != identity:
+        raise SourceMismatch("GitHub returned a different pull request node")
+    return source
 
 
 _STACK_SOURCE_QUERY = """
@@ -1825,6 +1919,58 @@ def observe_snapshot(
         membership,
         live_refs,
         fetch_url,
+    )
+
+
+def observe_tracked_restore(
+    workspace: str | Path,
+    *,
+    local: LocalObservation,
+    tool_state: ToolStateRead,
+    repository: GitHubRepository,
+    push_url: str,
+    remote: str,
+    tracked: TrackedStack,
+    desired: DesiredStack,
+    pr_sources: Sequence[GitHubPullRequestSource] | None = None,
+) -> TrackedRestoreObservation:
+    """Observe every tracked active PR independently of current stack shape."""
+    sources = (
+        tuple(pr_sources)
+        if pr_sources is not None
+        else tuple(
+            observe_github_pull_request_by_id(repository, identity, cwd=workspace)
+            for identity in tracked.ordered_prs
+        )
+    )
+    if tuple(source.pr.identity for source in sources) != tracked.ordered_prs:
+        raise SourceMismatch("tracked PR observations are incomplete or out of order")
+    stack_ids = {source.stack_id for source in sources if source.stack_id is not None}
+    current_stack = (
+        observe_github_stack(repository, next(iter(stack_ids)), cwd=workspace)
+        if len(stack_ids) == 1
+        else None
+    )
+    ref_names = tuple(
+        dict.fromkeys(
+            (
+                f"refs/heads/{tracked.base_branch}",
+                *(f"refs/heads/{source.pr.head_branch}" for source in sources),
+                *(f"refs/heads/{source.pr.base_branch}" for source in sources),
+            )
+        )
+    )
+    return TrackedRestoreObservation(
+        local,
+        tool_state,
+        repository,
+        push_url,
+        remote,
+        tracked,
+        sources,
+        current_stack,
+        observe_live_refs(push_url, repository.identity, ref_names, cwd=workspace),
+        desired,
     )
 
 
@@ -2614,9 +2760,12 @@ def topology_repair_to_json(operation: TopologyRepair) -> str:
     payload["operation_kind"] = "topology-repair"
     source = operation.plan.source
     encoded_source = payload["plan"]["dependencies"]["source"]
-    encoded_source["source_kind"] = (
-        "standalone" if isinstance(source, StandalonePullRequest) else "server-stack"
-    )
+    if isinstance(source, TrackedRestoreSource):
+        encoded_source["source_kind"] = "tracked-restore"
+    else:
+        encoded_source["source_kind"] = (
+            "standalone" if isinstance(source, StandalonePullRequest) else "server-stack"
+        )
     for encoded, update in zip(
         payload["plan"]["head_updates"], operation.plan.head_updates, strict=True
     ):
@@ -2706,11 +2855,37 @@ def parse_topology_repair(data: str) -> TopologyRepair:
             raise ValueError("live ref OID must be text or null")
         return LiveRemoteRef(ref(raw["ref"]), oid)
 
-    def membership(value: object) -> PullRequestMembership:
+    def tracked(value: object) -> TrackedStack:
+        raw = record(
+            value,
+            {"repository", "base_branch", "ordered_prs", "detached_prs"},
+            "tracked stack",
+        )
+        return TrackedStack(
+            rid(raw["repository"]),
+            text(raw["base_branch"], "tracked base"),
+            tuple(pid(item) for item in seq(raw["ordered_prs"], "tracked PRs")),
+            tuple(pid(item) for item in seq(raw["detached_prs"], "detached PRs")),
+        )
+
+    def membership(value: object) -> TopologySource:
         if not isinstance(value, dict):
             raise ValueError("source must be an object")
         raw = dict(value)
         kind = raw.pop("source_kind", None)
+        if kind == "tracked-restore":
+            restore = record(raw, {"tracked", "current_stack"}, "restore source")
+            current = restore["current_stack"]
+            if current is None:
+                parsed_current = None
+            else:
+                current_raw = dict(current) if isinstance(current, dict) else {}
+                current_raw["source_kind"] = "server-stack"
+                parsed = membership(current_raw)
+                if not isinstance(parsed, ServerStackMembership):
+                    raise ValueError("restore current stack must be a server stack")
+                parsed_current = parsed
+            return TrackedRestoreSource(tracked(restore["tracked"]), parsed_current)
         if kind == "standalone":
             return StandalonePullRequest(
                 pid(record(raw, {"pr"}, "standalone source")["pr"])
@@ -3967,10 +4142,21 @@ def _plan_publication(
     wanted: DesiredExistingPR,
     head: LiveRemoteRef,
 ) -> tuple[PlannedHeadUpdate, ...] | Blocked:
+    return _plan_head_update(
+        snapshot.local.commits, snapshot.tool_state.state, wanted, head
+    )
+
+
+def _plan_head_update(
+    commits: tuple[ObservedCommit, ...],
+    state: TrackedState,
+    wanted: DesiredExistingPR,
+    head: LiveRemoteRef,
+) -> tuple[PlannedHeadUpdate, ...] | Blocked:
     assert head.commit_id is not None
     if wanted.desired_commit_id == head.commit_id:
         return ()
-    if _is_ancestor(snapshot.local.commits, head.commit_id, wanted.desired_commit_id):
+    if _is_ancestor(commits, head.commit_id, wanted.desired_commit_id):
         return (
             PlannedHeadUpdate(
                 head.ref,
@@ -3981,7 +4167,7 @@ def _plan_publication(
         )
     publications = tuple(
         item
-        for item in snapshot.tool_state.state.last_published_heads
+        for item in state.last_published_heads
         if item.pr == wanted.pr_identity
         and item.ref == head.ref
         and item.verified_commit_id == head.commit_id
@@ -3989,7 +4175,7 @@ def _plan_publication(
     if len(publications) != 1:
         adoptions = tuple(
             item
-            for item in snapshot.tool_state.state.last_adopted_heads
+            for item in state.last_adopted_heads
             if item.pr == wanted.pr_identity
             and item.ref == head.ref
             and item.verified_commit_id == head.commit_id
@@ -4058,9 +4244,21 @@ def _tracking_update(snapshot: Snapshot) -> TrackedStack | Blocked | None:
 
 def _topology_naming_digest(snapshot: Snapshot, desired: DesiredStack) -> str:
     """Hash only the minimum immutable topology naming preimage."""
+    return _topology_naming_digest_parts(
+        snapshot.repository,
+        tuple(pr.identity for pr in snapshot.pull_requests),
+        desired,
+    )
+
+
+def _topology_naming_digest_parts(
+    repository: GitHubRepositoryId,
+    source_prs: tuple[PullRequestId, ...],
+    desired: DesiredStack,
+) -> str:
     semantic = [
-        [snapshot.repository.host, snapshot.repository.node_id],
-        [pr.identity.node_id for pr in snapshot.pull_requests],
+        [repository.host, repository.node_id],
+        [pr.node_id for pr in source_prs],
         desired.base_branch,
         [
             [item.pr_identity.node_id, item.desired_commit_id]
@@ -4371,6 +4569,193 @@ def plan_topology(value: TopologyPlanningInput | Blocked) -> TopologyPlanResult:
     )
 
 
+def prepare_tracked_restore_planning(
+    observation: TrackedRestoreObservation,
+) -> TrackedRestorePlanningSource | Blocked:
+    tracked = observation.tracked
+    if (
+        tracked.repository != observation.repository.identity
+        or observation.desired.repository != tracked.repository
+        or observation.desired.base_branch != tracked.base_branch
+        or tuple(item.pr_identity for item in observation.desired.active)
+        != tracked.ordered_prs
+    ):
+        return _block(
+            "restore-intent-mismatch",
+            "stack",
+            "restoration must preserve exact tracked base, membership, and order",
+        )
+    digest = _topology_naming_digest_parts(
+        tracked.repository, tracked.ordered_prs, observation.desired
+    )
+    return TrackedRestorePlanningSource(
+        observation,
+        digest,
+        _topology_temporary_base_refs(tracked.repository, observation.desired, digest),
+    )
+
+
+def complete_tracked_restore_planning_input(
+    source: TrackedRestorePlanningSource,
+    temporary_base_observations: Sequence[LiveRemoteRef],
+) -> TrackedRestorePlanningInput | Blocked:
+    observations = tuple(temporary_base_observations)
+    if tuple(item.ref for item in observations) != source.temporary_base_refs:
+        return _block(
+            "temporary-base-observation-missing",
+            "stack",
+            "every frozen temporary-base ref must be observed once",
+        )
+    occupied = next((item for item in observations if item.commit_id is not None), None)
+    if occupied is not None:
+        return _block(
+            "temporary-base-occupied",
+            occupied.ref.full_name,
+            "temporary base branch already exists",
+        )
+    return TrackedRestorePlanningInput(
+        source.observation, source.naming_digest, observations
+    )
+
+
+def plan_tracked_restore(
+    value: TrackedRestorePlanningInput | Blocked,
+) -> TopologyPlanResult:
+    """Purely plan restoration of one fully open tracked stack."""
+    if isinstance(value, Blocked):
+        return value
+    observed = value.observation
+    tracked = observed.tracked
+    desired = observed.desired
+    if observed.tool_state.operation_blob_oid is not None:
+        return _block("operation-fenced", OPERATION_REF, "a pending operation fences planning")
+    if tuple(stack for stack in observed.tool_state.state.stacks if stack == tracked) != (
+        tracked,
+    ):
+        return _block("tracked-source-mismatch", "stack", "exact tracked source is absent")
+    desired_ids = tuple(item.pr_identity for item in desired.active)
+    if (
+        desired.repository != tracked.repository
+        or desired.base_branch != tracked.base_branch
+        or desired_ids != tracked.ordered_prs
+        or len(set(desired_ids)) != len(desired_ids)
+    ):
+        return _block(
+            "restore-intent-mismatch",
+            "stack",
+            "restoration cannot add, drop, reorder, or retarget tracked PRs",
+        )
+    sources = observed.pr_sources
+    if tuple(source.pr.identity for source in sources) != tracked.ordered_prs:
+        return _block(
+            "incomplete-membership", "stack", "node-ID observations are incomplete"
+        )
+    if any(
+        source.pr.state is not PullRequestState.OPEN
+        or source.pr.head_repository != tracked.repository
+        for source in sources
+    ):
+        return _block("not-fully-open", "stack", "restoration requires open local PRs")
+    if any(source.pr.auto_merge_enabled or source.pr.in_merge_queue for source in sources):
+        return _block("active-automation", "stack", "automation blocks restoration")
+
+    stack_ids = {source.stack_id for source in sources if source.stack_id is not None}
+    if len(stack_ids) > 1:
+        return _block("ambiguous-membership", "stack", "multiple stacks survive")
+    current_membership = None
+    if not stack_ids:
+        if observed.current_stack is not None or any(
+            source.stack_base_branch is not None for source in sources
+        ):
+            return _block("association-mismatch", "stack", "standalone evidence is incomplete")
+    else:
+        stack_id = next(iter(stack_ids))
+        stack = observed.current_stack
+        if stack is None or stack.stack_id != stack_id:
+            return _block("association-mismatch", stack_id, "surviving stack is incomplete")
+        members = tuple(pr.identity for pr in stack.ordered_prs)
+        positions = tuple(tracked.ordered_prs.index(identity) for identity in members if identity in tracked.ordered_prs)
+        if (
+            len(members) != len(positions)
+            or tuple(sorted(positions)) != positions
+            or any(
+                (source.stack_id == stack_id) != (source.pr.identity in members)
+                for source in sources
+            )
+        ):
+            return _block("foreign-association", stack_id, "surviving stack is not a tracked subset")
+        current_membership = ServerStackMembership(
+            members[0], stack.identity, stack.base_branch, members
+        )
+
+    refs = {item.ref: item for item in observed.live_refs}
+    base_ref = RemoteBranchRef(tracked.repository, f"refs/heads/{tracked.base_branch}")
+    target = refs.get(base_ref)
+    if target is None or target.commit_id is None:
+        return _block("base-disagrees", base_ref.full_name, "tracked target is unavailable")
+    if len(value.temporary_base_observations) != len(desired_ids):
+        return _block("temporary-base-observation-invalid", "stack", "absence reads are incomplete")
+    by_id = {source.pr.identity: source.pr for source in sources}
+    wanted_by_id = {item.pr_identity: item for item in desired.active}
+    previous = target.commit_id
+    heads: list[LiveRemoteRef] = []
+    bases: list[LiveRemoteRef] = [target]
+    updates: list[PlannedHeadUpdate] = []
+    temporary: list[PlannedTemporaryBase] = []
+    for identity, absence in zip(desired_ids, value.temporary_base_observations, strict=True):
+        pr = by_id[identity]
+        wanted = wanted_by_id[identity]
+        head = refs.get(RemoteBranchRef(tracked.repository, f"refs/heads/{pr.head_branch}"))
+        literal = refs.get(RemoteBranchRef(tracked.repository, f"refs/heads/{pr.base_branch}"))
+        if head is None or head.commit_id != pr.reported_head_commit_id:
+            return _block("head-disagrees", pr.head_branch, "PR head and live ref disagree")
+        if literal is None or literal.commit_id != pr.reported_base_commit_id:
+            return _block("base-disagrees", pr.base_branch, "PR base and live ref disagree")
+        if not _comparison_is_nonempty_linear_and_conflict_free(
+            observed.local.commits, pr.reported_base_commit_id, pr.reported_head_commit_id
+        ):
+            return _block("invalid-old-comparison", identity.node_id, "current comparison is unsafe")
+        if not _comparison_is_nonempty_linear_and_conflict_free(
+            observed.local.commits, previous, wanted.desired_commit_id
+        ):
+            return _block("invalid-desired-comparison", identity.node_id, "desired comparison is unsafe")
+        planned = _plan_head_update(
+            observed.local.commits, observed.tool_state.state, wanted, head
+        )
+        if isinstance(planned, Blocked):
+            return planned
+        updates.extend(planned)
+        heads.append(head)
+        if literal not in bases:
+            bases.append(literal)
+        temporary.append(
+            PlannedTemporaryBase(identity, absence.ref, pr.reported_base_commit_id, previous)
+        )
+        previous = wanted.desired_commit_id
+    source = TrackedRestoreSource(tracked, current_membership)
+    dependencies = TopologyDependencies(
+        observed.local.effective_config,
+        observed.push_url,
+        observed.tool_state.state_blob_oid,
+        observed.tool_state.operation_blob_oid,
+        tuple(source.pr for source in sources),
+        source,
+        tuple(heads),
+        tuple(bases),
+    )
+    return TopologyPlan(
+        tracked.repository,
+        observed.repository.name_with_owner,
+        observed.remote,
+        desired,
+        (),
+        tuple(updates),
+        tuple(temporary),
+        tracked,
+        dependencies,
+    )
+
+
 def plan_sync(
     snapshot: Snapshot,
     desired: DesiredStack | Blocked,
@@ -4449,7 +4834,11 @@ def render_topology(plan: TopologyPlanResult) -> str:
             for item in plan.reasons
         )
     source = plan.source
-    if isinstance(source, StandalonePullRequest):
+    if isinstance(source, TrackedRestoreSource):
+        source_label = "tracked stack without a surviving server stack"
+        if source.current_stack is not None:
+            source_label = f"tracked stack with surviving stack #{source.current_stack.server_stack_number}"
+    elif isinstance(source, StandalonePullRequest):
         source_label = f"standalone PR {source.pr.node_id}"
     else:
         source_label = f"stack #{source.server_stack_number} ({source.server_stack_id})"
@@ -5924,7 +6313,11 @@ def _observe_frozen_topology_sources(
     cwd: str | Path,
 ) -> tuple[GitHubPullRequestSource, ...]:
     sources = tuple(
-        observe_github_pull_request(repository, expected.number, cwd=cwd)
+        (
+            observe_github_pull_request_by_id(repository, expected.identity, cwd=cwd)
+            if isinstance(plan.source, TrackedRestoreSource)
+            else observe_github_pull_request(repository, expected.number, cwd=cwd)
+        )
         for expected in plan.dependencies.prs
     )
     for expected, source in zip(plan.dependencies.prs, sources, strict=True):
@@ -5984,22 +6377,34 @@ def _observe_source_association(
     if all(
         item.stack_id is None and item.stack_base_branch is None for item in sources
     ):
-        if allow_dissolved or isinstance(plan.source, StandalonePullRequest):
+        if allow_dissolved or isinstance(plan.source, StandalonePullRequest) or (
+            isinstance(plan.source, TrackedRestoreSource)
+            and plan.source.current_stack is None
+        ):
             return sources, None
         raise SourceMismatch("frozen server stack disappeared before unstack")
-    if not isinstance(plan.source, ServerStackMembership):
+    expected = (
+        plan.source.current_stack
+        if isinstance(plan.source, TrackedRestoreSource)
+        else plan.source
+    )
+    if not isinstance(expected, ServerStackMembership):
         raise SourceMismatch("standalone source gained a stack association")
     if any(
-        item.stack_id != plan.source.server_stack_id
-        or item.stack_base_branch != plan.source.base_branch
+        (item.pr.identity in expected.ordered_prs)
+        != (item.stack_id == expected.server_stack_id)
+        or (
+            item.pr.identity in expected.ordered_prs
+            and item.stack_base_branch != expected.base_branch
+        )
         for item in sources
     ):
         raise SourceMismatch("frozen source stack associations changed")
-    stack = observe_github_stack(repository, plan.source.server_stack_id, cwd=cwd)
+    stack = observe_github_stack(repository, expected.server_stack_id, cwd=cwd)
     if (
-        stack.identity != plan.source.stack
-        or stack.base_branch != plan.source.base_branch
-        or tuple(pr.identity for pr in stack.ordered_prs) != plan.source.ordered_prs
+        stack.identity != expected.stack
+        or stack.base_branch != expected.base_branch
+        or tuple(pr.identity for pr in stack.ordered_prs) != expected.ordered_prs
     ):
         raise SourceMismatch("frozen source stack identity or membership changed")
     return sources, stack
@@ -6801,7 +7206,11 @@ def observe_topology_projection(
         plan.repository, plan.repository_name, cwd=workspace
     )
     sources = tuple(
-        observe_github_pull_request(repository, pr.number, cwd=workspace)
+        (
+            observe_github_pull_request_by_id(repository, pr.identity, cwd=workspace)
+            if isinstance(plan.source, TrackedRestoreSource)
+            else observe_github_pull_request(repository, pr.number, cwd=workspace)
+        )
         for pr in plan.dependencies.prs
     )
     desired = tuple(item.pr_identity for item in plan.desired.active)
@@ -6862,9 +7271,13 @@ def _build_topology_final_state(
 ) -> TrackedState:
     source_ids = tuple(pr.identity for pr in plan.dependencies.prs)
     source_base = (
-        plan.dependencies.prs[0].base_branch
-        if isinstance(plan.source, StandalonePullRequest)
-        else plan.source.base_branch
+        plan.source.tracked.base_branch
+        if isinstance(plan.source, TrackedRestoreSource)
+        else (
+            plan.dependencies.prs[0].base_branch
+            if isinstance(plan.source, StandalonePullRequest)
+            else plan.source.base_branch
+        )
     )
     matching = tuple(
         stack
@@ -6872,6 +7285,10 @@ def _build_topology_final_state(
         if stack.repository == plan.repository
         and stack.base_branch == source_base
         and stack.ordered_prs == source_ids
+        and (
+            not isinstance(plan.source, TrackedRestoreSource)
+            or stack == plan.source.tracked
+        )
     )
     if len(matching) != 1:
         raise Error("private state no longer contains the exact source record")
@@ -6915,10 +7332,15 @@ def _observe_topology_pr(
     repository: GitHubRepository,
     expected: GitHubPullRequest,
     *,
+    by_node_id: bool = False,
     expected_head_commit_id: str | None = None,
     cwd: str | Path,
 ) -> GitHubPullRequestSource:
-    source = observe_github_pull_request(repository, expected.number, cwd=cwd)
+    source = (
+        observe_github_pull_request_by_id(repository, expected.identity, cwd=cwd)
+        if by_node_id
+        else observe_github_pull_request(repository, expected.number, cwd=cwd)
+    )
     actual = source.pr
     if (
         actual.identity != expected.identity
@@ -6949,6 +7371,7 @@ def resume_topology_repair(workspace: str | Path) -> TopologyRepairResult:
             return Stopped("operation", "active operation is not a topology repair")
         operation = raw
         plan = operation.plan
+        restore = isinstance(plan.source, TrackedRestoreSource)
         try:
             repository = _frozen_repository(
                 plan.repository, plan.repository_name, cwd=workspace
@@ -6992,22 +7415,27 @@ def resume_topology_repair(workspace: str | Path) -> TopologyRepairResult:
                 save(phase=TopologyRepairPhase.UNSTACKING)
 
             if operation.phase is TopologyRepairPhase.UNSTACKING:
+                membership = (
+                    plan.source.current_stack
+                    if isinstance(plan.source, TrackedRestoreSource)
+                    else plan.source
+                )
                 _sources, stack = _observe_source_association(
                     plan,
                     repository,
                     allow_dissolved=True,
                     cwd=workspace,
                 )
-                if isinstance(plan.source, ServerStackMembership):
+                if isinstance(membership, ServerStackMembership):
                     if stack is not None and not operation.unstack_possibly_sent:
                         save(unstack_possibly_sent=True)
                         run_stack_unstack(
-                            workspace, plan, plan.source.server_stack_number
+                            workspace, plan, membership.server_stack_number
                         )
                     if (
                         prove_stack_dissolved(
                             repository,
-                            plan.source.server_stack_number,
+                            membership.server_stack_number,
                             cwd=workspace,
                         )
                         is not StackDissolution.ABSENT
@@ -7027,7 +7455,10 @@ def resume_topology_repair(workspace: str | Path) -> TopologyRepairResult:
                 frozen = {pr.identity: pr for pr in plan.dependencies.prs}
                 for item in plan.temporary_bases:
                     source = _observe_topology_pr(
-                        repository, frozen[item.pr_identity], cwd=workspace
+                        repository,
+                        frozen[item.pr_identity],
+                        by_node_id=restore,
+                        cwd=workspace,
                     )
                     if source.stack_id is not None:
                         return Stopped(
@@ -7071,7 +7502,10 @@ def resume_topology_repair(workspace: str | Path) -> TopologyRepairResult:
                         name,
                     )
                     verify = _observe_topology_pr(
-                        repository, frozen[item.pr_identity], cwd=workspace
+                        repository,
+                        frozen[item.pr_identity],
+                        by_node_id=restore,
+                        cwd=workspace,
                     )
                     if verify.pr.base_branch != name:
                         return Stopped("temporary-base", "base edit did not read back")
@@ -7086,7 +7520,9 @@ def resume_topology_repair(workspace: str | Path) -> TopologyRepairResult:
 
             if operation.phase is TopologyRepairPhase.PUBLISHING:
                 sources = tuple(
-                    _observe_topology_pr(repository, pr, cwd=workspace)
+                    _observe_topology_pr(
+                        repository, pr, by_node_id=restore, cwd=workspace
+                    )
                     for pr in plan.dependencies.prs
                 )
                 if any(item.stack_id is not None for item in sources):
@@ -7126,6 +7562,7 @@ def resume_topology_repair(workspace: str | Path) -> TopologyRepairResult:
                     source = _observe_topology_pr(
                         repository,
                         frozen[wanted.pr_identity],
+                        by_node_id=restore,
                         expected_head_commit_id=wanted.desired_commit_id,
                         cwd=workspace,
                     )
@@ -7171,6 +7608,7 @@ def resume_topology_repair(workspace: str | Path) -> TopologyRepairResult:
                         source = _observe_topology_pr(
                             repository,
                             frozen[wanted.pr_identity],
+                            by_node_id=restore,
                             expected_head_commit_id=wanted.desired_commit_id,
                             cwd=workspace,
                         )
