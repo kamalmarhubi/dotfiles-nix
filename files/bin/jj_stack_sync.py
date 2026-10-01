@@ -1,6 +1,7 @@
-"""Observation, planning, and existing-stack synchronization for ``jj stack sync``.
+"""Observation, planning, and durable execution for ``jj stack sync``.
 
-This module intentionally has no command-line entry point or topology mutation.
+The installed facade owns argument parsing and confirmation; this module owns
+the immutable plans, mutation protocols, and recovery state machines.
 """
 
 from __future__ import annotations
@@ -896,6 +897,66 @@ TopologyRepairResult = TopologyRepairVerified | Stopped
 Operation = FirstPublication | TopologyRepair
 
 
+@dataclass(frozen=True)
+class ExistingIntent:
+    pr_number: int
+    revision: str | None = None
+    bootstrap_local_wins: bool = False
+
+
+@dataclass(frozen=True)
+class NewIntent:
+    revision: str
+    base_branch: str | None = None
+
+
+@dataclass(frozen=True)
+class ExistingMembershipBoundary:
+    """A selected boundary proven to be one particular existing PR."""
+
+    pr_identity: PullRequestId
+    commit_id: str
+
+
+@dataclass(frozen=True)
+class NewMembershipBoundary:
+    """A selected boundary with no existing PR identity."""
+
+    commit_id: str
+
+
+CompleteMembershipBoundary = ExistingMembershipBoundary | NewMembershipBoundary
+
+
+@dataclass(frozen=True)
+class ResumeIntent:
+    pass
+
+
+@dataclass(frozen=True)
+class PersistedOperation:
+    operation: Operation
+
+
+ExplicitIntent = ExistingIntent | NewIntent | ResumeIntent
+ExplicitPlan = (
+    Blocked
+    | NoOp
+    | Apply
+    | RemoteRestackAdoption
+    | FirstPublication
+    | TopologyPlan
+    | PersistedOperation
+)
+ExplicitResult = (
+    ApplyResult
+    | AdoptionResult
+    | FirstPublicationResult
+    | TopologyRepairResult
+    | Blocked
+)
+
+
 def _run(
     args: Sequence[str], *, cwd: str | Path | None = None, stdin: str | None = None
 ) -> str:
@@ -1667,6 +1728,7 @@ def observe_local(
     *,
     revision: str,
     config_keys: Sequence[str],
+    ancestry_order: bool = False,
 ) -> LocalObservation:
     """Observe local jj/Git state at one pinned operation without mutating it."""
     workspace = Path(workspace).resolve()
@@ -1705,17 +1767,12 @@ def observe_local(
         " ++ ',\"conflicts\":' ++ conflict"
         " ++ ',\"hidden\":' ++ hidden ++ '}' ++ \"\\n\""
     )
+    log_arguments = ["log", "--no-graph"]
+    if ancestry_order:
+        log_arguments.append("--reversed")
+    log_arguments.extend(("-r", revision, "-T", commit_template))
     commit_records = _json_lines(
-        _jj(
-            workspace,
-            operation,
-            "log",
-            "--no-graph",
-            "-r",
-            revision,
-            "-T",
-            commit_template,
-        ),
+        _jj(workspace, operation, *log_arguments),
         "jj log",
     )
     git_root = Path(_jj(workspace, operation, "git", "root").strip())
@@ -1861,9 +1918,10 @@ def observe_snapshot(
     config_keys: Sequence[str],
     remote: str,
     selected_pr_number: int,
+    local: LocalObservation | None = None,
 ) -> Snapshot:
     """Assemble complete source facts for one explicitly selected PR's stack."""
-    local = observe_local(workspace, revision=revision, config_keys=config_keys)
+    local = local or observe_local(workspace, revision=revision, config_keys=config_keys)
     push_url = resolve_push_url(local, remote)
     fetch_url = resolve_remote_url(local, remote)
     repository = observe_github_repository(push_url, cwd=workspace)
@@ -3351,7 +3409,7 @@ def resolve_publication_assignments(
         name = item.branch_name
         if not _valid_publication_branch(name):
             return _block("invalid-publication-branch", name, "branch name is invalid")
-        if name in protected:
+        if name in protected or name.startswith("jj-stack/"):
             return _block(
                 "protected-publication-branch",
                 name,
@@ -3556,7 +3614,7 @@ def prepare_standalone_first_publication(
         repository.name_with_owner,
         push_url,
         remote,
-        local.effective_config,
+        tuple(item for item in local.effective_config if item[0] != "git.push"),
         local.workspace_targets,
         base_branch,
         tool_state.state_blob_oid,
@@ -3741,7 +3799,7 @@ def prepare_multi_first_publication(
         repository.name_with_owner,
         push_url,
         remote,
-        local.effective_config,
+        tuple(item for item in local.effective_config if item[0] != "git.push"),
         local.workspace_targets,
         base_branch,
         tool_state.state_blob_oid,
@@ -3913,7 +3971,9 @@ def _topology_dependencies(
     bases: tuple[LiveRemoteRef, ...],
 ) -> TopologyDependencies:
     return TopologyDependencies(
-        snapshot.local.effective_config,
+        tuple(
+            item for item in snapshot.local.effective_config if item[0] != "git.push"
+        ),
         snapshot.push_url,
         snapshot.tool_state.state_blob_oid,
         snapshot.tool_state.operation_blob_oid,
@@ -4734,7 +4794,9 @@ def plan_tracked_restore(
         previous = wanted.desired_commit_id
     source = TrackedRestoreSource(tracked, current_membership)
     dependencies = TopologyDependencies(
-        observed.local.effective_config,
+        tuple(
+            item for item in observed.local.effective_config if item[0] != "git.push"
+        ),
         observed.push_url,
         observed.tool_state.state_blob_oid,
         observed.tool_state.operation_blob_oid,
@@ -7723,3 +7785,947 @@ def resume_operation(
     if isinstance(operation, TopologyRepair):
         return resume_topology_repair(workspace)
     return resume_first_publication(workspace)
+
+
+def observe_revision_boundaries(
+    workspace: str | Path, revision: str, config_keys: Sequence[str]
+) -> tuple[ObservedCommit, ...]:
+    """Resolve an explicit revset in jj's ancestry order (oldest first)."""
+    return observe_local(
+        workspace,
+        revision=revision,
+        config_keys=config_keys,
+        ancestry_order=True,
+    ).commits
+
+
+def _managed_branch_names(state: TrackedState) -> tuple[str, ...]:
+    names = [stack.base_branch for stack in state.stacks]
+    names.extend(
+        association.base_branch
+        for stack in state.stacks
+        for association in stack.detached_prs
+    )
+    names.extend(
+        item.ref.full_name.removeprefix("refs/heads/")
+        for item in (*state.last_published_heads, *state.last_adopted_heads)
+    )
+    return tuple(dict.fromkeys(names))
+
+
+def observe_historical_pull_request_collisions(
+    repository: GitHubRepository,
+    branch_names: Sequence[str],
+    *,
+    cwd: str | Path | None = None,
+) -> tuple[GitHubPullRequest, ...]:
+    """Read historical PRs using only the proposed head/base branch names."""
+    branches = tuple(dict.fromkeys(branch_names))
+    if not branches:
+        return ()
+    owner, separator, name = repository.name_with_owner.partition("/")
+    if not separator or not owner or not name or "/" in name:
+        raise ValueError("repository name must have owner/name form")
+    definitions = ["$owner: String!", "$name: String!"]
+    selections: list[str] = []
+    variables: dict[str, object] = {"owner": owner, "name": name}
+    fields = """nodes {
+        id number state isDraft
+        headRepository { id }
+        headRefName headRefOid baseRefName baseRefOid
+        autoMergeRequest { enabledAt }
+        mergeQueueEntry { id }
+        title body
+        stack { id baseRefName }
+      }
+      pageInfo { hasNextPage }"""
+    for index, branch in enumerate(branches):
+        variable = f"branch{index}"
+        definitions.append(f"${variable}: String!")
+        variables[variable] = branch
+        selections.extend(
+            (
+                f"head{index}: pullRequests(first: 100, states: [OPEN, CLOSED, MERGED], headRefName: ${variable}) {{ {fields} }}",
+                f"base{index}: pullRequests(first: 100, states: [OPEN, CLOSED, MERGED], baseRefName: ${variable}) {{ {fields} }}",
+            )
+        )
+    query = f"""query({', '.join(definitions)}) {{
+  repository(owner: $owner, name: $name) {{
+    id
+    {chr(10).join(selections)}
+  }}
+}}"""
+    response = _exact_record(
+        _command_json(
+            [
+                "gh",
+                "api",
+                "--hostname",
+                repository.identity.host,
+                "graphql",
+                "--input",
+                "-",
+            ],
+            cwd=cwd,
+            stdin=json.dumps({"query": query, "variables": variables}),
+        ),
+        {"data"},
+        "GitHub historical collision response",
+    )
+    data = _exact_record(
+        response["data"], {"repository"}, "historical collision data"
+    )
+    raw_repository = data["repository"]
+    if raw_repository is None:
+        raise IncompleteSource("GitHub repository is unavailable")
+    aliases = {
+        f"{kind}{index}"
+        for index in range(len(branches))
+        for kind in ("head", "base")
+    }
+    record = _exact_record(
+        raw_repository, {"id", *aliases}, "historical collision repository"
+    )
+    if _text(record["id"], "historical collision repository ID") != repository.identity.node_id:
+        raise SourceMismatch("push destination and historical PR repository differ")
+    result: dict[PullRequestId, GitHubPullRequest] = {}
+    for alias in sorted(aliases):
+        connection = _exact_record(
+            record[alias], {"nodes", "pageInfo"}, "historical collision connection"
+        )
+        page = _exact_record(
+            connection["pageInfo"], {"hasNextPage"}, "historical collision page"
+        )
+        if page["hasNextPage"] is not False:
+            raise IncompleteSource("filtered historical PR evidence exceeds one page")
+        nodes = connection["nodes"]
+        if not isinstance(nodes, list):
+            raise MalformedSource("historical collision nodes must be an array")
+        for node in nodes:
+            if not isinstance(node, dict) or type(node.get("number")) is not int:
+                raise MalformedSource("historical collision PR is malformed")
+            pull_request = _parse_pr_source(node, repository, node["number"]).pr
+            previous = result.setdefault(pull_request.identity, pull_request)
+            if previous != pull_request:
+                raise SourceMismatch("historical collision observations disagree")
+    return tuple(result.values())
+
+
+def observe_open_pull_request_candidates(
+    repository: GitHubRepository,
+    branch_names: Sequence[str],
+    *,
+    cwd: str | Path | None = None,
+) -> tuple[GitHubPullRequestSource, ...]:
+    """Read only open PRs whose repository-qualified heads are local candidates."""
+    branches = tuple(dict.fromkeys(branch_names))
+    if not branches:
+        return ()
+    owner, separator, name = repository.name_with_owner.partition("/")
+    if not separator or not owner or not name or "/" in name:
+        raise ValueError("repository name must have owner/name form")
+    definitions = ["$owner: String!", "$name: String!"]
+    selections: list[str] = []
+    variables: dict[str, object] = {"owner": owner, "name": name}
+    for index, branch in enumerate(branches):
+        variable = f"head{index}"
+        alias = f"candidate{index}"
+        definitions.append(f"${variable}: String!")
+        variables[variable] = branch
+        selections.append(
+            f"""{alias}: pullRequests(first: 2, states: [OPEN], headRefName: ${variable}) {{
+      nodes {{
+        id number state isDraft
+        headRepository {{ id }}
+        headRefName headRefOid baseRefName baseRefOid
+        autoMergeRequest {{ enabledAt }}
+        mergeQueueEntry {{ id }}
+        title body
+        stack {{ id baseRefName }}
+      }}
+      pageInfo {{ hasNextPage }}
+    }}"""
+        )
+    query = f"""query({', '.join(definitions)}) {{
+  repository(owner: $owner, name: $name) {{
+    id
+    {chr(10).join(selections)}
+  }}
+}}"""
+    response = _exact_record(
+        _command_json(
+            [
+                "gh",
+                "api",
+                "--hostname",
+                repository.identity.host,
+                "graphql",
+                "--input",
+                "-",
+            ],
+            cwd=cwd,
+            stdin=json.dumps({"query": query, "variables": variables}),
+        ),
+        {"data"},
+        "GitHub open PR candidate response",
+    )
+    data = _exact_record(response["data"], {"repository"}, "open PR candidate data")
+    raw_repository = data["repository"]
+    if raw_repository is None:
+        raise IncompleteSource("GitHub repository is unavailable")
+    aliases = {f"candidate{index}" for index in range(len(branches))}
+    record = _exact_record(
+        raw_repository, {"id", *aliases}, "open PR candidate repository"
+    )
+    if _text(record["id"], "candidate repository ID") != repository.identity.node_id:
+        raise SourceMismatch("push destination and candidate PR repository differ")
+    result: list[GitHubPullRequestSource] = []
+    for index, branch in enumerate(branches):
+        connection = _exact_record(
+            record[f"candidate{index}"], {"nodes", "pageInfo"}, "candidate PR connection"
+        )
+        page = _exact_record(
+            connection["pageInfo"], {"hasNextPage"}, "candidate PR page"
+        )
+        if page["hasNextPage"] is not False:
+            raise SourceMismatch(f"multiple open pull requests use head branch {branch}")
+        nodes = connection["nodes"]
+        if not isinstance(nodes, list):
+            raise MalformedSource("candidate pull request nodes must be an array")
+        for node in nodes:
+            if not isinstance(node, dict):
+                raise MalformedSource("candidate pull request node must be an object")
+            number = node.get("number")
+            if type(number) is not int:
+                raise MalformedSource("candidate pull request number must be an integer")
+            source = _parse_pr_source(node, repository, number)
+            if source.pr.head_branch != branch:
+                raise SourceMismatch("GitHub returned a different candidate head branch")
+            result.append(source)
+    if len({item.pr.identity for item in result}) != len(result):
+        raise SourceMismatch("candidate head branches resolve to overlapping pull requests")
+    return tuple(result)
+
+
+def resolve_first_publication_assignments(
+    workspace: str | Path,
+    local: LocalObservation,
+    repository: GitHubRepository,
+    push_url: str,
+    commit_ids: Sequence[str],
+    protected_branch_names: Sequence[str],
+) -> tuple[PublicationAssignment, ...] | Blocked:
+    """Collect resolver-only naming evidence and return its exact frozen mapping."""
+    try:
+        template = _jj(
+            workspace, None, "config", "get", "templates.git_push_bookmark"
+        ).rstrip("\n")
+        if not template:
+            raise SourceMismatch("templates.git_push_bookmark is empty")
+        template_results: list[PublicationAssignment] = []
+        for commit_id in commit_ids:
+            rendered = _jj(
+                workspace,
+                local.operation_id,
+                "log",
+                "--no-graph",
+                "-r",
+                commit_id,
+                "-T",
+                f'({template}) ++ "\\n"',
+            ).splitlines()
+            if len(rendered) != 1 or not rendered[0]:
+                raise SourceMismatch(
+                    "templates.git_push_bookmark must produce one nonempty line per revision"
+                )
+            template_results.append(PublicationAssignment(commit_id, rendered[0]))
+
+        protected = set(protected_branch_names)
+        candidate_names: list[str] = []
+        for commit_id, generated in zip(commit_ids, template_results, strict=True):
+            aliases = tuple(
+                item.name
+                for item in local.local_bookmarks
+                if item.name not in protected
+                and isinstance(item.target, CommitTarget)
+                and item.target.commit_id == commit_id
+            )
+            candidate_names.extend(aliases or (generated.branch_name,))
+        names = tuple(dict.fromkeys(candidate_names))
+        destinations = observe_live_refs(
+            push_url,
+            repository.identity,
+            tuple(f"refs/heads/{name}" for name in names),
+            cwd=workspace,
+        )
+        historical = observe_historical_pull_request_collisions(
+            repository, names, cwd=workspace
+        )
+    except Error as exc:
+        return _block("publication-assignment-unavailable", "selection", str(exc))
+    return resolve_publication_assignments(
+        PublicationAssignmentInput(
+            repository.identity,
+            tuple(commit_ids),
+            local,
+            None,
+            tuple(template_results),
+            tuple(protected_branch_names),
+            destinations,
+            historical,
+        )
+    )
+
+
+def _assign_pr_boundaries(
+    local: LocalObservation,
+    prs: Sequence[GitHubPullRequest],
+    commits: Sequence[ObservedCommit],
+) -> tuple[ExistingPRAssignment, ...] | Blocked:
+    by_commit = {commit.commit_id: commit for commit in local.commits}
+    assignments: list[ExistingPRAssignment] = []
+    used: set[PullRequestId] = set()
+    for commit in commits:
+        matches: list[PullRequestId] = []
+        for pr in prs:
+            target = _one_bookmark_target(local, None, pr.head_branch)
+            local_head = by_commit.get(target or "")
+            if target == commit.commit_id or (
+                local_head is not None and local_head.change_id == commit.change_id
+            ):
+                matches.append(pr.identity)
+        if len(matches) != 1 or matches[0] in used:
+            return _block(
+                "mixed-or-unproven-selection",
+                commit.commit_id,
+                "every selected boundary must map uniquely to an existing PR by exact local bookmark/change identity",
+            )
+        used.add(matches[0])
+        assignments.append(ExistingPRAssignment(matches[0], commit.commit_id))
+    return tuple(assignments)
+
+
+def selected_boundary_bookmark_names(
+    local: LocalObservation, commits: Sequence[ObservedCommit]
+) -> tuple[str, ...]:
+    """Return local branch aliases that can identify existing selected PRs."""
+    selected_ids = {commit.commit_id for commit in commits}
+    selected_changes = {commit.change_id for commit in commits}
+    by_commit = {commit.commit_id: commit for commit in local.commits}
+    return tuple(
+        dict.fromkeys(
+            bookmark.name
+            for bookmark in local.local_bookmarks
+            if isinstance(bookmark.target, CommitTarget)
+            and (
+                bookmark.target.commit_id in selected_ids
+                or (
+                    bookmark.target.commit_id in by_commit
+                    and by_commit[bookmark.target.commit_id].change_id in selected_changes
+                )
+            )
+        )
+    )
+
+
+def resolve_standalone_membership_boundaries(
+    local: LocalObservation,
+    repository: GitHubRepositoryId,
+    selected_pr: PullRequestId,
+    sources: Sequence[GitHubPullRequestSource],
+    commits: Sequence[ObservedCommit],
+) -> tuple[
+    tuple[CompleteMembershipBoundary, ...],
+    tuple[GitHubPullRequestSource, ...],
+    str,
+] | Blocked:
+    """Resolve desired boundaries and prove the old standalone source chain."""
+    if len({commit.commit_id for commit in commits}) != len(commits):
+        return _block("duplicate-selection", "stack", "selected boundaries must be unique")
+    by_commit = {commit.commit_id: commit for commit in local.commits}
+    used: set[PullRequestId] = set()
+    resolved: list[CompleteMembershipBoundary] = []
+    matched_sources: list[GitHubPullRequestSource] = []
+    for commit in commits:
+        matches: list[GitHubPullRequestSource] = []
+        for source in sources:
+            pr = source.pr
+            bookmarks = tuple(
+                item for item in local.local_bookmarks if item.name == pr.head_branch
+            )
+            if len(bookmarks) != 1 or not isinstance(bookmarks[0].target, CommitTarget):
+                continue
+            target = bookmarks[0].target.commit_id
+            local_head = by_commit.get(target)
+            if target == commit.commit_id or (
+                local_head is not None and local_head.change_id == commit.change_id
+            ):
+                matches.append(source)
+        if len(matches) > 1:
+            return _block(
+                "ambiguous-boundary",
+                commit.commit_id,
+                "selected boundary matches multiple open PR identities",
+            )
+        if not matches:
+            resolved.append(NewMembershipBoundary(commit.commit_id))
+            continue
+        source = matches[0]
+        if source.pr.identity in used:
+            return _block(
+                "duplicate-membership",
+                source.pr.identity.node_id,
+                "an existing PR may occupy only one desired boundary",
+            )
+        used.add(source.pr.identity)
+        matched_sources.append(source)
+        resolved.append(ExistingMembershipBoundary(source.pr.identity, commit.commit_id))
+    if selected_pr not in used:
+        return _block(
+            "incomplete-observation",
+            selected_pr.node_id,
+            "the selected PR was not uniquely resolved by the selected revisions",
+        )
+    if any(
+        source.pr.identity.repository != repository
+        or source.pr.head_repository != repository
+        for source in matched_sources
+    ):
+        return _block(
+            "foreign-desired",
+            "stack",
+            "every resolved PR must have a repository-local head",
+        )
+    if any(
+        source.stack_id is not None or source.stack_base_branch is not None
+        for source in matched_sources
+    ):
+        return _block(
+            "mixed-stack-membership",
+            "stack",
+            "resolved PRs must all be standalone before they can be linked together",
+        )
+    by_head: dict[str, GitHubPullRequestSource] = {}
+    for source in matched_sources:
+        if source.pr.head_branch in by_head:
+            return _block(
+                "ambiguous-source-graph",
+                source.pr.head_branch,
+                "multiple source PRs claim one head branch",
+            )
+        by_head[source.pr.head_branch] = source
+    roots: list[GitHubPullRequestSource] = []
+    children: dict[PullRequestId, list[GitHubPullRequestSource]] = {}
+    for source in matched_sources:
+        parent = by_head.get(source.pr.base_branch)
+        if parent is None:
+            roots.append(source)
+            continue
+        if source.pr.reported_base_commit_id != parent.pr.reported_head_commit_id:
+            return _block(
+                "invalid-source-graph",
+                source.pr.identity.node_id,
+                "an internal base name and commit do not identify the same predecessor",
+            )
+        children.setdefault(parent.pr.identity, []).append(source)
+    branched = next(
+        (identity for identity, values in children.items() if len(values) != 1), None
+    )
+    if branched is not None:
+        return _block(
+            "branched-source-graph",
+            branched.node_id,
+            "the standalone source graph is not a nonbranching chain",
+        )
+    if len(roots) != 1:
+        return _block(
+            "multiple-root-source-graph",
+            "stack",
+            "the standalone source graph must have exactly one external ultimate base",
+        )
+    ordered: list[GitHubPullRequestSource] = []
+    current: GitHubPullRequestSource | None = roots[0]
+    while current is not None and current not in ordered:
+        ordered.append(current)
+        descendants = children.get(current.pr.identity, [])
+        current = descendants[0] if descendants else None
+    if len(ordered) != len(matched_sources):
+        return _block(
+            "disconnected-source-graph",
+            "stack",
+            "the standalone source graph is disconnected or cyclic",
+        )
+    return tuple(resolved), tuple(ordered), roots[0].pr.base_branch
+
+
+def _desired_from_assignments(
+    repository: GitHubRepositoryId,
+    base_branch: str,
+    local: LocalObservation,
+    prs: Sequence[GitHubPullRequest],
+    assignments: Sequence[ExistingPRAssignment],
+) -> DesiredStack | Blocked:
+    by_pr = {pr.identity: pr for pr in prs}
+    by_commit = {commit.commit_id: commit for commit in local.commits}
+    desired: list[DesiredExistingPR] = []
+    for assignment in assignments:
+        pr = by_pr.get(assignment.pr_identity)
+        commit = by_commit.get(assignment.commit_id)
+        if pr is None or commit is None or commit.has_conflicts:
+            return _block(
+                "commit-unobserved",
+                assignment.commit_id,
+                "assigned tracked PR or local commit is unavailable",
+            )
+        metadata = _metadata(commit.description)
+        if metadata is None:
+            return _block("title-missing", assignment.commit_id, "selected revision has no title")
+        desired.append(DesiredExistingPR(pr.identity, commit.commit_id, *metadata))
+    return DesiredStack(repository, base_branch, tuple(desired))
+
+
+def _snapshot_matches_tracked_topology(snapshot: Snapshot, tracked: TrackedStack) -> bool:
+    if isinstance(snapshot.membership, StandalonePullRequest):
+        membership = (snapshot.membership.pr,)
+        base = snapshot.pull_requests[0].base_branch
+    else:
+        membership = snapshot.membership.ordered_prs
+        base = snapshot.membership.base_branch
+    if membership != tracked.ordered_prs or base != tracked.base_branch:
+        return False
+    previous = tracked.base_branch
+    for pr in snapshot.pull_requests:
+        if pr.base_branch != previous:
+            return False
+        previous = pr.head_branch
+    return True
+
+
+def plan_explicit_tracked_restore(
+    workspace: str | Path,
+    intent: ExistingIntent,
+    *,
+    snapshot: Snapshot,
+    remote: str,
+    tracked: TrackedStack,
+    config_keys: Sequence[str],
+) -> TopologyPlanResult:
+    repository = observe_github_repository(snapshot.push_url, cwd=workspace)
+    sources = tuple(
+        observe_github_pull_request_by_id(repository, identity, cwd=workspace)
+        for identity in tracked.ordered_prs
+    )
+    prs = tuple(source.pr for source in sources)
+    if intent.revision is None:
+        by_commit = {commit.commit_id: commit for commit in snapshot.local.commits}
+        boundaries: list[ObservedCommit] = []
+        for pr in prs:
+            target = _one_bookmark_target(snapshot.local, None, pr.head_branch)
+            commit = by_commit.get(target or "")
+            if commit is None:
+                return _block(
+                    "tracked-representation-missing",
+                    pr.identity.node_id,
+                    "every tracked PR requires one exact local boundary",
+                )
+            boundaries.append(commit)
+    else:
+        boundaries = list(observe_revision_boundaries(workspace, intent.revision, config_keys))
+    assignments = _assign_pr_boundaries(snapshot.local, prs, boundaries)
+    if isinstance(assignments, Blocked):
+        return assignments
+    if tuple(item.pr_identity for item in assignments) != tracked.ordered_prs:
+        return _block(
+            "restore-order-mismatch",
+            "stack",
+            "explicit local boundaries must exactly preserve tracked membership and order",
+        )
+    desired = _desired_from_assignments(
+        tracked.repository,
+        tracked.base_branch,
+        snapshot.local,
+        prs,
+        assignments,
+    )
+    if isinstance(desired, Blocked):
+        return desired
+    observation = observe_tracked_restore(
+        workspace,
+        local=snapshot.local,
+        tool_state=snapshot.tool_state,
+        repository=repository,
+        push_url=snapshot.push_url,
+        remote=remote,
+        tracked=tracked,
+        desired=desired,
+        pr_sources=sources,
+    )
+    source = prepare_tracked_restore_planning(observation)
+    if isinstance(source, Blocked):
+        return source
+    absences = observe_live_refs(
+        snapshot.push_url,
+        tracked.repository,
+        tuple(ref.full_name for ref in source.temporary_base_refs),
+        cwd=workspace,
+    )
+    return plan_tracked_restore(complete_tracked_restore_planning_input(source, absences))
+
+
+def _implicit_existing_boundaries(snapshot: Snapshot) -> tuple[ObservedCommit, ...] | Blocked:
+    by_commit = {commit.commit_id: commit for commit in snapshot.local.commits}
+    result: list[ObservedCommit] = []
+    for pr in snapshot.pull_requests:
+        if pr.state is not PullRequestState.OPEN:
+            continue
+        target = _one_bookmark_target(snapshot.local, None, pr.head_branch)
+        commit = by_commit.get(target or "")
+        if commit is None:
+            return _block(
+                "tracked-representation-missing",
+                pr.identity.node_id,
+                "implicit intent requires every active PR to have one exact local boundary",
+            )
+        result.append(commit)
+    return tuple(result)
+
+
+def plan_explicit_existing(
+    workspace: str | Path,
+    intent: ExistingIntent,
+    *,
+    requested_remote: str | None = None,
+    config_keys: Sequence[str] = ("git.push",),
+) -> ExplicitPlan:
+    """Observe, resolve, and classify one explicitly selected existing stack."""
+    if intent.pr_number <= 0:
+        return _block("invalid-pr", str(intent.pr_number), "PR number must be positive")
+    local = observe_local(
+        workspace,
+        revision=intent.revision or "all()",
+        config_keys=config_keys,
+        ancestry_order=intent.revision is not None,
+    )
+    remote = resolve_remote(local, requested_remote)
+    snapshot = observe_snapshot(
+        workspace,
+        revision=intent.revision or "all()",
+        config_keys=config_keys,
+        remote=remote,
+        selected_pr_number=intent.pr_number,
+        local=local,
+    )
+    selected_identity = (
+        snapshot.membership.pr
+        if isinstance(snapshot.membership, StandalonePullRequest)
+        else snapshot.membership.selected_pr
+    )
+    if intent.revision is not None and not isinstance(
+        snapshot.membership, StandalonePullRequest
+    ):
+        complete_local = observe_local(
+            workspace, revision="all()", config_keys=config_keys
+        )
+        if replace(local, commits=()) != replace(complete_local, commits=()):
+            raise SourceMismatch("local observation changed during stack resolution")
+        snapshot = replace(snapshot, local=complete_local)
+    tracked_candidates = tuple(
+        stack
+        for stack in snapshot.tool_state.state.stacks
+        if stack.repository == snapshot.repository and selected_identity in stack.ordered_prs
+    )
+    if len(tracked_candidates) > 1:
+        return _block(
+            "tracked-overlap",
+            selected_identity.node_id,
+            "selected PR belongs to multiple tracked active stacks",
+        )
+    if tracked_candidates and not _snapshot_matches_tracked_topology(
+        snapshot, tracked_candidates[0]
+    ):
+        return plan_explicit_tracked_restore(
+            workspace,
+            intent,
+            snapshot=snapshot,
+            remote=remote,
+            tracked=tracked_candidates[0],
+            config_keys=config_keys,
+        )
+
+    open_prs = tuple(pr for pr in snapshot.pull_requests if pr.state is PullRequestState.OPEN)
+    if intent.revision is None:
+        boundaries = _implicit_existing_boundaries(snapshot)
+        if isinstance(boundaries, Blocked):
+            return boundaries
+        assignments = _assign_pr_boundaries(snapshot.local, snapshot.pull_requests, boundaries)
+        if isinstance(assignments, Blocked):
+            return assignments
+        selection: StackSelection | Blocked = StackSelection(
+            snapshot.pull_requests[0].base_branch
+            if isinstance(snapshot.membership, StandalonePullRequest)
+            else snapshot.membership.base_branch,
+            assignments,
+        )
+    else:
+        boundaries = local.commits
+        standalone_sources: tuple[GitHubPullRequestSource, ...] | None = None
+        standalone_repository: GitHubRepository | None = None
+        if isinstance(snapshot.membership, StandalonePullRequest):
+            standalone_repository = observe_github_repository(
+                snapshot.push_url, cwd=workspace
+            )
+            resolved = resolve_standalone_membership_boundaries(
+                snapshot.local,
+                snapshot.repository,
+                selected_identity,
+                observe_open_pull_request_candidates(
+                    standalone_repository,
+                    selected_boundary_bookmark_names(snapshot.local, boundaries),
+                    cwd=workspace,
+                ),
+                boundaries,
+            )
+            if isinstance(resolved, Blocked):
+                return resolved
+            _classified, standalone_sources, standalone_base_branch = resolved
+            focused_local = observe_local(
+                workspace,
+                revision=(
+                    f"({intent.revision})"
+                    f" | {standalone_sources[0].pr.reported_base_commit_id}::"
+                    f"{standalone_sources[-1].pr.reported_head_commit_id}"
+                ),
+                config_keys=config_keys,
+            )
+            if replace(local, commits=()) != replace(focused_local, commits=()):
+                raise SourceMismatch("local observation changed during standalone resolution")
+            snapshot = replace(snapshot, local=focused_local)
+        else:
+            boundaries = observe_revision_boundaries(workspace, intent.revision, config_keys)
+        existing_count = 0
+        for pr, commit in zip(open_prs, boundaries):
+            if _one_bookmark_target(snapshot.local, None, pr.head_branch) != commit.commit_id:
+                break
+            existing_count += 1
+        if existing_count == len(open_prs) and len(boundaries) > existing_count:
+            if not isinstance(snapshot.membership, ServerStackMembership) or len(open_prs) != len(
+                snapshot.pull_requests
+            ):
+                return _block(
+                    "append-unsupported",
+                    "stack",
+                    "append requires unchanged membership in one fully-open stack",
+                )
+            repository = observe_github_repository(snapshot.push_url, cwd=workspace)
+            commits = tuple(item.commit_id for item in boundaries[existing_count:])
+            protected = (
+                snapshot.membership.base_branch,
+                *(pr.head_branch for pr in snapshot.pull_requests),
+                *_managed_branch_names(snapshot.tool_state.state),
+            )
+            publication = resolve_first_publication_assignments(
+                workspace,
+                snapshot.local,
+                repository,
+                snapshot.push_url,
+                commits,
+                protected,
+            )
+            if isinstance(publication, Blocked):
+                return publication
+            return prepare_multi_first_publication(
+                workspace,
+                snapshot.local,
+                snapshot.tool_state,
+                repository,
+                snapshot.push_url,
+                remote,
+                snapshot.membership.base_branch,
+                publication,
+                existing_stack=GitHubStackSource(
+                    snapshot.membership.stack,
+                    snapshot.membership.base_branch,
+                    snapshot.pull_requests,
+                ),
+            )
+        assignments = _assign_pr_boundaries(snapshot.local, snapshot.pull_requests, boundaries)
+        if isinstance(assignments, Blocked):
+            return assignments
+        selection = StackSelection(
+            snapshot.pull_requests[0].base_branch
+            if isinstance(snapshot.membership, StandalonePullRequest)
+            else snapshot.membership.base_branch,
+            assignments,
+        )
+
+    desired = derive_desired(snapshot, selection)
+    if isinstance(desired, Blocked):
+        return desired
+    source_open = tuple(pr.identity for pr in open_prs)
+    selected = tuple(item.pr_identity for item in desired.active)
+    if selected == source_open:
+        local_boundaries = tuple(
+            _one_bookmark_target(snapshot.local, None, pr.head_branch) for pr in open_prs
+        )
+        desired_boundaries = tuple(item.desired_commit_id for item in desired.active)
+        if (
+            desired_boundaries == local_boundaries
+            and snapshot.tool_state.operation_blob_oid is None
+            and all(not pr.auto_merge_enabled and not pr.in_merge_queue for pr in open_prs)
+        ):
+            adoption = inspect_remote_restack(snapshot, remote)
+            if isinstance(adoption, RemoteRestackAdoption):
+                return adoption
+        return plan_sync(snapshot, desired)
+    repository = observe_github_repository(snapshot.push_url, cwd=workspace)
+    source = prepare_topology_planning(snapshot, repository, remote, desired)
+    if isinstance(source, Blocked):
+        return source
+    absences = observe_live_refs(
+        snapshot.push_url,
+        snapshot.repository,
+        tuple(ref.full_name for ref in source.temporary_base_refs),
+        cwd=workspace,
+    )
+    return plan_topology(complete_topology_planning_input(source, absences))
+
+
+def plan_explicit_new(
+    workspace: str | Path,
+    intent: NewIntent,
+    *,
+    requested_remote: str | None = None,
+    config_keys: Sequence[str] = ("git.push",),
+) -> FirstPublication | Blocked:
+    """Observe and freeze first publication; this never consults PR selection."""
+    selected = observe_revision_boundaries(workspace, intent.revision, config_keys)
+    if not selected:
+        return _block(
+            "empty-publication", intent.revision, "new publication requires a nonempty revset"
+        )
+    local = observe_local(workspace, revision="all()", config_keys=config_keys)
+    remote = resolve_remote(local, requested_remote)
+    push_url = resolve_push_url(local, remote)
+    repository = observe_github_repository(push_url, cwd=workspace)
+    base = intent.base_branch or repository.default_branch
+    commits = tuple(item.commit_id for item in selected)
+    tool_state = observe_tool_state(workspace)
+    protected = (base, *_managed_branch_names(tool_state.state))
+    assignments = resolve_first_publication_assignments(
+        workspace, local, repository, push_url, commits, protected
+    )
+    if isinstance(assignments, Blocked):
+        return assignments
+    if len(assignments) == 1:
+        return prepare_standalone_first_publication(
+            workspace,
+            local,
+            tool_state,
+            repository,
+            push_url,
+            remote,
+            base,
+            assignments[0],
+        )
+    return prepare_multi_first_publication(
+        workspace,
+        local,
+        tool_state,
+        repository,
+        push_url,
+        remote,
+        base,
+        assignments,
+    )
+
+
+def plan_explicit(
+    workspace: str | Path,
+    intent: ExplicitIntent,
+    *,
+    requested_remote: str | None = None,
+) -> ExplicitPlan:
+    if isinstance(intent, ExistingIntent):
+        return plan_explicit_existing(
+            workspace, intent, requested_remote=requested_remote
+        )
+    if isinstance(intent, NewIntent):
+        return plan_explicit_new(workspace, intent, requested_remote=requested_remote)
+    _oid, operation = read_operation(workspace)
+    return PersistedOperation(operation)
+
+
+def render_explicit(value: ExplicitPlan | ExplicitResult) -> str:
+    if isinstance(value, (Blocked, NoOp, Apply)):
+        return render(value)
+    if isinstance(value, TopologyPlan):
+        return render_topology(value)
+    if isinstance(value, RemoteRestackAdoption):
+        lines = ["remote restack adoption (local only; no push):"]
+        lines.extend(
+            f"  - {item.branch}: L={item.local_commit_id} T={item.tracked_commit_id} R={item.remote_commit_id}"
+            for item in value.boundaries
+        )
+        lines.extend(
+            f"  - affected workspace {name}" for name, _change in value.workspace_change_ids
+        )
+        return "\n".join(lines)
+    if isinstance(value, FirstPublication):
+        return "first publication:\n" + "\n".join(
+            f"  - publish {slot.commit_id} as {slot.branch} onto {slot.base_branch}"
+            for slot in value.slots
+        )
+    if isinstance(value, PersistedOperation):
+        if isinstance(value.operation, TopologyRepair):
+            return (
+                f"resume topology repair at {value.operation.phase.value}:\n"
+                + render_topology(value.operation.plan)
+            )
+        return (
+            f"resume first publication at {value.operation.phase.value}:\n"
+            + render_explicit(value.operation)
+        )
+    if isinstance(value, FirstPublicationVerified):
+        return f"published {len(value.ordered_prs)} PR(s)"
+    if isinstance(value, TopologyRepairVerified):
+        return f"topology repaired for {len(value.ordered_prs)} PR(s)"
+    if isinstance(value, AdoptionVerified):
+        return f"adopted {len(value.adopted_heads)} remote head(s) locally"
+    if isinstance(value, Verified):
+        return "sync verified"
+    if isinstance(value, Stopped):
+        return f"stopped [{value.stage}]: {value.detail}"
+    raise TypeError(f"unsupported explicit value: {type(value).__name__}")
+
+
+def render_detached_associations(values: Sequence[DetachedAssociation]) -> str:
+    if not values:
+        return "no detached PR associations"
+    return "detached PR associations:\n" + "\n".join(
+        f"  - {item.pr.node_id} ({item.repository.host}, base {item.base_branch})"
+        for item in values
+    )
+
+
+def render_detached_result(value: DetachedAssociationResult) -> str:
+    return (
+        f"removed detached association {value.association.pr.node_id}; "
+        f"state {value.state_blob_oid}"
+    )
+
+
+def apply_explicit(value: ExplicitPlan, workspace: str | Path) -> ExplicitResult:
+    """Dispatch the exact immutable object that was rendered and approved."""
+    if isinstance(value, Blocked):
+        return value
+    if isinstance(value, RemoteRestackAdoption):
+        return adopt_remote_restack(value, workspace)
+    if isinstance(value, FirstPublication):
+        start_first_publication(value, workspace)
+        return resume_first_publication(workspace)
+    if isinstance(value, TopologyPlan):
+        start_topology_repair(value, workspace)
+        return resume_topology_repair(workspace)
+    if isinstance(value, PersistedOperation):
+        return resume_operation(workspace)
+    return apply(value, workspace)

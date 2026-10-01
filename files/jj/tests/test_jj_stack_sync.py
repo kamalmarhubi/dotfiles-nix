@@ -2648,7 +2648,7 @@ def first_publication_operation(
         "owner/repo",
         "ssh://git@github.com/owner/repo.git",
         "origin",
-        (("stack.remote", "origin"),),
+        (),
         (("default", "2" * 40),),
         "main",
         None,
@@ -3095,7 +3095,6 @@ def test_native_first_publication_establishes_tracking_without_moving_workspace(
     run("jj", "git", "init", "--colocate" if colocated else "--no-colocate", repo)
     jj(repo, "config", "set", "--repo", "user.name", "Test User")
     jj(repo, "config", "set", "--repo", "user.email", "test@example.com")
-    jj(repo, "config", "set", "--repo", "stack.remote", "origin")
     jj(
         repo,
         "config",
@@ -3118,7 +3117,7 @@ def test_native_first_publication_establishes_tracking_without_moving_workspace(
     local = sync.observe_local(
         repo,
         revision=f"main@origin | {commit_id}",
-        config_keys=("stack.remote",),
+        config_keys=("git.push",),
     )
     repository = sync.GitHubRepository(
         sync.GitHubRepositoryId("github.com", "R_repo"),
@@ -3187,7 +3186,7 @@ def test_native_first_publication_establishes_tracking_without_moving_workspace(
     assert isinstance(stopped, sync.Stopped)
     assert stopped.stage == "create-pr"
     observed = sync.observe_local(
-        repo, revision=commit_id, config_keys=("stack.remote",)
+        repo, revision=commit_id, config_keys=("git.push",)
     )
     assert (
         sync.LocalBookmark(branch, sync.CommitTarget(commit_id))
@@ -4153,6 +4152,7 @@ def test_publication_assignment_blocks_alias_ambiguity_without_fallback() -> Non
     ("assignment", "bookmarks", "code"),
     (
         ("main", (), "protected-publication-branch"),
+        ("jj-stack/temporary-bases/manual/1", (), "protected-publication-branch"),
         ("bad..name", (), "invalid-publication-branch"),
         (
             "generated-one",
@@ -4228,6 +4228,227 @@ def test_publication_assignment_blocks_historical_base_and_same_repo_head_use() 
     fork = historical_pr(head="generated-one", base="main", fork=True)
     observed = publication_assignment_input(explicit=explicit, history=(fork,))
     assert sync.resolve_publication_assignments(observed) == explicit
+
+
+def test_historical_collision_observation_is_one_call_bounded_by_names(
+    monkeypatch,
+) -> None:
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    branches = ("new-one", "new-two")
+    requests = []
+
+    def response(_args, *, cwd, stdin):
+        request = json.loads(stdin)
+        requests.append(request)
+        return {
+            "data": {
+                "repository": {
+                    "id": "R_repo",
+                    "head0": {
+                        "nodes": [
+                            pr_source_record(
+                                id="PR_head", number=7, headRefName="new-one"
+                            )
+                        ],
+                        "pageInfo": {"hasNextPage": False},
+                    },
+                    "base0": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+                    "head1": {"nodes": [], "pageInfo": {"hasNextPage": False}},
+                    "base1": {
+                        "nodes": [
+                            pr_source_record(
+                                id="PR_base", number=8, baseRefName="new-two"
+                            )
+                        ],
+                        "pageInfo": {"hasNextPage": False},
+                    },
+                }
+            }
+        }
+
+    monkeypatch.setattr(sync, "_command_json", response)
+
+    observed = sync.observe_historical_pull_request_collisions(repository, branches)
+
+    assert len(requests) == 1
+    assert requests[0]["variables"] == {
+        "owner": "owner",
+        "name": "repo",
+        "branch0": "new-one",
+        "branch1": "new-two",
+    }
+    assert tuple(item.number for item in observed) == (8, 7)
+
+
+def test_selected_boundary_bookmark_names_uses_exact_and_change_aliases() -> None:
+    observed = publication_assignment_input().local
+    selected = observed.commits
+    rewritten = dataclasses.replace(
+        selected[1], commit_id="3" * 40, parent_commit_ids=(selected[1].commit_id,)
+    )
+    local = dataclasses.replace(
+        observed,
+        local_bookmarks=(
+            sync.LocalBookmark("exact", sync.CommitTarget(selected[0].commit_id)),
+            sync.LocalBookmark("change-alias", sync.CommitTarget(rewritten.commit_id)),
+            sync.LocalBookmark("unselected", sync.CommitTarget("4" * 40)),
+            sync.LocalBookmark("absent", sync.AbsentBookmarkTarget()),
+        ),
+        commits=(*selected, rewritten),
+    )
+
+    assert sync.selected_boundary_bookmark_names(local, selected) == (
+        "exact",
+        "change-alias",
+    )
+
+
+def test_standalone_membership_resolution_orders_source_chain_and_new_boundary() -> None:
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    first_id, new_id, last_id, rewritten_id = (character * 40 for character in "1234")
+    commits = (
+        sync.ObservedCommit(first_id, (), "change-1", "One", False, False),
+        sync.ObservedCommit(new_id, (first_id,), "change-new", "New", False, False),
+        sync.ObservedCommit(last_id, (new_id,), "change-2", "Two", False, False),
+    )
+    rewritten = dataclasses.replace(
+        commits[-1], commit_id=rewritten_id, parent_commit_ids=(last_id,)
+    )
+    local = dataclasses.replace(
+        publication_assignment_input().local,
+        local_bookmarks=(
+            sync.LocalBookmark("topic-1", sync.CommitTarget(first_id)),
+            sync.LocalBookmark("topic-2", sync.CommitTarget(rewritten_id)),
+        ),
+        commits=(*commits, rewritten),
+    )
+    first_pr = sync.GitHubPullRequest(
+        sync.PullRequestId(repository, "PR_1"), 1, sync.PullRequestState.OPEN,
+        False, repository, "topic-1", first_id, "dev", "0" * 40,
+        False, False, "One", "",
+    )
+    last_pr = sync.GitHubPullRequest(
+        sync.PullRequestId(repository, "PR_2"), 2, sync.PullRequestState.OPEN,
+        False, repository, "topic-2", rewritten_id, "topic-1", first_id,
+        False, False, "Two", "",
+    )
+    first = sync.GitHubPullRequestSource(first_pr, None, None)
+    last = sync.GitHubPullRequestSource(last_pr, None, None)
+
+    result = sync.resolve_standalone_membership_boundaries(
+        local, repository, first_pr.identity, (last, first), commits
+    )
+
+    assert result == (
+        (
+            sync.ExistingMembershipBoundary(first_pr.identity, first_id),
+            sync.NewMembershipBoundary(new_id),
+            sync.ExistingMembershipBoundary(last_pr.identity, last_id),
+        ),
+        (first, last),
+        "dev",
+    )
+
+
+def test_open_pr_candidate_observation_is_one_call_bounded_by_selected_aliases(
+    monkeypatch,
+) -> None:
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    branches = ("topic-4", "topic-1", "topic-2", "topic-3")
+    requests = []
+
+    def response(_args, *, cwd, stdin):
+        request = json.loads(stdin)
+        requests.append(request)
+        return {
+            "data": {
+                "repository": {
+                    "id": "R_repo",
+                    **{
+                        f"candidate{index}": {
+                            "nodes": [
+                                pr_source_record(
+                                    id=f"PR_{index}",
+                                    number=index + 1,
+                                    headRefName=branch,
+                                )
+                            ],
+                            "pageInfo": {"hasNextPage": False},
+                        }
+                        for index, branch in enumerate(branches)
+                    },
+                }
+            }
+        }
+
+    monkeypatch.setattr(sync, "_command_json", response)
+
+    observed = sync.observe_open_pull_request_candidates(repository, branches)
+
+    assert len(requests) == 1
+    assert requests[0]["variables"] == {
+        "owner": "owner",
+        "name": "repo",
+        **{f"head{index}": branch for index, branch in enumerate(branches)},
+    }
+    assert tuple(item.pr.head_branch for item in observed) == branches
+
+
+def test_assignment_observer_mixes_exact_bookmark_and_template(monkeypatch) -> None:
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    commits = ("1" * 40, "2" * 40)
+    local = dataclasses.replace(
+        publication_assignment_input().local,
+        local_bookmarks=(
+            sync.LocalBookmark("intentional", sync.CommitTarget(commits[0])),
+        ),
+    )
+
+    def jj(_workspace, _operation, *arguments):
+        if arguments[:3] == ("config", "get", "templates.git_push_bookmark"):
+            return '"generated-" ++ change_id.short()\n'
+        commit = arguments[arguments.index("-r") + 1]
+        return "generated-one\n" if commit == commits[0] else "generated-two\n"
+
+    def refs(_push_url, identity, names, *, cwd):
+        assert names == ("refs/heads/intentional", "refs/heads/generated-two")
+        return tuple(
+            sync.LiveRemoteRef(sync.RemoteBranchRef(identity, name), None)
+            for name in names
+        )
+
+    monkeypatch.setattr(sync, "_jj", jj)
+    monkeypatch.setattr(sync, "observe_live_refs", refs)
+    monkeypatch.setattr(
+        sync, "observe_historical_pull_request_collisions", lambda *_args, **_kwargs: ()
+    )
+
+    assert sync.resolve_first_publication_assignments(
+        "/repo",
+        local,
+        repository,
+        "git@example/repo",
+        commits,
+        ("main",),
+    ) == (
+        sync.PublicationAssignment(commits[0], "intentional"),
+        sync.PublicationAssignment(commits[1], "generated-two"),
+    )
 
 
 def test_observations_are_deeply_immutable() -> None:
