@@ -1048,6 +1048,7 @@ Operation = FirstPublication | TopologyRepair | MembershipRepair | PreservedPref
 class ExistingIntent:
     pr_number: int
     revision: str | None = None
+    bootstrap_local_wins: bool = False
 
 
 @dataclass(frozen=True)
@@ -9761,6 +9762,7 @@ def prepare_membership_repair(
     *,
     standalone_sources: Sequence[GitHubPullRequestSource] | None = None,
     standalone_base_branch: str | None = None,
+    bootstrap_local_wins: bool = False,
 ) -> MembershipRepair | Blocked:
     """Observe and freeze a mixed complete-membership transaction; never mutate."""
     boundaries = tuple(boundaries)
@@ -9883,7 +9885,11 @@ def prepare_membership_repair(
             wanted = DesiredExistingPR(pr.identity, boundary.commit_id, *metadata)
             head = refs[RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.head_branch}")]
             planned = _plan_head_update(
-                snapshot.local.commits, snapshot.tool_state.state, wanted, head
+                snapshot.local.commits,
+                snapshot.tool_state.state,
+                wanted,
+                head,
+                allow_bootstrap=bootstrap_local_wins,
             )
             if isinstance(planned, Blocked): return planned
             updates.extend(planned); metadata_updates.extend(_metadata_updates(pr, wanted))
@@ -10167,6 +10173,12 @@ def plan_explicit_existing(
                 raise SourceMismatch("local observation changed during standalone resolution")
             snapshot = replace(snapshot, local=focused_local)
         else:
+            if intent.bootstrap_local_wins:
+                return _block(
+                    "bootstrap-not-applicable",
+                    "stack",
+                    "bootstrap local-wins is only valid for an explicit standalone PR set",
+                )
             classified = classify_complete_membership_boundaries(
                 snapshot.local,
                 open_prs
@@ -10215,6 +10227,13 @@ def plan_explicit_existing(
                 classified,
                 standalone_sources=standalone_sources,
                 standalone_base_branch=standalone_base_branch,
+                bootstrap_local_wins=intent.bootstrap_local_wins,
+            )
+        if intent.bootstrap_local_wins:
+            return _block(
+                "bootstrap-not-applicable",
+                "stack",
+                "bootstrap local-wins requires a multi-PR or mixed standalone membership repair",
             )
         simple_append = (
             isinstance(snapshot.membership, ServerStackMembership)
@@ -10416,7 +10435,11 @@ def render_explicit(value: ExplicitPlan | ExplicitResult) -> str:
             item.pr_identity for item in value.desired
             if isinstance(item, ExistingMembershipEntry)
         }
-        lines = [f"membership repair at {value.phase.value}:", "  ordered goal:"]
+        lines = [
+            f"membership repair at {value.phase.value}:",
+            f"  ultimate base: {value.base_branch}",
+            "  ordered goal:",
+        ]
         for item in value.desired:
             if isinstance(item, ExistingMembershipEntry):
                 lines.append(f"    - existing {item.pr_identity.node_id}")
@@ -10439,6 +10462,17 @@ def render_explicit(value: ExplicitPlan | ExplicitResult) -> str:
                 )
             )
         )
+        replacements = tuple(
+            update
+            for update in value.head_updates
+            if isinstance(update.authority, BootstrapLocalWins)
+        )
+        if replacements:
+            lines.append("  one-shot bootstrap replacements:")
+            lines.extend(
+                f"    - {item.ref.full_name}: {item.expected_old_commit_id} -> {item.new_commit_id}"
+                for item in replacements
+            )
         lines.append("  detached: " + (", ".join(item.node_id for item in detached) if detached else "none"))
         return "\n".join(lines)
     if isinstance(value, PreservedPrefixRepair):

@@ -1628,6 +1628,397 @@ def test_explicit_completed_stack_routes_new_suffix_to_append(monkeypatch) -> No
     assert result.slots[0].base_branch == "main"
 
 
+def standalone_set_planning_case():
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    base = "0" * 40
+    desired_ids = tuple(str(index) * 40 for index in range(1, 7))
+    old_ids = tuple(character * 40 for character in "abcd")
+    commits = []
+    # The selected stack and old PR comparisons may have external-root ancestry;
+    # the PR head/base name graph, not Git parentage, proves those outer edges.
+    previous = "9" * 40
+    for index, commit_id in enumerate(desired_ids, start=1):
+        commits.append(
+            sync.ObservedCommit(
+                commit_id,
+                (previous,),
+                f"change-{index}",
+                f"Title {index}\n\nBody {index}",
+                False,
+                False,
+            )
+        )
+        previous = commit_id
+    previous = base
+    for index, commit_id in enumerate(old_ids, start=1):
+        parent = "e" * 40 if index == 3 else previous
+        commits.append(
+            sync.ObservedCommit(
+                commit_id,
+                (parent,),
+                f"old-change-{index}",
+                f"Old {index}",
+                False,
+                False,
+            )
+        )
+        previous = commit_id
+    commits.append(sync.ObservedCommit(base, (), "base", "Base", False, False))
+    prs = []
+    for index in range(1, 5):
+        prs.append(
+            sync.GitHubPullRequest(
+            sync.PullRequestId(repository, f"PR_{index}"),
+            index,
+            sync.PullRequestState.OPEN,
+            False,
+            repository,
+            f"topic-{index}",
+            old_ids[index - 1],
+            "dev" if index == 1 else f"topic-{index - 1}",
+            base if index == 1 else old_ids[index - 2],
+            False,
+            False,
+            f"Title {index}",
+            f"Body {index}",
+        )
+        )
+    prs = tuple(prs)
+    desired_by_branch = {
+        "topic-4": desired_ids[0],
+        "topic-1": desired_ids[3],
+        "topic-2": desired_ids[4],
+        "topic-3": desired_ids[5],
+    }
+    local = sync.LocalObservation(
+        "/repo",
+        "op",
+        (("stack.remote", "origin"),),
+        (("default", desired_ids[-1]),),
+        tuple(
+            sync.LocalBookmark(
+                pr.head_branch, sync.CommitTarget(desired_by_branch[pr.head_branch])
+            )
+            for pr in prs
+        ),
+        (),
+        (),
+        tuple(commits),
+        "/git",
+    )
+    refs = (
+        sync.LiveRemoteRef(
+            sync.RemoteBranchRef(repository, "refs/heads/dev"), "8" * 40
+        ),
+        *(
+            sync.LiveRemoteRef(
+                sync.RemoteBranchRef(repository, f"refs/heads/topic-{index}"),
+                old_ids[index - 1],
+            )
+            for index in range(1, 5)
+        ),
+    )
+    snapshot = sync.Snapshot(
+        repository,
+        "ssh://git@github.com/owner/repo.git",
+        local,
+        sync.ToolStateRead(None, sync.EMPTY_STATE, None),
+        (prs[0],),
+        sync.StandalonePullRequest(prs[0].identity),
+        (refs[0], refs[1]),
+    )
+    github_repository = sync.GitHubRepository(
+        repository, "owner/repo", "https://github.com/owner/repo", "main"
+    )
+    sources = tuple(sync.GitHubPullRequestSource(pr, None, None) for pr in prs)
+    boundaries = tuple(commits[:6])
+    return snapshot, github_repository, sources, boundaries, refs, desired_ids, old_ids
+
+
+def test_explicit_four_standalone_prs_plus_two_new_requires_scoped_bootstrap(
+    monkeypatch,
+) -> None:
+    snapshot, repository, sources, boundaries, refs, desired_ids, old_ids = (
+        standalone_set_planning_case()
+    )
+    monkeypatch.setattr(
+        sync,
+        "observe_local",
+        lambda *_args, **kwargs: (
+            dataclasses.replace(snapshot.local, commits=boundaries)
+            if kwargs.get("ancestry_order")
+            else snapshot.local
+        ),
+    )
+    monkeypatch.setattr(sync, "observe_snapshot", lambda *_args, **_kwargs: snapshot)
+    monkeypatch.setattr(
+        sync, "observe_revision_boundaries", lambda *_args, **_kwargs: boundaries
+    )
+    monkeypatch.setattr(sync, "observe_github_repository", lambda *_args, **_kwargs: repository)
+    candidate_calls = []
+    monkeypatch.setattr(
+        sync,
+        "observe_open_pull_request_candidates",
+        lambda _repository, branches, **_kwargs: candidate_calls.append(tuple(branches))
+        or sources,
+    )
+    monkeypatch.setattr(
+        sync,
+        "resolve_first_publication_assignments",
+        lambda *_args, **_kwargs: (
+            sync.PublicationAssignment(desired_ids[1], "topic-new-1"),
+            sync.PublicationAssignment(desired_ids[2], "topic-new-2"),
+        ),
+    )
+
+    def observe_refs(_url, identity, names, *, cwd):
+        by_name = {item.ref.full_name: item.commit_id for item in refs}
+        return tuple(
+            sync.LiveRemoteRef(sync.RemoteBranchRef(identity, name), by_name.get(name))
+            for name in names
+        )
+
+    monkeypatch.setattr(sync, "observe_live_refs", observe_refs)
+
+    blocked = sync.plan_explicit_existing(
+        "/repo", sync.ExistingIntent(1, "selected")
+    )
+    operation = sync.plan_explicit_existing(
+        "/repo", sync.ExistingIntent(1, "selected", bootstrap_local_wins=True)
+    )
+
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "replacement-unauthorized"
+    assert isinstance(operation, sync.MembershipRepair)
+    assert operation.source_membership == sync.StandalonePullRequestSet(
+        tuple(source.pr.identity for source in sources)
+    )
+    assert operation.source_tracked is None
+    assert operation.base_branch == "dev"
+    assert len(operation.desired) == 6
+    assert len(operation.slots) == 2
+    assert candidate_calls == [("topic-1", "topic-2", "topic-3", "topic-4")] * 2
+    assert tuple(update.expected_old_commit_id for update in operation.head_updates) == (
+        old_ids[3], old_ids[0], old_ids[1], old_ids[2]
+    )
+    assert tuple(update.new_commit_id for update in operation.head_updates) == (
+        desired_ids[0], desired_ids[3], desired_ids[4], desired_ids[5]
+    )
+    assert tuple(
+        item.pr_identity if isinstance(item, sync.ExistingMembershipEntry) else None
+        for item in operation.desired
+    ) == (sources[3].pr.identity, None, None, sources[0].pr.identity,
+          sources[1].pr.identity, sources[2].pr.identity)
+    assert all(
+        isinstance(update.authority, sync.BootstrapLocalWins)
+        for update in operation.head_updates
+    )
+    assert sync.parse_membership_repair(
+        sync.membership_repair_to_json(operation)
+    ) == operation
+    rendered = sync.render_explicit(operation)
+    assert "ultimate base: dev" in rendered
+    assert "one-shot bootstrap replacements" in rendered
+    assert f"{old_ids[3]} -> {desired_ids[0]}" in rendered
+    assert f"{old_ids[0]} -> {desired_ids[3]}" in rendered
+    bound = dataclasses.replace(
+        operation,
+        slots=tuple(
+            dataclasses.replace(
+                slot,
+                phase=sync.NewPRPhase.VERIFIED,
+                pr_identity=sync.PullRequestId(
+                    operation.repository, f"PR_new_{index}"
+                ),
+                pr_number=10 + index,
+            )
+            for index, slot in enumerate(operation.slots, start=1)
+        ),
+    )
+    final_state = sync._build_membership_final_state(bound, sync.EMPTY_STATE)
+    assert len(final_state.stacks) == 1
+    assert final_state.last_adopted_heads == ()
+    assert {
+        (receipt.pr, receipt.ref, receipt.verified_commit_id)
+        for receipt in final_state.last_published_heads
+    } == {
+        (
+            source.pr.identity,
+            sync.RemoteBranchRef(
+                operation.repository, f"refs/heads/{source.pr.head_branch}"
+            ),
+            desired_commit,
+        )
+        for source, desired_commit in zip(
+            sources,
+            (desired_ids[3], desired_ids[4], desired_ids[5], desired_ids[0]),
+            strict=True,
+        )
+    } | {
+        (
+            slot.pr_identity,
+            sync.RemoteBranchRef(
+                operation.repository, f"refs/heads/{slot.branch}"
+            ),
+            slot.commit_id,
+        )
+        for slot in bound.slots
+    }
+
+
+@pytest.mark.parametrize(
+    ("mutation", "code"),
+    (
+        ("mixed", "mixed-stack-membership"),
+        ("foreign", "foreign-desired"),
+        ("incomplete", "incomplete-observation"),
+        ("ambiguous", "ambiguous-boundary"),
+    ),
+)
+def test_standalone_set_resolution_blocks_unproven_associations(
+    mutation: str, code: str
+) -> None:
+    snapshot, _repository, sources, boundaries, _refs, _desired, _old = (
+        standalone_set_planning_case()
+    )
+    candidates = list(sources)
+    commits = boundaries
+    if mutation == "mixed":
+        candidates[1] = dataclasses.replace(
+            candidates[1], stack_id="STACK", stack_base_branch="main"
+        )
+    elif mutation == "foreign":
+        fork = sync.GitHubRepositoryId("github.com", "R_fork")
+        candidates[1] = dataclasses.replace(
+            candidates[1], pr=dataclasses.replace(candidates[1].pr, head_repository=fork)
+        )
+    elif mutation == "incomplete":
+        commits = (*boundaries[:3], *boundaries[4:])
+    else:
+        candidates.append(
+            dataclasses.replace(
+                candidates[0],
+                pr=dataclasses.replace(
+                    candidates[0].pr,
+                    identity=sync.PullRequestId(snapshot.repository, "PR_ambiguous"),
+                    number=99,
+                ),
+            )
+        )
+
+    result = sync.resolve_standalone_membership_boundaries(
+        snapshot.local,
+        snapshot.repository,
+        sources[0].pr.identity,
+        candidates,
+        commits,
+    )
+
+    assert isinstance(result, sync.Blocked)
+    assert result.reasons[0].code == code
+
+
+@pytest.mark.parametrize(
+    ("shape", "code"),
+    (
+        ("branched", "branched-source-graph"),
+        ("multiple-root", "multiple-root-source-graph"),
+        ("disconnected-cycle", "disconnected-source-graph"),
+    ),
+)
+def test_standalone_source_graph_fails_closed(shape: str, code: str) -> None:
+    snapshot, _repository, sources, boundaries, _refs, _desired, old = (
+        standalone_set_planning_case()
+    )
+    candidates = list(sources)
+    if shape == "branched":
+        candidates[2] = dataclasses.replace(
+            candidates[2],
+            pr=dataclasses.replace(
+                candidates[2].pr,
+                base_branch="topic-1",
+                reported_base_commit_id=old[0],
+            ),
+        )
+    elif shape == "multiple-root":
+        candidates[1] = dataclasses.replace(
+            candidates[1],
+            pr=dataclasses.replace(
+                candidates[1].pr,
+                base_branch="other",
+                reported_base_commit_id="f" * 40,
+            ),
+        )
+    else:
+        candidates[2] = dataclasses.replace(
+            candidates[2],
+            pr=dataclasses.replace(
+                candidates[2].pr,
+                base_branch="topic-4",
+                reported_base_commit_id=old[3],
+            ),
+        )
+
+    result = sync.resolve_standalone_membership_boundaries(
+        snapshot.local,
+        snapshot.repository,
+        sources[0].pr.identity,
+        candidates,
+        boundaries,
+    )
+
+    assert isinstance(result, sync.Blocked)
+    assert result.reasons[0].code == code
+
+
+def test_standalone_set_membership_repair_revalidates_without_unstack(monkeypatch) -> None:
+    operation = membership_operation()
+    source = sync.StandalonePullRequestSet(
+        tuple(pr.identity for pr in operation.source_prs)
+    )
+    operation = dataclasses.replace(
+        operation,
+        source_membership=source,
+        source_tracked=None,
+        phase=sync.MembershipRepairPhase.UNSTACKING_SOURCE,
+        slots=(
+            dataclasses.replace(
+                operation.slots[0],
+                phase=sync.NewPRPhase.VERIFIED,
+                pr_identity=sync.PullRequestId(operation.repository, "PR_new"),
+                pr_number=9,
+            ),
+        ),
+    )
+    repository = sync.GitHubRepository(
+        operation.repository, operation.repository_name, "https://github.com/owner/repo", "main"
+    )
+    monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
+    monkeypatch.setattr(sync, "read_operation", lambda _workspace: ("operation-oid", operation))
+    monkeypatch.setattr(sync, "_frozen_repository", lambda *_args, **_kwargs: repository)
+    monkeypatch.setattr(sync, "read_ref_oid", lambda *_args: operation.expected_state_oid)
+    monkeypatch.setattr(sync, "_membership_source_refs_error", lambda *_args: None)
+    monkeypatch.setattr(
+        sync,
+        "_observe_topology_pr",
+        lambda _repository, pr, **_kwargs: sync.GitHubPullRequestSource(pr, None, None),
+    )
+    monkeypatch.setattr(
+        sync, "run_stack_unstack", lambda *_args: pytest.fail("unstack requested")
+    )
+    monkeypatch.setattr(sync, "cas_write_membership_repair", lambda *_args: "operation-oid")
+    monkeypatch.setattr(
+        sync,
+        "_membership_projection",
+        lambda *_args: (_ for _ in ()).throw(sync.Error("stop after association check")),
+    )
+
+    result = sync.resume_membership_repair("/repo")
+
+    assert isinstance(result, sync.Stopped)
+    assert result.stage == sync.MembershipRepairPhase.TRANSITIONING_BASES
+
+
 @pytest.mark.parametrize("count", (2, 3))
 def test_multi_pr_planner_aggregates_complete_unchanged_topology(count: int) -> None:
     observed, selected = stacked_snapshot(count=count)
