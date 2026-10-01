@@ -629,7 +629,15 @@ class MatchesLastAdoption:
     adoption: LastAdoptedHead
 
 
-Authority = FastForward | MatchesLastPublication | MatchesLastAdoption
+@dataclass(frozen=True)
+class BootstrapLocalWins:
+    """One-operation authority for one exact pre-tool remote-to-local replacement."""
+
+    expected_old_commit_id: str
+    new_commit_id: str
+
+
+Authority = FastForward | MatchesLastPublication | MatchesLastAdoption | BootstrapLocalWins
 
 
 @dataclass(frozen=True)
@@ -3056,7 +3064,11 @@ def topology_repair_to_json(operation: TopologyRepair) -> str:
             else (
                 "last-publication"
                 if isinstance(update.authority, MatchesLastPublication)
-                else "last-adoption"
+                else (
+                    "last-adoption"
+                    if isinstance(update.authority, MatchesLastAdoption)
+                    else "bootstrap-local-wins"
+                )
             )
         )
     return (
@@ -3182,6 +3194,15 @@ def _validate_topology_repair(operation: TopologyRepair) -> None:
         or len({update.ref for update in plan.head_updates}) != len(plan.head_updates)
     ):
         raise ValueError("topology repair repository and remote must be frozen")
+    if any(
+        isinstance(update.authority, BootstrapLocalWins)
+        and (
+            update.authority.expected_old_commit_id != update.expected_old_commit_id
+            or update.authority.new_commit_id != update.new_commit_id
+        )
+        for update in plan.head_updates
+    ):
+        raise ValueError("bootstrap authority must match its exact frozen replacement")
     committing = operation.phase is TopologyRepairPhase.COMMITTING
     if committing != (
         operation.final_state_json is not None and operation.final_state_oid is not None
@@ -3317,6 +3338,16 @@ def parse_topology_repair(data: str) -> TopologyRepair:
         if kind == "fast-forward":
             record(raw, set(), "fast-forward authority")
             return FastForward()
+        if kind == "bootstrap-local-wins":
+            item = record(
+                raw,
+                {"expected_old_commit_id", "new_commit_id"},
+                "bootstrap authority",
+            )
+            return BootstrapLocalWins(
+                text(item["expected_old_commit_id"], "bootstrap old OID"),
+                text(item["new_commit_id"], "bootstrap new OID"),
+            )
         field = "publication" if kind == "last-publication" else "adoption"
         item = record(raw, {field}, "receipt authority")[field]
         if kind == "last-publication":
@@ -4932,6 +4963,8 @@ def _plan_head_update(
     state: TrackedState,
     wanted: DesiredExistingPR,
     head: LiveRemoteRef,
+    *,
+    allow_bootstrap: bool = False,
 ) -> tuple[PlannedHeadUpdate, ...] | Blocked:
     assert head.commit_id is not None
     if wanted.desired_commit_id == head.commit_id:
@@ -4961,12 +4994,17 @@ def _plan_head_update(
             and item.verified_commit_id == head.commit_id
         )
         if len(adoptions) != 1:
-            return _block(
-                "replacement-unauthorized",
-                head.ref.full_name,
-                "live head is neither an ancestor nor one unambiguous verified authority",
+            if not allow_bootstrap:
+                return _block(
+                    "replacement-unauthorized",
+                    head.ref.full_name,
+                    "live head is neither an ancestor nor one unambiguous verified authority",
+                )
+            authority: Authority = BootstrapLocalWins(
+                head.commit_id, wanted.desired_commit_id
             )
-        authority: Authority = MatchesLastAdoption(adoptions[0])
+        else:
+            authority = MatchesLastAdoption(adoptions[0])
     else:
         authority = MatchesLastPublication(publications[0])
     return (
