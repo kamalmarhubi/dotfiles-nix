@@ -11376,10 +11376,10 @@ def render_explicit(value: ExplicitPlan | ExplicitResult) -> str:
     if isinstance(value, PreservedPrefixRepair):
         plan = value.plan
         lines = [
-            f"preserved-prefix repair at {value.phase.value}:\n"
-            f"  - retain {len(plan.merged_prefix)} merged PR(s) in stack #{plan.stack.identity.number}\n"
-            f"  - atomically advance {plan.boundary.ref.full_name} to {plan.integration.commit_id}\n"
-            f"  - relink {len(plan.carrier.desired.active)} open PR(s) to the same stack"
+            f"preserved-prefix repair at {value.phase.value}:",
+            f"  - retain {len(plan.merged_prefix)} merged PR(s) in stack #{plan.stack.identity.number}",
+            f"  - atomically advance {plan.boundary.ref.full_name} to {plan.integration.commit_id}",
+            f"  - relink {len(plan.carrier.desired.active)} open PR(s) to the same stack",
         ]
         local_wins_replacements = tuple(
             update

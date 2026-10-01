@@ -1916,6 +1916,9 @@ def test_explicit_merged_prefix_requires_force_for_unrecognized_live_heads(
         live_refs=live_refs,
     )
     monkeypatch.setattr(sync, "observe_local", lambda *_args, **_kwargs: local)
+    monkeypatch.setattr(
+        sync, "observe_commits", lambda *_args, **_kwargs: local.commits
+    )
     monkeypatch.setattr(sync, "observe_snapshot", lambda *_args, **_kwargs: observed)
     monkeypatch.setattr(
         sync, "observe_commits", lambda *_args, **_kwargs: local.commits
@@ -2080,6 +2083,9 @@ def test_explicit_completed_stack_routes_new_suffix_to_append(monkeypatch) -> No
     server.seed_repository(repository, aliases=(observed.push_url,))
     client = FakeGitHubClient(server)
     monkeypatch.setattr(sync, "observe_local", lambda *_args, **_kwargs: local)
+    monkeypatch.setattr(
+        sync, "observe_commits", lambda *_args, **_kwargs: local.commits
+    )
     monkeypatch.setattr(sync, "observe_snapshot", lambda *_args, **_kwargs: observed)
     monkeypatch.setattr(sync, "observe_commits", lambda *_args, **_kwargs: (new_commit,))
     monkeypatch.setattr(sync, "resolve_push_url", lambda *_args: observed.push_url)
