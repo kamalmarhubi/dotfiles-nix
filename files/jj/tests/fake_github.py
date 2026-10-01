@@ -19,6 +19,7 @@ class FakeGitHubServer:
         self._stacks: dict[sync.GitHubStackId, sync.GitHubStack] = {}
         self._branches: dict[tuple[sync.GitHubRepositoryId, str], str] = {}
         self._next_pull_request: dict[sync.GitHubRepositoryId, int] = {}
+        self._next_stack: dict[sync.GitHubRepositoryId, int] = {}
 
     def seed_repository(
         self, repository: sync.GitHubRepository, *, aliases: Sequence[str] = ()
@@ -32,6 +33,7 @@ class FakeGitHubServer:
         for locator in locators:
             self._locators[locator] = repository.identity
         self._next_pull_request[repository.identity] = 1
+        self._next_stack[repository.identity] = 1
 
     def seed_pull_request(self, pull_request: sync.GitHubPullRequest) -> None:
         if pull_request.identity.repository not in self._repositories:
@@ -79,6 +81,9 @@ class FakeGitHubServer:
         if existing.intersection(stack.pull_requests):
             raise ValueError("pull request already belongs to another stack")
         self._stacks[stack.identity] = stack
+        self._next_stack[stack.identity.repository] = max(
+            self._next_stack[stack.identity.repository], stack.identity.number + 1
+        )
 
     def snapshot(self) -> FakeGitHubServer:
         frozen = FakeGitHubServer()
@@ -88,6 +93,7 @@ class FakeGitHubServer:
         frozen._stacks = self._stacks.copy()
         frozen._branches = self._branches.copy()
         frozen._next_pull_request = self._next_pull_request.copy()
+        frozen._next_stack = self._next_stack.copy()
         return frozen
 
     def read_repository(
@@ -201,6 +207,89 @@ class FakeGitHubServer:
         )
         return identity
 
+    def apply_create_stack(
+        self,
+        repository: sync.GitHubRepository,
+        *,
+        pull_requests: Sequence[sync.PullRequestId],
+    ) -> sync.GitHubStackSummary:
+        identities = tuple(pull_requests)
+        self._validate_stack_members(repository, identities)
+        if any(
+            set(stack.pull_requests).intersection(identities)
+            for stack in self._stacks.values()
+        ):
+            raise ValueError("pull request already belongs to a stack")
+        number = self._next_stack[repository.identity]
+        self._next_stack[repository.identity] += 1
+        identity = sync.GitHubStackId(repository.identity, number)
+        stack = sync.GitHubStack(
+            identity,
+            f"STACK_{repository.identity.node_id}_{number}",
+            self._pull_requests[identities[0]].base_branch,
+            identities,
+        )
+        self._stacks[identity] = stack
+        return sync.GitHubStackSummary(
+            identity, stack.node_id, stack.base_branch
+        )
+
+    def apply_add_stack_members(
+        self,
+        repository: sync.GitHubRepository,
+        identity: sync.GitHubStackId,
+        *,
+        pull_requests: Sequence[sync.PullRequestId],
+    ) -> sync.GitHubStackSummary:
+        if identity.repository != repository.identity:
+            raise ValueError("stack identity belongs to another repository")
+        additions = tuple(pull_requests)
+        self._validate_stack_members(repository, additions)
+        stack = self._stacks.get(identity)
+        if stack is None:
+            raise sync.IncompleteSource("pull request stack is unavailable")
+        if set(stack.pull_requests).intersection(additions):
+            raise ValueError("stack additions must be new members")
+        if any(
+            set(candidate.pull_requests).intersection(additions)
+            for candidate_identity, candidate in self._stacks.items()
+            if candidate_identity != identity
+        ):
+            raise ValueError("pull request already belongs to another stack")
+        updated = dataclasses.replace(
+            stack, pull_requests=stack.pull_requests + additions
+        )
+        self._stacks[identity] = updated
+        return sync.GitHubStackSummary(
+            identity, updated.node_id, updated.base_branch
+        )
+
+    def apply_unstack(
+        self,
+        repository: sync.GitHubRepository,
+        identity: sync.GitHubStackId,
+    ) -> sync.GitHubStackSummary | None:
+        if identity.repository != repository.identity:
+            raise ValueError("stack identity belongs to another repository")
+        if identity not in self._stacks:
+            raise sync.IncompleteSource("pull request stack is unavailable")
+        del self._stacks[identity]
+        return None
+
+    def _validate_stack_members(
+        self,
+        repository: sync.GitHubRepository,
+        pull_requests: tuple[sync.PullRequestId, ...],
+    ) -> None:
+        if not pull_requests or len(set(pull_requests)) != len(pull_requests):
+            raise ValueError("stack pull requests must be nonempty and unique")
+        if any(
+            identity.repository != repository.identity
+            or identity not in self._pull_requests
+            for identity in pull_requests
+        ):
+            raise ValueError("stack pull requests must be seeded in the repository")
+
     def apply_update_pull_request(
         self,
         repository: sync.GitHubRepository,
@@ -259,6 +348,25 @@ class FakeGitHubServer:
 
     def merge_pull_request(self, identity: sync.PullRequestId) -> None:
         self._set_state(identity, sync.PullRequestState.MERGED)
+
+    def replace_stack_members(
+        self,
+        identity: sync.GitHubStackId,
+        pull_requests: Sequence[sync.PullRequestId],
+    ) -> None:
+        stack = self._stacks.get(identity)
+        if stack is None:
+            raise sync.IncompleteSource("pull request stack is unavailable")
+        members = tuple(pull_requests)
+        repository = self._repositories[identity.repository]
+        self._validate_stack_members(repository, members)
+        if any(
+            set(candidate.pull_requests).intersection(members)
+            for candidate_identity, candidate in self._stacks.items()
+            if candidate_identity != identity
+        ):
+            raise ValueError("pull request already belongs to another stack")
+        self._stacks[identity] = dataclasses.replace(stack, pull_requests=members)
 
     def _pull_request(
         self, identity: sync.PullRequestId
@@ -322,6 +430,9 @@ class FakeGitHubClient:
     _MUTATIONS = {
         sync.GitHubClient.create_pull_request,
         sync.GitHubClient.update_pull_request,
+        sync.GitHubClient.create_stack,
+        sync.GitHubClient.add_stack_members,
+        sync.GitHubClient.unstack,
     }
 
     def __init__(self, server: FakeGitHubServer) -> None:
@@ -499,4 +610,46 @@ class FakeGitHubClient:
                 base_branch=base_branch,
                 state=state,
             ),
+        )
+
+    def create_stack(
+        self,
+        repository: sync.GitHubRepository,
+        *,
+        pull_requests: Sequence[sync.PullRequestId],
+    ) -> sync.GitHubStackSummary:
+        identities = tuple(pull_requests)
+        return self._mutation(
+            sync.GitHubClient.create_stack,
+            None,
+            lambda: self._server.apply_create_stack(
+                repository, pull_requests=identities
+            ),
+        )
+
+    def add_stack_members(
+        self,
+        repository: sync.GitHubRepository,
+        identity: sync.GitHubStackId,
+        *,
+        pull_requests: Sequence[sync.PullRequestId],
+    ) -> sync.GitHubStackSummary:
+        identities = tuple(pull_requests)
+        return self._mutation(
+            sync.GitHubClient.add_stack_members,
+            None,
+            lambda: self._server.apply_add_stack_members(
+                repository, identity, pull_requests=identities
+            ),
+        )
+
+    def unstack(
+        self,
+        repository: sync.GitHubRepository,
+        identity: sync.GitHubStackId,
+    ) -> sync.GitHubStackSummary | None:
+        return self._mutation(
+            sync.GitHubClient.unstack,
+            None,
+            lambda: self._server.apply_unstack(repository, identity),
         )

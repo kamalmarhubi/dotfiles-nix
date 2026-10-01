@@ -698,6 +698,73 @@ def test_github_routing_accepts_canonical_ssh_aliases_only(monkeypatch) -> None:
         sync._github_repository_locator("https://github.example.com/owner/repo.git")
 
 
+def test_github_api_stack_mutations_send_exact_frozen_rest_requests(monkeypatch) -> None:
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    first = sync.PullRequestId(repository.identity, 1)
+    second = sync.PullRequestId(repository.identity, 2)
+    stack = sync.GitHubStackId(repository.identity, 7)
+    calls = []
+
+    def request(host, method, path, *, body=None, cwd=None):
+        calls.append((host, method, path, body, cwd))
+        if path.endswith("/unstack"):
+            return sync.GitHubHttpResponse(204, (), b"")
+        number = 1 if path.endswith("/stacks") else 7
+        return sync.GitHubHttpResponse(
+            200,
+            (),
+            json.dumps(
+                {
+                    "number": number,
+                    "node_id": f"STACK_{number}",
+                    "base": {"ref": "main"},
+                }
+            ).encode(),
+        )
+
+    monkeypatch.setattr(sync, "github_http_request", request)
+    api = sync.GitHubAPI(workspace="/workspace")
+
+    assert api.create_stack(
+        repository, pull_requests=(first, second)
+    ) == sync.GitHubStackSummary(
+        sync.GitHubStackId(repository.identity, 1), "STACK_1", "main"
+    )
+    assert api.add_stack_members(
+        repository, stack, pull_requests=(second,)
+    ) == sync.GitHubStackSummary(stack, "STACK_7", "main")
+    assert api.unstack(repository, stack) is None
+
+    assert calls == [
+        (
+            "github.com",
+            "POST",
+            "/repos/owner/repo/stacks",
+            b'{"pull_requests":[1,2]}',
+            Path("/workspace"),
+        ),
+        (
+            "github.com",
+            "POST",
+            "/repos/owner/repo/stacks/7/add",
+            b'{"pull_requests":[2]}',
+            Path("/workspace"),
+        ),
+        (
+            "github.com",
+            "POST",
+            "/repos/owner/repo/stacks/7/unstack",
+            None,
+            Path("/workspace"),
+        ),
+    ]
+
+
 def test_github_transport_rejects_errors_partial_data_and_repository_mismatch(
     monkeypatch,
 ) -> None:

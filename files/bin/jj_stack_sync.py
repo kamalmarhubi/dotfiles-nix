@@ -313,6 +313,25 @@ class GitHubClient(Protocol):
         draft: bool,
     ) -> PullRequestId: ...
 
+    def create_stack(
+        self,
+        repository: GitHubRepository,
+        *,
+        pull_requests: Sequence[PullRequestId],
+    ) -> GitHubStackSummary: ...
+
+    def add_stack_members(
+        self,
+        repository: GitHubRepository,
+        identity: GitHubStackId,
+        *,
+        pull_requests: Sequence[PullRequestId],
+    ) -> GitHubStackSummary: ...
+
+    def unstack(
+        self, repository: GitHubRepository, identity: GitHubStackId
+    ) -> GitHubStackSummary | None: ...
+
     def update_pull_request(
         self,
         repository: GitHubRepository,
@@ -663,6 +682,43 @@ class FirstPublicationVerified:
     ordered_prs: tuple[PullRequestId, ...]
 
 
+class GitHubEffectPhase(StrEnum):
+    NOT_ATTEMPTED = "not-attempted"
+    POSSIBLY_SENT = "possibly-sent"
+    VERIFIED = "verified"
+
+
+@dataclass(frozen=True)
+class PullRequestBaseEffect:
+    repository: GitHubRepositoryId
+    repository_name: str
+    pr_identity: PullRequestId
+    expected_base: str
+    desired_base: str
+    phase: GitHubEffectPhase = GitHubEffectPhase.NOT_ATTEMPTED
+
+
+class StackEffectKind(StrEnum):
+    CREATE = "create"
+    ADD = "add"
+    UNSTACK = "unstack"
+
+
+@dataclass(frozen=True)
+class StackEffect:
+    kind: StackEffectKind
+    repository: GitHubRepositoryId
+    repository_name: str
+    expected_before: tuple[PullRequestId, ...]
+    desired_after: tuple[PullRequestId, ...]
+    stack: GitHubStackId | None = None
+    phase: GitHubEffectPhase = GitHubEffectPhase.NOT_ATTEMPTED
+    resulting_stack: GitHubStackSummary | None = None
+
+
+GitHubEffect = PullRequestBaseEffect | StackEffect
+
+
 @dataclass(frozen=True)
 class PlannedHeadUpdate:
     ref: RemoteBranchRef
@@ -931,6 +987,46 @@ def _github_graphql(
     if not isinstance(value, dict) or "errors" in value:
         raise MalformedSource("GitHub GraphQL response contains errors or is malformed")
     return value
+
+
+def send_github_effect(
+    effect: GitHubEffect, github: GitHubClient
+) -> GitHubStackSummary | None:
+    """Send one already-journaled effect exactly once; callers own reconciliation."""
+    if effect.phase is not GitHubEffectPhase.POSSIBLY_SENT:
+        raise ValueError("GitHub effect must be journaled as possibly-sent before I/O")
+    repository = github.resolve_repository(effect.repository)
+    if isinstance(effect, PullRequestBaseEffect):
+        if effect.pr_identity.repository != effect.repository:
+            raise ValueError("pull request effect belongs to another repository")
+        github.update_pull_request(
+            repository, effect.pr_identity, base_branch=effect.desired_base
+        )
+        return None
+    if effect.kind is StackEffectKind.CREATE:
+        if effect.stack is not None:
+            raise ValueError("stack creation cannot freeze an existing stack")
+        return github.create_stack(
+            repository, pull_requests=effect.desired_after
+        )
+    if effect.stack is None or effect.stack.repository != effect.repository:
+        raise ValueError("stack mutation requires the frozen stack identity")
+    if effect.kind is StackEffectKind.ADD:
+        additions = tuple(
+            pr for pr in effect.desired_after if pr not in effect.expected_before
+        )
+        return github.add_stack_members(
+            repository, effect.stack, pull_requests=additions
+        )
+    return github.unstack(repository, effect.stack)
+
+
+def github_effect_to_record(effect: GitHubEffect) -> dict[str, object]:
+    record = asdict(effect)
+    record["effect_kind"] = (
+        "pull-request-base" if isinstance(effect, PullRequestBaseEffect) else "stack"
+    )
+    return record
 
 
 def _exact_record(value: object, fields: set[str], context: str) -> dict[str, object]:
@@ -1256,6 +1352,40 @@ def _parse_github_stack(
     )
 
 
+def _parse_stack_summary(
+    value: object,
+    repository: GitHubRepositoryId,
+    expected: GitHubStackId | None = None,
+) -> GitHubStackSummary:
+    if not isinstance(value, dict):
+        raise MalformedSource("stack mutation response must be an object")
+    number = value.get("number")
+    if type(number) is not int or number <= 0:
+        raise MalformedSource("stack mutation number must be a positive integer")
+    identity = GitHubStackId(repository, number)
+    if expected is not None and identity != expected:
+        raise SourceMismatch("stack mutation returned a different stack")
+    base = value.get("base")
+    if not isinstance(base, dict):
+        raise MalformedSource("stack mutation base is malformed")
+    return GitHubStackSummary(
+        identity,
+        _text(value.get("node_id"), "stack mutation node ID"),
+        _text(base.get("ref"), "stack mutation base branch"),
+    )
+
+
+def _stack_pull_request_numbers(
+    repository: GitHubRepository, pull_requests: Sequence[PullRequestId]
+) -> list[int]:
+    identities = tuple(pull_requests)
+    if not identities or len(set(identities)) != len(identities):
+        raise ValueError("stack pull requests must be nonempty and unique")
+    if any(identity.repository != repository.identity for identity in identities):
+        raise ValueError("stack pull request belongs to another repository")
+    return [identity.number for identity in identities]
+
+
 class GitHubAPI:
     def __init__(self, *, workspace: str | Path) -> None:
         self.workspace = Path(workspace)
@@ -1445,6 +1575,71 @@ class GitHubAPI:
         if raw_repository.get("node_id") != repository.identity.node_id:
             raise SourceMismatch("GitHub created a pull request in another repository")
         return PullRequestId(repository.identity, number)
+
+    def create_stack(
+        self,
+        repository: GitHubRepository,
+        *,
+        pull_requests: Sequence[PullRequestId],
+    ) -> GitHubStackSummary:
+        numbers = _stack_pull_request_numbers(repository, pull_requests)
+        response = github_http_request(
+            repository.identity.host,
+            "POST",
+            f"/{_github_repository_path(repository.name_with_owner)}/stacks",
+            body=json.dumps(
+                {"pull_requests": numbers}, separators=(",", ":")
+            ).encode(),
+            cwd=self.workspace,
+        )
+        return _parse_stack_summary(
+            _github_json_response(response, "create stack response"),
+            repository.identity,
+        )
+
+    def add_stack_members(
+        self,
+        repository: GitHubRepository,
+        identity: GitHubStackId,
+        *,
+        pull_requests: Sequence[PullRequestId],
+    ) -> GitHubStackSummary:
+        if identity.repository != repository.identity:
+            raise ValueError("stack identity belongs to another repository")
+        numbers = _stack_pull_request_numbers(repository, pull_requests)
+        response = github_http_request(
+            repository.identity.host,
+            "POST",
+            f"/{_github_repository_path(repository.name_with_owner)}/stacks/{identity.number}/add",
+            body=json.dumps(
+                {"pull_requests": numbers}, separators=(",", ":")
+            ).encode(),
+            cwd=self.workspace,
+        )
+        return _parse_stack_summary(
+            _github_json_response(response, "add stack members response"),
+            repository.identity,
+            identity,
+        )
+
+    def unstack(
+        self, repository: GitHubRepository, identity: GitHubStackId
+    ) -> GitHubStackSummary | None:
+        if identity.repository != repository.identity:
+            raise ValueError("stack identity belongs to another repository")
+        response = github_http_request(
+            repository.identity.host,
+            "POST",
+            f"/{_github_repository_path(repository.name_with_owner)}/stacks/{identity.number}/unstack",
+            cwd=self.workspace,
+        )
+        if response.status == 204 and not response.body:
+            return None
+        return _parse_stack_summary(
+            _github_json_response(response, "unstack response"),
+            repository.identity,
+            identity,
+        )
 
     def update_pull_request(
         self,
