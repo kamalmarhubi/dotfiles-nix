@@ -637,7 +637,9 @@ class BootstrapLocalWins:
     new_commit_id: str
 
 
-Authority = FastForward | MatchesLastPublication | MatchesLastAdoption | BootstrapLocalWins
+Authority = (
+    FastForward | MatchesLastPublication | MatchesLastAdoption | BootstrapLocalWins
+)
 
 
 @dataclass(frozen=True)
@@ -1359,13 +1361,9 @@ def send_github_effect(
             else None
         )
     body = (
-        None
-        if payload is None
-        else json.dumps(payload, separators=(",", ":")).encode()
+        None if payload is None else json.dumps(payload, separators=(",", ":")).encode()
     )
-    return github_http_request(
-        effect.repository.host, method, path, body=body, cwd=cwd
-    )
+    return github_http_request(effect.repository.host, method, path, body=body, cwd=cwd)
 
 
 def github_effect_to_record(effect: GitHubEffect) -> dict[str, object]:
@@ -2071,7 +2069,9 @@ def observe_snapshot(
     local: LocalObservation | None = None,
 ) -> Snapshot:
     """Assemble complete source facts for one explicitly selected PR's stack."""
-    local = local or observe_local(workspace, revision=revision, config_keys=config_keys)
+    local = local or observe_local(
+        workspace, revision=revision, config_keys=config_keys
+    )
     push_url = resolve_push_url(local, remote)
     fetch_url = resolve_remote_url(local, remote)
     repository = observe_github_repository(push_url, cwd=workspace)
@@ -2330,7 +2330,12 @@ def parse_state(data: str) -> TrackedState:
     try:
         raw = fields(
             record(json.loads(data), "root"),
-            {"stacks", "last_published_heads", "last_adopted_heads", "boundary_aliases"},
+            {
+                "stacks",
+                "last_published_heads",
+                "last_adopted_heads",
+                "boundary_aliases",
+            },
             "root",
         )
         stacks = tuple(
@@ -2599,9 +2604,7 @@ def _parse_detached_pr_state(
     value: object, association: DetachedAssociation, context: str
 ) -> PullRequestState:
     record = _exact_record(value, {"id", "state", "repository"}, context)
-    repository = _exact_record(
-        record["repository"], {"id"}, f"{context} repository"
-    )
+    repository = _exact_record(record["repository"], {"id"}, f"{context} repository")
     if (
         _text(record["id"], f"{context} ID") != association.pr.node_id
         or _text(repository["id"], f"{context} repository ID")
@@ -2614,18 +2617,14 @@ def _parse_detached_pr_state(
         raise MalformedSource("pull request state is unsupported") from exc
 
 
-def _close_detached_pr(
-    workspace: str | Path, association: DetachedAssociation
-) -> None:
+def _close_detached_pr(workspace: str | Path, association: DetachedAssociation) -> None:
     response = _exact_record(
         _detached_pr_graphql(workspace, association, _CLOSE_DETACHED_PR_MUTATION),
         {"data"},
         "close pull request response",
     )
     data = _exact_record(response["data"], {"closePullRequest"}, "close data")
-    closed = _exact_record(
-        data["closePullRequest"], {"pullRequest"}, "close result"
-    )
+    closed = _exact_record(data["closePullRequest"], {"pullRequest"}, "close result")
     _parse_detached_pr_state(closed["pullRequest"], association, "closed pull request")
 
 
@@ -2670,7 +2669,10 @@ def close_detached_association(
             _close_detached_pr(workspace, selected)
         except Error:
             pass
-        if _observe_detached_pr_state(workspace, selected) is not PullRequestState.CLOSED:
+        if (
+            _observe_detached_pr_state(workspace, selected)
+            is not PullRequestState.CLOSED
+        ):
             raise Error("detached pull request is not closed")
         written = cas_write_state(
             workspace, state_oid, _remove_detached_association(state, selected)
@@ -2953,7 +2955,11 @@ def parse_first_publication(data: str) -> FirstPublication:
             number = member["number"]
             draft = member["draft"]
             body = member["body"]
-            if type(number) is not int or type(draft) is not bool or not isinstance(body, str):
+            if (
+                type(number) is not int
+                or type(draft) is not bool
+                or not isinstance(body, str)
+            ):
                 raise ValueError(f"{context} scalar fields are malformed")
             existing_members.append(
                 ExistingFirstPublicationPR(
@@ -3054,7 +3060,9 @@ def topology_repair_to_json(operation: TopologyRepair) -> str:
         encoded_source["source_kind"] = "standalone-set"
     else:
         encoded_source["source_kind"] = (
-            "standalone" if isinstance(source, StandalonePullRequest) else "server-stack"
+            "standalone"
+            if isinstance(source, StandalonePullRequest)
+            else "server-stack"
         )
     for encoded, update in zip(
         payload["plan"]["head_updates"], operation.plan.head_updates, strict=True
@@ -3088,13 +3096,17 @@ def topology_repair_to_json(operation: TopologyRepair) -> str:
 def preserved_prefix_repair_to_json(operation: PreservedPrefixRepair) -> str:
     """Strict durable codec; the carrier reuses only topology's value codec."""
     _validate_preserved_prefix_repair(operation)
-    carrier = json.loads(topology_repair_to_json(TopologyRepair(operation.plan.carrier)))
+    carrier = json.loads(
+        topology_repair_to_json(TopologyRepair(operation.plan.carrier))
+    )
     payload = {
         "operation_kind": "preserved-prefix-repair",
         "carrier": carrier,
         "workspace_targets": operation.plan.workspace_targets,
         "stack": asdict(operation.plan.stack),
-        "merged_prefix": [item.identity.node_id for item in operation.plan.merged_prefix],
+        "merged_prefix": [
+            item.identity.node_id for item in operation.plan.merged_prefix
+        ],
         "integration": asdict(operation.plan.integration),
         "boundary": asdict(operation.plan.boundary),
         "ownership": asdict(operation.plan.ownership),
@@ -3113,20 +3125,31 @@ def _validate_preserved_prefix_repair(operation: PreservedPrefixRepair) -> None:
     source = plan.carrier.source
     if not isinstance(source, ServerStackMembership) or source.stack != plan.stack:
         raise ValueError("preserved-prefix repair requires its exact server stack")
-    if not plan.workspace_targets or len({name for name, _target in plan.workspace_targets}) != len(plan.workspace_targets):
+    if not plan.workspace_targets or len(
+        {name for name, _target in plan.workspace_targets}
+    ) != len(plan.workspace_targets):
         raise ValueError("preserved-prefix repair requires complete workspace targets")
     if not plan.merged_prefix or not plan.carrier.desired.active:
         raise ValueError("preserved-prefix repair requires merged and open members")
-    if tuple(plan.carrier.dependencies.prs[: len(plan.merged_prefix)]) != plan.merged_prefix:
+    if (
+        tuple(plan.carrier.dependencies.prs[: len(plan.merged_prefix)])
+        != plan.merged_prefix
+    ):
         raise ValueError("merged prefix is not the frozen membership prefix")
     if any(item.state is not PullRequestState.MERGED for item in plan.merged_prefix):
         raise ValueError("preserved prefix contains a non-merged PR")
-    if plan.integration.commit_id is None or plan.integration.ref.full_name != f"refs/heads/{plan.carrier.desired.base_branch}":
+    if (
+        plan.integration.commit_id is None
+        or plan.integration.ref.full_name
+        != f"refs/heads/{plan.carrier.desired.base_branch}"
+    ):
         raise ValueError("integration observation is incomplete")
     if plan.boundary.ref != plan.ownership.ref or plan.ownership.stack != plan.stack:
         raise ValueError("boundary ownership does not match the frozen alias")
     committing = operation.phase is PreservedPrefixRepairPhase.COMMITTING
-    if committing != (operation.final_state_json is not None and operation.final_state_oid is not None):
+    if committing != (
+        operation.final_state_json is not None and operation.final_state_oid is not None
+    ):
         raise ValueError("committing preserved-prefix repair must freeze final state")
     if operation.final_state_json is not None:
         parse_state(operation.final_state_json)
@@ -3135,51 +3158,130 @@ def _validate_preserved_prefix_repair(operation: PreservedPrefixRepair) -> None:
 def parse_preserved_prefix_repair(data: str) -> PreservedPrefixRepair:
     try:
         raw = json.loads(data)
-        names = {"operation_kind", "carrier", "workspace_targets", "stack", "merged_prefix", "integration", "boundary", "ownership", "phase", "publication_possibly_sent", "unstack_possibly_sent", "relink_possibly_sent", "final_state_json", "final_state_oid"}
-        if not isinstance(raw, dict) or set(raw) != names or raw["operation_kind"] != "preserved-prefix-repair":
+        names = {
+            "operation_kind",
+            "carrier",
+            "workspace_targets",
+            "stack",
+            "merged_prefix",
+            "integration",
+            "boundary",
+            "ownership",
+            "phase",
+            "publication_possibly_sent",
+            "unstack_possibly_sent",
+            "relink_possibly_sent",
+            "final_state_json",
+            "final_state_oid",
+        }
+        if (
+            not isinstance(raw, dict)
+            or set(raw) != names
+            or raw["operation_kind"] != "preserved-prefix-repair"
+        ):
             raise ValueError("operation has unexpected fields or kind")
         carrier_raw = raw["carrier"]
         if not isinstance(carrier_raw, dict):
             raise ValueError("carrier must be an object")
         carrier = parse_topology_repair(json.dumps(carrier_raw)).plan
         repository = carrier.repository
+
         def exact(value: object, fields: set[str], where: str) -> dict[str, object]:
             if not isinstance(value, dict) or set(value) != fields:
                 raise ValueError(f"{where} has unexpected fields")
             return value
+
         def repo(value: object) -> GitHubRepositoryId:
             item = exact(value, {"host", "node_id"}, "repository")
             if not all(isinstance(item[key], str) and item[key] for key in item):
                 raise ValueError("repository identity is malformed")
             return GitHubRepositoryId(item["host"], item["node_id"])  # type: ignore[arg-type]
+
         def ref(value: object) -> RemoteBranchRef:
             item = exact(value, {"repository", "full_name"}, "ref")
-            if not isinstance(item["full_name"], str): raise ValueError("ref name is malformed")
+            if not isinstance(item["full_name"], str):
+                raise ValueError("ref name is malformed")
             return RemoteBranchRef(repo(item["repository"]), item["full_name"])
+
         def live(value: object) -> LiveRemoteRef:
             item = exact(value, {"ref", "commit_id"}, "live ref")
-            if item["commit_id"] is not None and not isinstance(item["commit_id"], str): raise ValueError("live OID is malformed")
+            if item["commit_id"] is not None and not isinstance(item["commit_id"], str):
+                raise ValueError("live OID is malformed")
             return LiveRemoteRef(ref(item["ref"]), item["commit_id"])  # type: ignore[arg-type]
+
         stack_raw = exact(raw["stack"], {"repository", "node_id", "number"}, "stack")
-        if type(stack_raw["number"]) is not int or not isinstance(stack_raw["node_id"], str): raise ValueError("stack is malformed")
-        stack = ServerStackIdentity(repo(stack_raw["repository"]), stack_raw["node_id"], stack_raw["number"])  # type: ignore[arg-type]
-        own = exact(raw["ownership"], {"stack", "ref", "created", "last_owned_commit_id"}, "ownership")
-        own_stack_raw = exact(own["stack"], {"repository", "node_id", "number"}, "ownership stack")
-        own_stack = ServerStackIdentity(repo(own_stack_raw["repository"]), own_stack_raw["node_id"], own_stack_raw["number"])  # type: ignore[arg-type]
-        if type(own["created"]) is not bool or not isinstance(own["last_owned_commit_id"], str): raise ValueError("ownership is malformed")
-        ownership = BoundaryAliasOwnership(own_stack, ref(own["ref"]), own["created"], own["last_owned_commit_id"])  # type: ignore[arg-type]
+        if type(stack_raw["number"]) is not int or not isinstance(
+            stack_raw["node_id"], str
+        ):
+            raise ValueError("stack is malformed")
+        stack = ServerStackIdentity(
+            repo(stack_raw["repository"]), stack_raw["node_id"], stack_raw["number"]
+        )  # type: ignore[arg-type]
+        own = exact(
+            raw["ownership"],
+            {"stack", "ref", "created", "last_owned_commit_id"},
+            "ownership",
+        )
+        own_stack_raw = exact(
+            own["stack"], {"repository", "node_id", "number"}, "ownership stack"
+        )
+        own_stack = ServerStackIdentity(
+            repo(own_stack_raw["repository"]),
+            own_stack_raw["node_id"],
+            own_stack_raw["number"],
+        )  # type: ignore[arg-type]
+        if type(own["created"]) is not bool or not isinstance(
+            own["last_owned_commit_id"], str
+        ):
+            raise ValueError("ownership is malformed")
+        ownership = BoundaryAliasOwnership(
+            own_stack, ref(own["ref"]), own["created"], own["last_owned_commit_id"]
+        )  # type: ignore[arg-type]
         ids = raw["merged_prefix"]
-        if not isinstance(ids, list) or any(not isinstance(item, str) for item in ids): raise ValueError("merged prefix is malformed")
+        if not isinstance(ids, list) or any(not isinstance(item, str) for item in ids):
+            raise ValueError("merged prefix is malformed")
         by_id = {item.identity.node_id: item for item in carrier.dependencies.prs}
         merged = tuple(by_id[item] for item in ids)
-        booleans = (raw["publication_possibly_sent"], raw["unstack_possibly_sent"], raw["relink_possibly_sent"])
-        if any(type(item) is not bool for item in booleans): raise ValueError("progress markers must be boolean")
-        if raw["final_state_json"] is not None and not isinstance(raw["final_state_json"], str): raise ValueError("final state must be text or null")
-        if raw["final_state_oid"] is not None and not isinstance(raw["final_state_oid"], str): raise ValueError("final OID must be text or null")
+        booleans = (
+            raw["publication_possibly_sent"],
+            raw["unstack_possibly_sent"],
+            raw["relink_possibly_sent"],
+        )
+        if any(type(item) is not bool for item in booleans):
+            raise ValueError("progress markers must be boolean")
+        if raw["final_state_json"] is not None and not isinstance(
+            raw["final_state_json"], str
+        ):
+            raise ValueError("final state must be text or null")
+        if raw["final_state_oid"] is not None and not isinstance(
+            raw["final_state_oid"], str
+        ):
+            raise ValueError("final OID must be text or null")
         workspaces = raw["workspace_targets"]
-        if not isinstance(workspaces, list) or any(not isinstance(item, list) or len(item) != 2 or not all(isinstance(value, str) and value for value in item) for item in workspaces): raise ValueError("workspace targets are malformed")
-        operation = PreservedPrefixRepair(PreservedPrefixPlan(carrier, tuple(tuple(item) for item in workspaces), stack, merged, live(raw["integration"]), live(raw["boundary"]), ownership), PreservedPrefixRepairPhase(raw["phase"]), *booleans, raw["final_state_json"], raw["final_state_oid"])
-        if repository != stack.repository: raise ValueError("stack repository differs")
+        if not isinstance(workspaces, list) or any(
+            not isinstance(item, list)
+            or len(item) != 2
+            or not all(isinstance(value, str) and value for value in item)
+            for item in workspaces
+        ):
+            raise ValueError("workspace targets are malformed")
+        operation = PreservedPrefixRepair(
+            PreservedPrefixPlan(
+                carrier,
+                tuple(tuple(item) for item in workspaces),
+                stack,
+                merged,
+                live(raw["integration"]),
+                live(raw["boundary"]),
+                ownership,
+            ),
+            PreservedPrefixRepairPhase(raw["phase"]),
+            *booleans,
+            raw["final_state_json"],
+            raw["final_state_oid"],
+        )
+        if repository != stack.repository:
+            raise ValueError("stack repository differs")
         _validate_preserved_prefix_repair(operation)
         return operation
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -3597,28 +3699,30 @@ def _validate_membership_repair(operation: MembershipRepair) -> None:
         or set(desired_slots) != set(slot_ids)
         or len(desired_slots) != len(slot_ids)
     ):
-        raise ValueError("membership repair desired membership does not match source and slots")
+        raise ValueError(
+            "membership repair desired membership does not match source and slots"
+        )
     slot_by_id = {slot.slot_id: slot for slot in operation.slots}
     pr_by_id = {pr.identity: pr for pr in operation.source_prs}
     previous_branch = operation.base_branch
-    previous_commit: str | None = None
     for item in operation.desired:
         if isinstance(item, ExistingMembershipEntry):
             pr = pr_by_id[item.pr_identity]
             previous_branch = pr.head_branch
-            updates = tuple(
-                update for update in operation.head_updates
-                if update.ref.full_name == f"refs/heads/{pr.head_branch}"
-            )
-            previous_commit = updates[0].new_commit_id if updates else pr.reported_head_commit_id
         else:
             slot = slot_by_id[item.slot_id]
             if slot.base_branch != previous_branch:
-                raise ValueError("membership repair slot predecessor is not frozen exactly")
-            previous_branch, previous_commit = slot.branch, slot.commit_id
+                raise ValueError(
+                    "membership repair slot predecessor is not frozen exactly"
+                )
+            previous_branch = slot.branch
     metadata_ids = tuple(item.pr_identity for item in operation.metadata_updates)
-    if len(set(metadata_ids)) != len(metadata_ids) or any(identity not in existing for identity in metadata_ids):
-        raise ValueError("membership repair metadata updates are not desired existing PRs")
+    if len(set(metadata_ids)) != len(metadata_ids) or any(
+        identity not in existing for identity in metadata_ids
+    ):
+        raise ValueError(
+            "membership repair metadata updates are not desired existing PRs"
+        )
     refs = tuple(update.ref for update in operation.head_updates)
     temporary_refs = tuple(item.ref for item in operation.temporary_bases)
     if (
@@ -3628,19 +3732,27 @@ def _validate_membership_repair(operation: MembershipRepair) -> None:
         or len({item.pr_identity for item in operation.temporary_bases})
         != len(operation.temporary_bases)
     ):
-        raise ValueError("membership repair refs and temporary resources must be unique")
+        raise ValueError(
+            "membership repair refs and temporary resources must be unique"
+        )
     phase_order = list(MembershipRepairPhase)
     phase_index = phase_order.index(operation.phase)
     slot_phases = {slot.phase for slot in operation.slots}
-    if operation.slots and operation.phase is MembershipRepairPhase.PREPARING_BOOKMARKS and slot_phases != {
-        NewPRPhase.NOT_ATTEMPTED
-    }:
+    if (
+        operation.slots
+        and operation.phase is MembershipRepairPhase.PREPARING_BOOKMARKS
+        and slot_phases != {NewPRPhase.NOT_ATTEMPTED}
+    ):
         raise ValueError("bookmark preparation has incompatible slot progress")
-    if operation.phase is MembershipRepairPhase.PUBLISHING_NEW_REFS and not slot_phases <= {
-        NewPRPhase.NOT_ATTEMPTED,
-        NewPRPhase.PUBLICATION_POSSIBLY_SENT,
-        NewPRPhase.READY,
-    }:
+    if (
+        operation.phase is MembershipRepairPhase.PUBLISHING_NEW_REFS
+        and not slot_phases
+        <= {
+            NewPRPhase.NOT_ATTEMPTED,
+            NewPRPhase.PUBLICATION_POSSIBLY_SENT,
+            NewPRPhase.READY,
+        }
+    ):
         raise ValueError("new-ref publication has incompatible slot progress")
     if operation.phase is MembershipRepairPhase.CREATING_PRS and not slot_phases <= {
         NewPRPhase.READY,
@@ -3727,13 +3839,25 @@ def membership_repair_to_json(operation: MembershipRepair) -> str:
         else {"entry_kind": "new", "slot_id": item.slot_id}
         for item in operation.desired
     ]
-    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=lambda value: value.value if isinstance(value, Enum) else TypeError()) + "\n"
+    return (
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=lambda value: value.value
+            if isinstance(value, Enum)
+            else TypeError(),
+        )
+        + "\n"
+    )
 
 
 def parse_membership_repair(data: str) -> MembershipRepair:
     try:
         raw = json.loads(data)
-        names = {field.name for field in dataclasses.fields(MembershipRepair)} | {"operation_kind"}
+        names = {field.name for field in dataclasses.fields(MembershipRepair)} | {
+            "operation_kind"
+        }
         if not isinstance(raw, dict) or set(raw) != names:
             raise ValueError("operation has unexpected fields")
         if raw["operation_kind"] != "membership-repair":
@@ -3748,22 +3872,35 @@ def parse_membership_repair(data: str) -> MembershipRepair:
                 "repository": raw["repository"],
                 "repository_name": raw["repository_name"],
                 "remote": raw["remote"],
-                "desired": {"repository": raw["repository"], "base_branch": raw["base_branch"], "active": []},
+                "desired": {
+                    "repository": raw["repository"],
+                    "base_branch": raw["base_branch"],
+                    "active": [],
+                },
                 "detached_prs": raw["base_transitions_possibly_sent"],
                 "head_updates": raw["head_updates"],
                 "temporary_bases": raw["temporary_bases"],
                 "tracking_update": raw["source_tracked"],
                 "dependencies": {
-                    "effective_config": raw["effective_config"], "push_url": raw["push_url"],
-                    "state_blob_oid": raw["expected_state_oid"], "operation_blob_oid": None,
-                    "prs": raw["source_prs"], "source": raw["source_membership"],
-                    "live_heads": [{"ref": item, "commit_id": None} for item in raw["publication_possibly_sent"]],
+                    "effective_config": raw["effective_config"],
+                    "push_url": raw["push_url"],
+                    "state_blob_oid": raw["expected_state_oid"],
+                    "operation_blob_oid": None,
+                    "prs": raw["source_prs"],
+                    "source": raw["source_membership"],
+                    "live_heads": [
+                        {"ref": item, "commit_id": None}
+                        for item in raw["publication_possibly_sent"]
+                    ],
                     "live_bases": [],
                 },
             },
-            "phase": "creating-temporary-bases", "unstack_possibly_sent": False,
-            "temporary_bases_possibly_sent": [], "relink_possibly_sent": False,
-            "final_state_json": None, "final_state_oid": None,
+            "phase": "creating-temporary-bases",
+            "unstack_possibly_sent": False,
+            "temporary_bases_possibly_sent": [],
+            "relink_possibly_sent": False,
+            "final_state_json": None,
+            "final_state_oid": None,
         }
         parsed = parse_topology_repair(json.dumps(carrier)).plan
         desired: list[DesiredMembershipEntry] = []
@@ -3777,7 +3914,12 @@ def parse_membership_repair(data: str) -> MembershipRepair:
                 probe["plan"]["detached_prs"] = [item["pr_identity"]]
                 identity = parse_topology_repair(json.dumps(probe)).plan.detached_prs[0]
                 desired.append(ExistingMembershipEntry(identity))
-            elif kind == "new" and set(item) == {"entry_kind", "slot_id"} and isinstance(item["slot_id"], str) and item["slot_id"]:
+            elif (
+                kind == "new"
+                and set(item) == {"entry_kind", "slot_id"}
+                and isinstance(item["slot_id"], str)
+                and item["slot_id"]
+            ):
                 desired.append(NewMembershipEntry(item["slot_id"]))
             else:
                 raise ValueError("desired entry has unexpected fields")
@@ -3792,47 +3934,132 @@ def parse_membership_repair(data: str) -> MembershipRepair:
             parsed_identity = None
             if identity is not None:
                 probe["plan"]["detached_prs"] = [identity]
-                parsed_identity = parse_topology_repair(json.dumps(probe)).plan.detached_prs[0]
+                parsed_identity = parse_topology_repair(
+                    json.dumps(probe)
+                ).plan.detached_prs[0]
             number = item["pr_number"]
             if number is not None and type(number) is not int:
                 raise ValueError("slot PR number must be integer or null")
             scalar_names = ("slot_id", "branch", "commit_id", "base_branch", "title")
-            if any(not isinstance(item[name], str) or not item[name] for name in scalar_names) or not isinstance(item["body"], str):
+            if any(
+                not isinstance(item[name], str) or not item[name]
+                for name in scalar_names
+            ) or not isinstance(item["body"], str):
                 raise ValueError("slot scalar fields are malformed")
-            slots.append(NewPRSlot(item["slot_id"], item["branch"], item["commit_id"], BookmarkSetup(item["bookmark_setup"]), item["base_branch"], item["title"], item["body"], NewPRPhase(item["phase"]), parsed_identity, number))
+            slots.append(
+                NewPRSlot(
+                    item["slot_id"],
+                    item["branch"],
+                    item["commit_id"],
+                    BookmarkSetup(item["bookmark_setup"]),
+                    item["base_branch"],
+                    item["title"],
+                    item["body"],
+                    NewPRPhase(item["phase"]),
+                    parsed_identity,
+                    number,
+                )
+            )
         stack = raw["resulting_stack"]
         resulting = None
         if stack is not None:
-            if not isinstance(stack, dict) or set(stack) != {"repository", "node_id", "number"} or type(stack["number"]) is not int:
+            if (
+                not isinstance(stack, dict)
+                or set(stack) != {"repository", "node_id", "number"}
+                or type(stack["number"]) is not int
+            ):
                 raise ValueError("resulting stack is malformed")
-            probe = dict(carrier); probe["plan"] = dict(carrier["plan"]); probe["plan"]["dependencies"] = dict(carrier["plan"]["dependencies"])
-            source = {"source_kind": "server-stack", "selected_pr": raw["source_prs"][0]["identity"], "stack": stack, "base_branch": raw["base_branch"], "ordered_prs": [raw["source_prs"][0]["identity"]]}
+            probe = dict(carrier)
+            probe["plan"] = dict(carrier["plan"])
+            probe["plan"]["dependencies"] = dict(carrier["plan"]["dependencies"])
+            source = {
+                "source_kind": "server-stack",
+                "selected_pr": raw["source_prs"][0]["identity"],
+                "stack": stack,
+                "base_branch": raw["base_branch"],
+                "ordered_prs": [raw["source_prs"][0]["identity"]],
+            }
             probe["plan"]["dependencies"]["source"] = source
             resulting = parse_topology_repair(json.dumps(probe)).plan.source.stack  # type: ignore[union-attr]
         final_json, final_oid = raw["final_state_json"], raw["final_state_oid"]
-        if (final_json is not None and not isinstance(final_json, str)) or (final_oid is not None and not isinstance(final_oid, str)):
+        if (final_json is not None and not isinstance(final_json, str)) or (
+            final_oid is not None and not isinstance(final_oid, str)
+        ):
             raise ValueError("final state fields must be text or null")
         # Decode metadata identities through the already strict desired identity decoder.
-        metadata_by_id = {item.pr_identity.node_id: item.pr_identity for item in desired if isinstance(item, ExistingMembershipEntry)}
+        metadata_by_id = {
+            item.pr_identity.node_id: item.pr_identity
+            for item in desired
+            if isinstance(item, ExistingMembershipEntry)
+        }
         if not isinstance(raw["metadata_updates"], list) or any(
             not isinstance(item, dict)
             or set(item) != {"pr_identity", "title", "body"}
             or not isinstance(item["pr_identity"], dict)
             or set(item["pr_identity"]) != {"repository", "node_id"}
             or item["pr_identity"].get("node_id") not in metadata_by_id
-            or item["pr_identity"] != asdict(metadata_by_id.get(item["pr_identity"].get("node_id")))
+            or item["pr_identity"]
+            != asdict(metadata_by_id.get(item["pr_identity"].get("node_id")))
             or not isinstance(item["title"], str)
             or not isinstance(item["body"], str)
             for item in raw["metadata_updates"]
         ):
             raise ValueError("metadata updates are malformed")
-        decoded_metadata = tuple(PRMetadataUpdate(metadata_by_id[item["pr_identity"]["node_id"]], item["title"], item["body"]) for item in raw["metadata_updates"])
-        operation = MembershipRepair(parsed.repository, parsed.repository_name, parsed.dependencies.push_url, parsed.remote, parsed.dependencies.effective_config, tuple(tuple(item) for item in raw["workspace_targets"]), parsed.desired.base_branch, parsed.dependencies.state_blob_oid, parsed.source, parsed.dependencies.prs, parsed.tracking_update, tuple(desired), tuple(slots), parsed.head_updates, parsed.temporary_bases, decoded_metadata, MembershipRepairPhase(raw["phase"]), raw["source_unstack_possibly_sent"], parsed.detached_prs, tuple(item.ref for item in parsed.dependencies.live_heads), raw["relink_possibly_sent"], resulting, final_json, final_oid)  # type: ignore[arg-type]
-        if type(operation.source_unstack_possibly_sent) is not bool or type(operation.relink_possibly_sent) is not bool or any(not isinstance(item, list) or len(item) != 2 or not all(isinstance(value, str) for value in item) for item in raw["workspace_targets"]):
+        decoded_metadata = tuple(
+            PRMetadataUpdate(
+                metadata_by_id[item["pr_identity"]["node_id"]],
+                item["title"],
+                item["body"],
+            )
+            for item in raw["metadata_updates"]
+        )
+        operation = MembershipRepair(
+            parsed.repository,
+            parsed.repository_name,
+            parsed.dependencies.push_url,
+            parsed.remote,
+            parsed.dependencies.effective_config,
+            tuple(tuple(item) for item in raw["workspace_targets"]),
+            parsed.desired.base_branch,
+            parsed.dependencies.state_blob_oid,
+            parsed.source,
+            parsed.dependencies.prs,
+            parsed.tracking_update,
+            tuple(desired),
+            tuple(slots),
+            parsed.head_updates,
+            parsed.temporary_bases,
+            decoded_metadata,
+            MembershipRepairPhase(raw["phase"]),
+            raw["source_unstack_possibly_sent"],
+            parsed.detached_prs,
+            tuple(item.ref for item in parsed.dependencies.live_heads),
+            raw["relink_possibly_sent"],
+            resulting,
+            final_json,
+            final_oid,
+        )  # type: ignore[arg-type]
+        if (
+            type(operation.source_unstack_possibly_sent) is not bool
+            or type(operation.relink_possibly_sent) is not bool
+            or any(
+                not isinstance(item, list)
+                or len(item) != 2
+                or not all(isinstance(value, str) for value in item)
+                for item in raw["workspace_targets"]
+            )
+        ):
             raise ValueError("progress or workspace fields are malformed")
         _validate_membership_repair(operation)
         return operation
-    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError, Error) as exc:
+    except (
+        KeyError,
+        IndexError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+        Error,
+    ) as exc:
         raise Error(f"invalid refs/jj-stack/operation payload: {exc}") from exc
 
 
@@ -3958,7 +4185,9 @@ def cas_write_membership_repair(
         if read_ref_oid(workspace, OPERATION_REF) != expected_oid:
             raise ConcurrentUpdate("operation ref changed during compare-and-swap")
         detail = result.stderr.strip() or result.stdout.strip()
-        raise Error("could not update operation ref" + (f": {detail}" if detail else ""))
+        raise Error(
+            "could not update operation ref" + (f": {detail}" if detail else "")
+        )
     return new_oid
 
 
@@ -3975,7 +4204,9 @@ def cas_write_preserved_prefix_repair(
     expected = expected_oid or ("0" * len(new_oid))
     result = subprocess.run(
         ["git", f"--git-dir={common}", "update-ref", OPERATION_REF, new_oid, expected],
-        text=True, capture_output=True, check=False,
+        text=True,
+        capture_output=True,
+        check=False,
     )
     if result.returncode:
         if read_ref_oid(workspace, OPERATION_REF) != expected_oid:
@@ -4486,17 +4717,23 @@ def prepare_multi_first_publication(
         commit = by_commit.get(assignment.commit_id)
         if commit is None or commit.has_conflicts:
             return _block(
-                "commit-unavailable", assignment.commit_id, "revision is absent or conflicted"
+                "commit-unavailable",
+                assignment.commit_id,
+                "revision is absent or conflicted",
             )
         metadata = _metadata(commit.description)
         if metadata is None:
-            return _block("title-missing", assignment.commit_id, "revision has no title")
+            return _block(
+                "title-missing", assignment.commit_id, "revision has no title"
+            )
         if by_name.get(f"refs/heads/{assignment.branch_name}") is not None:
             return _block(
                 "branch-collision", assignment.branch_name, "destination branch exists"
             )
         local_matches = tuple(
-            item for item in local.local_bookmarks if item.name == assignment.branch_name
+            item
+            for item in local.local_bookmarks
+            if item.name == assignment.branch_name
         )
         if not local_matches:
             setup = BookmarkSetup.CREATE
@@ -4909,10 +5146,16 @@ def _validate_pr_dependencies(
     merged = tuple(
         pr for pr in snapshot.pull_requests if pr.state is PullRequestState.MERGED
     )
-    comparison_base = merged[-1].reported_head_commit_id if merged else bases[0].commit_id
+    comparison_base = (
+        merged[-1].reported_head_commit_id if merged else bases[0].commit_id
+    )
     if merged:
-        boundary_ref = RemoteBranchRef(snapshot.repository, f"refs/heads/{merged[-1].head_branch}")
-        boundary = next((item for item in snapshot.live_refs if item.ref == boundary_ref), None)
+        boundary_ref = RemoteBranchRef(
+            snapshot.repository, f"refs/heads/{merged[-1].head_branch}"
+        )
+        boundary = next(
+            (item for item in snapshot.live_refs if item.ref == boundary_ref), None
+        )
         if boundary is not None and boundary.commit_id == bases[0].commit_id:
             # A current boundary needs no structural repair.  Native jj roots
             # the surviving suffix at the current integration OID.
@@ -5079,10 +5322,7 @@ def _topology_naming_digest_parts(
         [repository.host, repository.node_id],
         [pr.node_id for pr in source_prs],
         desired.base_branch,
-        [
-            [item.pr_identity.node_id, item.desired_commit_id]
-            for item in desired.active
-        ],
+        [[item.pr_identity.node_id, item.desired_commit_id] for item in desired.active],
     ]
     canonical = json.dumps(semantic, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()[:24]
@@ -5354,9 +5594,7 @@ def plan_topology(value: TopologyPlanningInput | Blocked) -> TopologyPlanResult:
         snapshot.pull_requests,
         snapshot.membership,
         tuple(
-            refs[
-                RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.head_branch}")
-            ]
+            refs[RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.head_branch}")]
             for pr in snapshot.pull_requests
         ),
         tuple(
@@ -5447,11 +5685,15 @@ def plan_tracked_restore(
     tracked = observed.tracked
     desired = observed.desired
     if observed.tool_state.operation_blob_oid is not None:
-        return _block("operation-fenced", OPERATION_REF, "a pending operation fences planning")
-    if tuple(stack for stack in observed.tool_state.state.stacks if stack == tracked) != (
-        tracked,
-    ):
-        return _block("tracked-source-mismatch", "stack", "exact tracked source is absent")
+        return _block(
+            "operation-fenced", OPERATION_REF, "a pending operation fences planning"
+        )
+    if tuple(
+        stack for stack in observed.tool_state.state.stacks if stack == tracked
+    ) != (tracked,):
+        return _block(
+            "tracked-source-mismatch", "stack", "exact tracked source is absent"
+        )
     desired_ids = tuple(item.pr_identity for item in desired.active)
     if (
         desired.repository != tracked.repository
@@ -5475,7 +5717,9 @@ def plan_tracked_restore(
         for source in sources
     ):
         return _block("not-fully-open", "stack", "restoration requires open local PRs")
-    if any(source.pr.auto_merge_enabled or source.pr.in_merge_queue for source in sources):
+    if any(
+        source.pr.auto_merge_enabled or source.pr.in_merge_queue for source in sources
+    ):
         return _block("active-automation", "stack", "automation blocks restoration")
 
     stack_ids = {source.stack_id for source in sources if source.stack_id is not None}
@@ -5486,14 +5730,22 @@ def plan_tracked_restore(
         if observed.current_stack is not None or any(
             source.stack_base_branch is not None for source in sources
         ):
-            return _block("association-mismatch", "stack", "standalone evidence is incomplete")
+            return _block(
+                "association-mismatch", "stack", "standalone evidence is incomplete"
+            )
     else:
         stack_id = next(iter(stack_ids))
         stack = observed.current_stack
         if stack is None or stack.stack_id != stack_id:
-            return _block("association-mismatch", stack_id, "surviving stack is incomplete")
+            return _block(
+                "association-mismatch", stack_id, "surviving stack is incomplete"
+            )
         members = tuple(pr.identity for pr in stack.ordered_prs)
-        positions = tuple(tracked.ordered_prs.index(identity) for identity in members if identity in tracked.ordered_prs)
+        positions = tuple(
+            tracked.ordered_prs.index(identity)
+            for identity in members
+            if identity in tracked.ordered_prs
+        )
         if (
             len(members) != len(positions)
             or tuple(sorted(positions)) != positions
@@ -5502,7 +5754,11 @@ def plan_tracked_restore(
                 for source in sources
             )
         ):
-            return _block("foreign-association", stack_id, "surviving stack is not a tracked subset")
+            return _block(
+                "foreign-association",
+                stack_id,
+                "surviving stack is not a tracked subset",
+            )
         current_membership = ServerStackMembership(
             members[0], stack.identity, stack.base_branch, members
         )
@@ -5511,9 +5767,15 @@ def plan_tracked_restore(
     base_ref = RemoteBranchRef(tracked.repository, f"refs/heads/{tracked.base_branch}")
     target = refs.get(base_ref)
     if target is None or target.commit_id is None:
-        return _block("base-disagrees", base_ref.full_name, "tracked target is unavailable")
+        return _block(
+            "base-disagrees", base_ref.full_name, "tracked target is unavailable"
+        )
     if len(value.temporary_base_observations) != len(desired_ids):
-        return _block("temporary-base-observation-invalid", "stack", "absence reads are incomplete")
+        return _block(
+            "temporary-base-observation-invalid",
+            "stack",
+            "absence reads are incomplete",
+        )
     by_id = {source.pr.identity: source.pr for source in sources}
     wanted_by_id = {item.pr_identity: item for item in desired.active}
     previous = target.commit_id
@@ -5521,23 +5783,43 @@ def plan_tracked_restore(
     bases: list[LiveRemoteRef] = [target]
     updates: list[PlannedHeadUpdate] = []
     temporary: list[PlannedTemporaryBase] = []
-    for identity, absence in zip(desired_ids, value.temporary_base_observations, strict=True):
+    for identity, absence in zip(
+        desired_ids, value.temporary_base_observations, strict=True
+    ):
         pr = by_id[identity]
         wanted = wanted_by_id[identity]
-        head = refs.get(RemoteBranchRef(tracked.repository, f"refs/heads/{pr.head_branch}"))
-        literal = refs.get(RemoteBranchRef(tracked.repository, f"refs/heads/{pr.base_branch}"))
+        head = refs.get(
+            RemoteBranchRef(tracked.repository, f"refs/heads/{pr.head_branch}")
+        )
+        literal = refs.get(
+            RemoteBranchRef(tracked.repository, f"refs/heads/{pr.base_branch}")
+        )
         if head is None or head.commit_id != pr.reported_head_commit_id:
-            return _block("head-disagrees", pr.head_branch, "PR head and live ref disagree")
+            return _block(
+                "head-disagrees", pr.head_branch, "PR head and live ref disagree"
+            )
         if literal is None or literal.commit_id != pr.reported_base_commit_id:
-            return _block("base-disagrees", pr.base_branch, "PR base and live ref disagree")
+            return _block(
+                "base-disagrees", pr.base_branch, "PR base and live ref disagree"
+            )
         if not _comparison_is_nonempty_linear_and_conflict_free(
-            observed.local.commits, pr.reported_base_commit_id, pr.reported_head_commit_id
+            observed.local.commits,
+            pr.reported_base_commit_id,
+            pr.reported_head_commit_id,
         ):
-            return _block("invalid-old-comparison", identity.node_id, "current comparison is unsafe")
+            return _block(
+                "invalid-old-comparison",
+                identity.node_id,
+                "current comparison is unsafe",
+            )
         if not _comparison_is_nonempty_linear_and_conflict_free(
             observed.local.commits, previous, wanted.desired_commit_id
         ):
-            return _block("invalid-desired-comparison", identity.node_id, "desired comparison is unsafe")
+            return _block(
+                "invalid-desired-comparison",
+                identity.node_id,
+                "desired comparison is unsafe",
+            )
         planned = _plan_head_update(
             observed.local.commits, observed.tool_state.state, wanted, head
         )
@@ -5548,7 +5830,9 @@ def plan_tracked_restore(
         if literal not in bases:
             bases.append(literal)
         temporary.append(
-            PlannedTemporaryBase(identity, absence.ref, pr.reported_base_commit_id, previous)
+            PlannedTemporaryBase(
+                identity, absence.ref, pr.reported_base_commit_id, previous
+            )
         )
         previous = wanted.desired_commit_id
     source = TrackedRestoreSource(tracked, current_membership)
@@ -5631,69 +5915,182 @@ def plan_preserved_prefix_repair(
     """Plan only the stale owned boundary case; return None for ordinary sync."""
     if not isinstance(snapshot.membership, ServerStackMembership):
         return None
-    merged = tuple(pr for pr in snapshot.pull_requests if pr.state is PullRequestState.MERGED)
-    opened = tuple(pr for pr in snapshot.pull_requests if pr.state is PullRequestState.OPEN)
+    merged = tuple(
+        pr for pr in snapshot.pull_requests if pr.state is PullRequestState.MERGED
+    )
+    opened = tuple(
+        pr for pr in snapshot.pull_requests if pr.state is PullRequestState.OPEN
+    )
     if not merged or not opened:
         return None
-    integration_ref = RemoteBranchRef(snapshot.repository, f"refs/heads/{desired.base_branch}")
-    boundary_ref = RemoteBranchRef(snapshot.repository, f"refs/heads/{merged[-1].head_branch}")
-    integration_values = tuple(item for item in snapshot.live_refs if item.ref == integration_ref)
-    boundary_values = tuple(item for item in snapshot.live_refs if item.ref == boundary_ref)
-    if len(integration_values) != 1 or integration_values[0].commit_id is None or len(boundary_values) != 1:
-        return _block("boundary-observation-incomplete", boundary_ref.full_name, "integration and boundary refs require exact authoritative observations")
+    integration_ref = RemoteBranchRef(
+        snapshot.repository, f"refs/heads/{desired.base_branch}"
+    )
+    boundary_ref = RemoteBranchRef(
+        snapshot.repository, f"refs/heads/{merged[-1].head_branch}"
+    )
+    integration_values = tuple(
+        item for item in snapshot.live_refs if item.ref == integration_ref
+    )
+    boundary_values = tuple(
+        item for item in snapshot.live_refs if item.ref == boundary_ref
+    )
+    if (
+        len(integration_values) != 1
+        or integration_values[0].commit_id is None
+        or len(boundary_values) != 1
+    ):
+        return _block(
+            "boundary-observation-incomplete",
+            boundary_ref.full_name,
+            "integration and boundary refs require exact authoritative observations",
+        )
     integration, boundary = integration_values[0], boundary_values[0]
-    if tuple(item.pr_identity for item in desired.active) != tuple(pr.identity for pr in opened):
-        return _block("merged-identity-selected", "stack", "the active goal must contain exactly the open suffix")
+    if tuple(item.pr_identity for item in desired.active) != tuple(
+        pr.identity for pr in opened
+    ):
+        return _block(
+            "merged-identity-selected",
+            "stack",
+            "the active goal must contain exactly the open suffix",
+        )
     # A suffix still rooted at the historical merged head is ordinary
     # unchanged-topology sync, including an exact NoOp.  Structural recovery is
     # selected only after native jj has rooted the first open segment at I.
     if not _comparison_is_nonempty_linear_and_conflict_free(
-        snapshot.local.commits, integration.commit_id, desired.active[0].desired_commit_id
+        snapshot.local.commits,
+        integration.commit_id,
+        desired.active[0].desired_commit_id,
     ):
         return None
-    tracked = tuple(stack for stack in snapshot.tool_state.state.stacks if stack.repository == snapshot.repository and stack.base_branch == desired.base_branch and stack.ordered_prs in (snapshot.membership.ordered_prs, tuple(pr.identity for pr in opened)))
+    tracked = tuple(
+        stack
+        for stack in snapshot.tool_state.state.stacks
+        if stack.repository == snapshot.repository
+        and stack.base_branch == desired.base_branch
+        and stack.ordered_prs
+        in (snapshot.membership.ordered_prs, tuple(pr.identity for pr in opened))
+    )
     if len(tracked) != 1:
-        return _block("tracked-source-mismatch", "stack", "repair requires one exact compatible active/history record")
-    ownerships = tuple(item for item in snapshot.tool_state.state.boundary_aliases if item.stack == snapshot.membership.stack)
+        return _block(
+            "tracked-source-mismatch",
+            "stack",
+            "repair requires one exact compatible active/history record",
+        )
+    ownerships = tuple(
+        item
+        for item in snapshot.tool_state.state.boundary_aliases
+        if item.stack == snapshot.membership.stack
+    )
     if boundary.commit_id is None:
         if ownerships:
-            return _block("boundary-moved", boundary_ref.full_name, "an owned boundary unexpectedly disappeared")
-        ownership = BoundaryAliasOwnership(snapshot.membership.stack, boundary_ref, True, integration.commit_id)
+            return _block(
+                "boundary-moved",
+                boundary_ref.full_name,
+                "an owned boundary unexpectedly disappeared",
+            )
+        ownership = BoundaryAliasOwnership(
+            snapshot.membership.stack, boundary_ref, True, integration.commit_id
+        )
     else:
         if len(ownerships) != 1 or ownerships[0].ref != boundary_ref:
-            return _block("foreign-boundary", boundary_ref.full_name, "an existing boundary alias is not owned by this stack")
+            return _block(
+                "foreign-boundary",
+                boundary_ref.full_name,
+                "an existing boundary alias is not owned by this stack",
+            )
         ownership = ownerships[0]
         if ownership.last_owned_commit_id != boundary.commit_id:
-            return _block("boundary-moved", boundary_ref.full_name, "the owned boundary alias moved externally")
+            return _block(
+                "boundary-moved",
+                boundary_ref.full_name,
+                "the owned boundary alias moved externally",
+            )
         if boundary.commit_id == integration.commit_id:
             return None
         ownership = replace(ownership, last_owned_commit_id=integration.commit_id)
     if any(pr.auto_merge_enabled or pr.in_merge_queue for pr in snapshot.pull_requests):
-        return _block("active-automation", "stack", "automation blocks preserved-prefix repair")
+        return _block(
+            "active-automation", "stack", "automation blocks preserved-prefix repair"
+        )
     by_commit = {item.commit_id: item for item in snapshot.local.commits}
     predecessor = integration.commit_id
     updates: list[PlannedHeadUpdate] = []
     heads: list[LiveRemoteRef] = []
     for pr, wanted in zip(opened, desired.active, strict=True):
         if (wanted.title, wanted.body) != (pr.title, pr.body):
-            return _block("metadata-repair-required", pr.identity.node_id, "repair requires already-exact open PR metadata")
-        if wanted.desired_commit_id not in by_commit or not _comparison_is_nonempty_linear_and_conflict_free(snapshot.local.commits, predecessor, wanted.desired_commit_id):
-            return _block("suffix-not-rebased", wanted.desired_commit_id, "native jj must produce a linear conflict-free suffix rooted at current integration")
+            return _block(
+                "metadata-repair-required",
+                pr.identity.node_id,
+                "repair requires already-exact open PR metadata",
+            )
+        if (
+            wanted.desired_commit_id not in by_commit
+            or not _comparison_is_nonempty_linear_and_conflict_free(
+                snapshot.local.commits, predecessor, wanted.desired_commit_id
+            )
+        ):
+            return _block(
+                "suffix-not-rebased",
+                wanted.desired_commit_id,
+                "native jj must produce a linear conflict-free suffix rooted at current integration",
+            )
         ref = RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.head_branch}")
         values = tuple(item for item in snapshot.live_refs if item.ref == ref)
         if len(values) != 1 or values[0].commit_id != pr.reported_head_commit_id:
-            return _block("head-disagrees", ref.full_name, "open head observation is not exact")
+            return _block(
+                "head-disagrees", ref.full_name, "open head observation is not exact"
+            )
         heads.append(values[0])
-        planned = _plan_head_update(snapshot.local.commits, snapshot.tool_state.state, wanted, values[0])
-        if isinstance(planned, Blocked): return planned
+        planned = _plan_head_update(
+            snapshot.local.commits, snapshot.tool_state.state, wanted, values[0]
+        )
+        if isinstance(planned, Blocked):
+            return planned
         updates.extend(planned)
         predecessor = wanted.desired_commit_id
-    dependencies = TopologyDependencies(snapshot.local.effective_config, snapshot.push_url, snapshot.tool_state.state_blob_oid, snapshot.tool_state.operation_blob_oid, snapshot.pull_requests, snapshot.membership, tuple(heads), (integration, boundary))
-    final_tracking = TrackedStack(snapshot.repository, desired.base_branch, tuple(pr.identity for pr in opened), tracked[0].detached_prs)
-    carrier = TopologyPlan(snapshot.repository, repository.name_with_owner, remote, desired, (), tuple(updates), (), final_tracking, dependencies)
-    operation = PreservedPrefixRepair(PreservedPrefixPlan(carrier, snapshot.local.workspace_targets, snapshot.membership.stack, merged, integration, boundary, ownership))
-    try: _validate_preserved_prefix_repair(operation)
-    except ValueError as exc: return _block("invalid-preserved-prefix-repair", "stack", str(exc))
+    dependencies = TopologyDependencies(
+        snapshot.local.effective_config,
+        snapshot.push_url,
+        snapshot.tool_state.state_blob_oid,
+        snapshot.tool_state.operation_blob_oid,
+        snapshot.pull_requests,
+        snapshot.membership,
+        tuple(heads),
+        (integration, boundary),
+    )
+    final_tracking = TrackedStack(
+        snapshot.repository,
+        desired.base_branch,
+        tuple(pr.identity for pr in opened),
+        tracked[0].detached_prs,
+    )
+    carrier = TopologyPlan(
+        snapshot.repository,
+        repository.name_with_owner,
+        remote,
+        desired,
+        (),
+        tuple(updates),
+        (),
+        final_tracking,
+        dependencies,
+    )
+    operation = PreservedPrefixRepair(
+        PreservedPrefixPlan(
+            carrier,
+            snapshot.local.workspace_targets,
+            snapshot.membership.stack,
+            merged,
+            integration,
+            boundary,
+            ownership,
+        )
+    )
+    try:
+        _validate_preserved_prefix_repair(operation)
+    except ValueError as exc:
+        return _block("invalid-preserved-prefix-repair", "stack", str(exc))
     return operation
 
 
@@ -5748,9 +6145,7 @@ def render_topology(plan: TopologyPlanResult) -> str:
             for item in plan.temporary_bases
         ),
     ]
-    return "topology repair:\n" + "\n".join(
-        f"  - {item}" for item in consequences
-    )
+    return "topology repair:\n" + "\n".join(f"  - {item}" for item in consequences)
 
 
 def _apply_shape(plan: SyncPlan) -> Stopped | None:
@@ -5862,8 +6257,10 @@ def validate_frozen_dependencies(plan: NoOp | Apply, fresh: Snapshot) -> Blocked
     dependencies = plan.dependencies
     if fresh.repository != plan.desired.repository:
         return _block("repository-changed", "repository", "repository identity changed")
-    if fresh.local.effective_config != dependencies.effective_config:
+    if operation_config(fresh.local) != dependencies.effective_config:
         return _block("config-changed", "config", "effective configuration changed")
+    if fresh.remote != dependencies.remote:
+        return _block("remote-changed", "remote", "selected remote changed")
     if fresh.push_url != dependencies.push_url:
         return _block("push-url-changed", "push-url", "push destination changed")
     if fresh.tool_state.state_blob_oid != dependencies.state_blob_oid:
@@ -6236,7 +6633,7 @@ def _observe_publication_local(
         revision=" | ".join(slot.commit_id for slot in operation.slots),
         config_keys=tuple(key for key, _value in operation.effective_config),
     )
-    if local.effective_config != operation.effective_config:
+    if operation_config(local) != operation.effective_config:
         raise SourceMismatch("effective configuration changed during publication")
     if local.workspace_targets != operation.workspace_targets:
         raise SourceMismatch("workspace target changed during publication")
@@ -6363,7 +6760,8 @@ def _prevalidate_operation_repository(
     workspace: str | Path, operation: FirstPublication
 ) -> None:
     observed = observe_github_repository(
-        f"https://{operation.repository.host}/{operation.repository_name}", cwd=workspace
+        f"https://{operation.repository.host}/{operation.repository_name}",
+        cwd=workspace,
     )
     if (
         observed.identity != operation.repository
@@ -6437,7 +6835,9 @@ def append_source_is_unchanged(
         return True
     assert operation.existing_stack is not None
     stack = observe_github_stack(
-        _operation_repository(operation), operation.existing_stack.node_id, cwd=workspace
+        _operation_repository(operation),
+        operation.existing_stack.node_id,
+        cwd=workspace,
     )
     return (
         stack.identity == operation.existing_stack
@@ -6565,8 +6965,9 @@ def verify_final_state(
     )
     if (
         fresh.repository != plan.desired.repository
-        or fresh.local.effective_config != plan.dependencies.effective_config
+        or operation_config(fresh.local) != plan.dependencies.effective_config
         or fresh.push_url != plan.dependencies.push_url
+        or fresh.remote != plan.dependencies.remote
         or fresh.tool_state.state_blob_oid != plan.dependencies.state_blob_oid
         or fresh.tool_state.operation_blob_oid != plan.dependencies.operation_blob_oid
         or fresh.membership != plan.dependencies.membership
@@ -6756,7 +7157,9 @@ def inspect_remote_restack(
 ) -> RemoteRestackAdoption | Blocked:
     """Match every old/new change ID and patch ID, then freeze adoption."""
     if remote != snapshot.remote:
-        return _block("remote-changed", remote, "selected remote differs from observation")
+        return _block(
+            "remote-changed", remote, "selected remote differs from observation"
+        )
     if not snapshot.fetch_url:
         return _block("fetch-url-missing", remote, "fetch transport was not observed")
     try:
@@ -6983,8 +7386,9 @@ def _validate_adoption_prestate(
 ) -> str | None:
     if (
         fresh.repository != plan.repository
+        or fresh.remote != plan.remote
         or fresh.fetch_url != plan.fetch_url
-        or fresh.local.effective_config != plan.effective_config
+        or operation_config(fresh.local) != plan.effective_config
         or fresh.tool_state.state_blob_oid != plan.state_blob_oid
         or fresh.tool_state.operation_blob_oid != plan.operation_blob_oid
         or fresh.membership != plan.membership
@@ -7008,8 +7412,9 @@ def _validate_adoption_poststate(
 ) -> str | None:
     if (
         fresh.repository != plan.repository
+        or fresh.remote != plan.remote
         or fresh.fetch_url != plan.fetch_url
-        or fresh.local.effective_config != plan.effective_config
+        or operation_config(fresh.local) != plan.effective_config
         or fresh.tool_state.state_blob_oid != plan.state_blob_oid
         or fresh.tool_state.operation_blob_oid != plan.operation_blob_oid
         or fresh.membership != plan.membership
@@ -7312,9 +7717,13 @@ def _observe_source_association(
     if all(
         item.stack_id is None and item.stack_base_branch is None for item in sources
     ):
-        if allow_dissolved or isinstance(plan.source, StandalonePullRequest) or (
-            isinstance(plan.source, TrackedRestoreSource)
-            and plan.source.current_stack is None
+        if (
+            allow_dissolved
+            or isinstance(plan.source, StandalonePullRequest)
+            or (
+                isinstance(plan.source, TrackedRestoreSource)
+                and plan.source.current_stack is None
+            )
         ):
             return sources, None
         raise SourceMismatch("frozen server stack disappeared before unstack")
@@ -7585,7 +7994,9 @@ def _finish_first_publication(
         )
     return FirstPublicationVerified(
         operation.active_existing_prs
-        + tuple(slot.pr_identity for slot in operation.slots if slot.pr_identity is not None)
+        + tuple(
+            slot.pr_identity for slot in operation.slots if slot.pr_identity is not None
+        )
     )
 
 
@@ -7897,7 +8308,8 @@ def resume_first_publication(workspace: str | Path) -> FirstPublicationResult:
                     try:
                         if not append_source_is_unchanged(workspace, operation):
                             return Stopped(
-                                "stack-link", "existing append stack changed before request"
+                                "stack-link",
+                                "existing append stack changed before request",
                             )
                     except Error as exc:
                         return Stopped("stack-link", str(exc))
@@ -8076,7 +8488,10 @@ def run_stack_unstack(
     workspace: str | Path, plan: TopologyPlan, stack_number: int
 ) -> GitHubResponse:
     source = plan.source
-    if not isinstance(source, ServerStackMembership) or source.stack.number != stack_number:
+    if (
+        not isinstance(source, ServerStackMembership)
+        or source.stack.number != stack_number
+    ):
         raise ValueError("unstack request does not match the frozen source stack")
     effect = StackEffect(
         StackEffectKind.UNSTACK,
@@ -8685,21 +9100,34 @@ def start_membership_repair(operation: MembershipRepair, workspace: str | Path) 
             raise ConcurrentUpdate("another operation is already active")
         _local, readbacks = observe_publication_slots(workspace, operation)  # type: ignore[arg-type]
         for slot, readback in zip(operation.slots, readbacks, strict=True):
-            if slot.bookmark_setup is BookmarkSetup.CREATE and readback.local_target is not None:
-                raise ConcurrentUpdate(f"CREATE bookmark {slot.branch} is no longer absent")
-            if slot.bookmark_setup is BookmarkSetup.KEEP and not _exact_target(readback.local_target, slot.commit_id):
+            if (
+                slot.bookmark_setup is BookmarkSetup.CREATE
+                and readback.local_target is not None
+            ):
+                raise ConcurrentUpdate(
+                    f"CREATE bookmark {slot.branch} is no longer absent"
+                )
+            if slot.bookmark_setup is BookmarkSetup.KEEP and not _exact_target(
+                readback.local_target, slot.commit_id
+            ):
                 raise ConcurrentUpdate(f"KEEP bookmark {slot.branch} moved")
-            if readback.live_commit_id is not None or not _absent_target(readback.remote_target):
-                raise ConcurrentUpdate(f"publication destination {slot.branch} is no longer absent")
+            if readback.live_commit_id is not None or not _absent_target(
+                readback.remote_target
+            ):
+                raise ConcurrentUpdate(
+                    f"publication destination {slot.branch} is no longer absent"
+                )
         refs = tuple(item.ref for item in operation.temporary_bases)
-        if _topology_refs(_membership_carrier(operation).plan, workspace, refs) != tuple(
-            LiveRemoteRef(ref, None) for ref in refs
-        ):
+        if _topology_refs(
+            _membership_carrier(operation).plan, workspace, refs
+        ) != tuple(LiveRemoteRef(ref, None) for ref in refs):
             raise ConcurrentUpdate("a frozen temporary base branch is occupied")
         return cas_write_membership_repair(workspace, None, operation)
 
 
-def start_preserved_prefix_repair(operation: PreservedPrefixRepair, workspace: str | Path) -> str:
+def start_preserved_prefix_repair(
+    operation: PreservedPrefixRepair, workspace: str | Path
+) -> str:
     """Install the CAS fence before any stale-boundary effect."""
     _validate_preserved_prefix_repair(operation)
     if operation.phase is not PreservedPrefixRepairPhase.PUBLISHING:
@@ -8710,26 +9138,56 @@ def start_preserved_prefix_repair(operation: PreservedPrefixRepair, workspace: s
             raise ConcurrentUpdate("private state changed before operation start")
         if read_ref_oid(workspace, OPERATION_REF) is not None:
             raise ConcurrentUpdate("another operation is already active")
-        refs = tuple(item.ref for item in plan.head_updates) + (operation.plan.integration.ref, operation.plan.boundary.ref)
+        refs = tuple(item.ref for item in plan.head_updates) + (
+            operation.plan.integration.ref,
+            operation.plan.boundary.ref,
+        )
         values = _topology_refs(plan, workspace, refs)
-        expected = tuple(LiveRemoteRef(item.ref, item.expected_old_commit_id) for item in plan.head_updates) + (operation.plan.integration, operation.plan.boundary)
+        expected = tuple(
+            LiveRemoteRef(item.ref, item.expected_old_commit_id)
+            for item in plan.head_updates
+        ) + (operation.plan.integration, operation.plan.boundary)
         if values != expected:
-            raise ConcurrentUpdate("frozen integration, open heads, or boundary alias changed")
+            raise ConcurrentUpdate(
+                "frozen integration, open heads, or boundary alias changed"
+            )
         return cas_write_preserved_prefix_repair(workspace, None, operation)
 
 
-def push_preserved_prefix_updates(workspace: str | Path, operation: PreservedPrefixRepair) -> subprocess.CompletedProcess[str]:
+def push_preserved_prefix_updates(
+    workspace: str | Path, operation: PreservedPrefixRepair
+) -> subprocess.CompletedProcess[str]:
     plan = operation.plan.carrier
     updates = plan.head_updates
     boundary = operation.plan.boundary
     integration = operation.plan.integration
     assert integration.commit_id is not None
     common = git_common_dir(workspace)
-    leases = [f"--force-with-lease={item.ref.full_name}:{item.expected_old_commit_id}" for item in updates]
-    leases.append(f"--force-with-lease={boundary.ref.full_name}:{boundary.commit_id or ''}")
+    leases = [
+        f"--force-with-lease={item.ref.full_name}:{item.expected_old_commit_id}"
+        for item in updates
+    ]
+    leases.append(
+        f"--force-with-lease={boundary.ref.full_name}:{boundary.commit_id or ''}"
+    )
     specs = [f"{item.new_commit_id}:{item.ref.full_name}" for item in updates]
     specs.append(f"{integration.commit_id}:{boundary.ref.full_name}")
-    return subprocess.run(["git", f"--git-dir={common}", "push", "--atomic", "--no-follow-tags", "--recurse-submodules=no", *leases, plan.dependencies.push_url, *specs], text=True, capture_output=True, check=False)
+    return subprocess.run(
+        [
+            "git",
+            f"--git-dir={common}",
+            "push",
+            "--atomic",
+            "--no-follow-tags",
+            "--recurse-submodules=no",
+            *leases,
+            plan.dependencies.push_url,
+            *specs,
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
 
 
 def run_preserved_prefix_stack_link(
@@ -8751,24 +9209,42 @@ def run_preserved_prefix_stack_link(
     return send_github_effect(effect, cwd=workspace)
 
 
-def _preserved_projection(operation: PreservedPrefixRepair, workspace: str | Path) -> tuple[tuple[GitHubPullRequestSource, ...], GitHubStackSource | None]:
+def _preserved_projection(
+    operation: PreservedPrefixRepair, workspace: str | Path
+) -> tuple[tuple[GitHubPullRequestSource, ...], GitHubStackSource | None]:
     plan = operation.plan.carrier
-    repository = _frozen_repository(plan.repository, plan.repository_name, cwd=workspace)
-    sources = tuple(observe_github_pull_request(repository, item.number, cwd=workspace) for item in plan.dependencies.prs)
+    repository = _frozen_repository(
+        plan.repository, plan.repository_name, cwd=workspace
+    )
+    sources = tuple(
+        observe_github_pull_request(repository, item.number, cwd=workspace)
+        for item in plan.dependencies.prs
+    )
     ids = {item.stack_id for item in sources if item.stack_id is not None}
-    stack = observe_github_stack(repository, operation.plan.stack.node_id, cwd=workspace) if ids else None
+    stack = (
+        observe_github_stack(repository, operation.plan.stack.node_id, cwd=workspace)
+        if ids
+        else None
+    )
     return sources, stack
 
 
-def _preserved_error(operation: PreservedPrefixRepair, workspace: str | Path, expected: str) -> str | None:
+def _preserved_error(
+    operation: PreservedPrefixRepair, workspace: str | Path, expected: str
+) -> str | None:
     plan = operation.plan.carrier
     try:
         local = observe_local(
             workspace,
             revision="all()",
-            config_keys=tuple(key for key, _value in plan.dependencies.effective_config),
+            config_keys=tuple(
+                key for key, _value in plan.dependencies.effective_config
+            ),
         )
-        if local.effective_config != plan.dependencies.effective_config or local.workspace_targets != operation.plan.workspace_targets:
+        if (
+            operation_config(local) != plan.dependencies.effective_config
+            or local.workspace_targets != operation.plan.workspace_targets
+        ):
             return "frozen config or workspace targets changed"
         if resolve_push_url(local, plan.remote) != plan.dependencies.push_url:
             return "frozen publication routing changed"
@@ -8776,38 +9252,94 @@ def _preserved_error(operation: PreservedPrefixRepair, workspace: str | Path, ex
     except Error as exc:
         return str(exc)
     frozen = plan.dependencies.prs
-    if len(sources) != len(frozen): return "complete PR observation changed"
+    if len(sources) != len(frozen):
+        return "complete PR observation changed"
     desired = {item.pr_identity: item for item in plan.desired.active}
     previous_branch = operation.plan.boundary.ref.full_name.removeprefix("refs/heads/")
     previous_oid = operation.plan.integration.commit_id
     for old, source in zip(frozen, sources, strict=True):
         pr = source.pr
-        if (pr.identity, pr.number, pr.state, pr.draft, pr.head_branch, pr.title, pr.body) != (old.identity, old.number, old.state, old.draft, old.head_branch, old.title, old.body): return f"pull request #{old.number} frozen identity or metadata changed"
-        if pr.auto_merge_enabled or pr.in_merge_queue: return f"pull request #{old.number} has active automation"
-        if old.identity in desired and expected in {"prefix", "final"} and pr.reported_head_commit_id != desired[old.identity].desired_commit_id: return f"pull request #{old.number} head is not final"
+        if (
+            pr.identity,
+            pr.number,
+            pr.state,
+            pr.draft,
+            pr.head_branch,
+            pr.title,
+            pr.body,
+        ) != (
+            old.identity,
+            old.number,
+            old.state,
+            old.draft,
+            old.head_branch,
+            old.title,
+            old.body,
+        ):
+            return f"pull request #{old.number} frozen identity or metadata changed"
+        if pr.auto_merge_enabled or pr.in_merge_queue:
+            return f"pull request #{old.number} has active automation"
+        if (
+            old.identity in desired
+            and expected in {"prefix", "final"}
+            and pr.reported_head_commit_id != desired[old.identity].desired_commit_id
+        ):
+            return f"pull request #{old.number} head is not final"
         if old.identity in desired:
-            if expected == "final" and (pr.base_branch, pr.reported_base_commit_id) != (previous_branch, previous_oid): return f"pull request #{old.number} final base is not exact"
+            if expected == "final" and (pr.base_branch, pr.reported_base_commit_id) != (
+                previous_branch,
+                previous_oid,
+            ):
+                return f"pull request #{old.number} final base is not exact"
             previous_branch = old.head_branch
             previous_oid = desired[old.identity].desired_commit_id
-    wanted_members = tuple(item.identity for item in operation.plan.merged_prefix) if expected == "prefix" else tuple(item.identity for item in frozen)
-    if stack is None or stack.identity != operation.plan.stack or tuple(item.identity for item in stack.ordered_prs) != wanted_members: return "stack identity or exact membership changed"
+    wanted_members = (
+        tuple(item.identity for item in operation.plan.merged_prefix)
+        if expected == "prefix"
+        else tuple(item.identity for item in frozen)
+    )
+    if (
+        stack is None
+        or stack.identity != operation.plan.stack
+        or tuple(item.identity for item in stack.ordered_prs) != wanted_members
+    ):
+        return "stack identity or exact membership changed"
     return None
 
 
-def _build_preserved_prefix_state(operation: PreservedPrefixRepair, state: TrackedState) -> TrackedState:
+def _build_preserved_prefix_state(
+    operation: PreservedPrefixRepair, state: TrackedState
+) -> TrackedState:
     plan = operation.plan.carrier
     source_ids = tuple(item.identity for item in plan.dependencies.prs)
-    matches = tuple(item for item in state.stacks if item.repository == plan.repository and item.base_branch == plan.desired.base_branch and item.ordered_prs in (source_ids, tuple(w.pr_identity for w in plan.desired.active)))
-    if len(matches) != 1: raise Error("private state no longer contains exact compatible source")
-    stacks = tuple(item for item in state.stacks if item != matches[0]) + (plan.tracking_update,)
+    matches = tuple(
+        item
+        for item in state.stacks
+        if item.repository == plan.repository
+        and item.base_branch == plan.desired.base_branch
+        and item.ordered_prs
+        in (source_ids, tuple(w.pr_identity for w in plan.desired.active))
+    )
+    if len(matches) != 1:
+        raise Error("private state no longer contains exact compatible source")
+    stacks = tuple(item for item in state.stacks if item != matches[0]) + (
+        plan.tracking_update,
+    )
     publications = state.last_published_heads
     adoptions = state.last_adopted_heads
-    by_ref = {f"refs/heads/{item.head_branch}": item.identity for item in plan.dependencies.prs}
+    by_ref = {
+        f"refs/heads/{item.head_branch}": item.identity
+        for item in plan.dependencies.prs
+    }
     for update in plan.head_updates:
         key = (by_ref[update.ref.full_name], update.ref)
-        publications = tuple(item for item in publications if (item.pr, item.ref) != key) + (LastPublishedHead(key[0], key[1], update.new_commit_id),)
+        publications = tuple(
+            item for item in publications if (item.pr, item.ref) != key
+        ) + (LastPublishedHead(key[0], key[1], update.new_commit_id),)
         adoptions = tuple(item for item in adoptions if (item.pr, item.ref) != key)
-    aliases = tuple(item for item in state.boundary_aliases if item.stack != operation.plan.stack) + (operation.plan.ownership,)
+    aliases = tuple(
+        item for item in state.boundary_aliases if item.stack != operation.plan.stack
+    ) + (operation.plan.ownership,)
     return TrackedState(stacks, publications, adoptions, aliases)  # type: ignore[arg-type]
 
 
@@ -8824,44 +9356,98 @@ def _membership_plan(operation: MembershipRepair) -> TopologyPlan:
             pr = source[item.pr_identity]
             update = updates.get(f"refs/heads/{pr.head_branch}")
             wanted = metadata.get(item.pr_identity)
-            active.append(DesiredExistingPR(item.pr_identity, update.new_commit_id if update else pr.reported_head_commit_id,
-                                            wanted.title if wanted else pr.title, wanted.body if wanted else pr.body))
+            active.append(
+                DesiredExistingPR(
+                    item.pr_identity,
+                    update.new_commit_id if update else pr.reported_head_commit_id,
+                    wanted.title if wanted else pr.title,
+                    wanted.body if wanted else pr.body,
+                )
+            )
         else:
             slot = slots[item.slot_id]
             if slot.pr_identity is None or slot.pr_number is None:
                 raise Error("new membership slot is not bound")
-            pr = GitHubPullRequest(slot.pr_identity, slot.pr_number, PullRequestState.OPEN, True,
-                                   operation.repository, slot.branch, slot.commit_id, slot.base_branch, "", False, False,
-                                   slot.title, slot.body)
+            pr = GitHubPullRequest(
+                slot.pr_identity,
+                slot.pr_number,
+                PullRequestState.OPEN,
+                True,
+                operation.repository,
+                slot.branch,
+                slot.commit_id,
+                slot.base_branch,
+                "",
+                False,
+                False,
+                slot.title,
+                slot.body,
+            )
             prs.append(pr)
-            active.append(DesiredExistingPR(slot.pr_identity, slot.commit_id, slot.title, slot.body))
-    dependencies = TopologyDependencies(operation.effective_config, operation.push_url,
-        operation.expected_state_oid, None, tuple(prs), operation.source_membership, (), ())
+            active.append(
+                DesiredExistingPR(
+                    slot.pr_identity, slot.commit_id, slot.title, slot.body
+                )
+            )
+    dependencies = TopologyDependencies(
+        operation.effective_config,
+        operation.push_url,
+        operation.expected_state_oid,
+        None,
+        tuple(prs),
+        operation.source_membership,
+        (),
+        (),
+    )
     detached = (
         ()
         if operation.source_tracked is None
-        else tuple(identity for identity in operation.source_tracked.ordered_prs
-                   if identity not in {item.pr_identity for item in active})
+        else tuple(
+            identity
+            for identity in operation.source_tracked.ordered_prs
+            if identity not in {item.pr_identity for item in active}
+        )
     )
-    return TopologyPlan(operation.repository, operation.repository_name, operation.remote,
-        DesiredStack(operation.repository, operation.base_branch, tuple(active)), detached,
-        operation.head_updates, operation.temporary_bases, None, dependencies)
+    return TopologyPlan(
+        operation.repository,
+        operation.repository_name,
+        operation.remote,
+        DesiredStack(operation.repository, operation.base_branch, tuple(active)),
+        detached,
+        operation.head_updates,
+        operation.temporary_bases,
+        None,
+        dependencies,
+    )
 
 
-def _membership_projection(operation: MembershipRepair, repository: GitHubRepository,
-                           workspace: str | Path) -> tuple[tuple[GitHubPullRequestSource, ...], GitHubStackSource | None]:
+def _membership_projection(
+    operation: MembershipRepair, repository: GitHubRepository, workspace: str | Path
+) -> tuple[tuple[GitHubPullRequestSource, ...], GitHubStackSource | None]:
     plan = _membership_plan(operation)
-    sources = tuple(observe_github_pull_request_by_id(repository, pr.identity, cwd=workspace)
-                    for pr in plan.dependencies.prs)
+    sources = tuple(
+        observe_github_pull_request_by_id(repository, pr.identity, cwd=workspace)
+        for pr in plan.dependencies.prs
+    )
     desired = tuple(item.pr_identity for item in plan.desired.active)
-    ids = {item.stack_id for item in sources if item.pr.identity in desired and item.stack_id is not None}
-    stack = observe_github_stack(repository, next(iter(ids)), cwd=workspace) if len(desired) >= 2 and len(ids) == 1 else None
+    ids = {
+        item.stack_id
+        for item in sources
+        if item.pr.identity in desired and item.stack_id is not None
+    }
+    stack = (
+        observe_github_stack(repository, next(iter(ids)), cwd=workspace)
+        if len(desired) >= 2 and len(ids) == 1
+        else None
+    )
     return sources, stack
 
 
-def _membership_projection_error(operation: MembershipRepair,
-                                 sources: Sequence[GitHubPullRequestSource],
-                                 stack: GitHubStackSource | None) -> str | None:
+def _membership_projection_error(
+    operation: MembershipRepair,
+    sources: Sequence[GitHubPullRequestSource],
+    stack: GitHubStackSource | None,
+) -> str | None:
     plan = _membership_plan(operation)
     error = _topology_projection_error(plan, sources, stack)
     if error is not None:
@@ -8876,33 +9462,47 @@ def _membership_projection_error(operation: MembershipRepair,
     actual = {item.pr.identity: item for item in sources}
     for identity in omitted:
         old, now = frozen[identity], actual[identity]
-        if now.stack_id is not None or (now.pr.reported_head_commit_id, now.pr.title, now.pr.body, now.pr.draft) != (
-            old.reported_head_commit_id, old.title, old.body, old.draft
-        ):
+        if now.stack_id is not None or (
+            now.pr.reported_head_commit_id,
+            now.pr.title,
+            now.pr.body,
+            now.pr.draft,
+        ) != (old.reported_head_commit_id, old.title, old.body, old.draft):
             return f"omitted pull request #{old.number} changed or is not standalone"
     return None
 
 
-def _membership_source_refs_error(operation: MembershipRepair, plan: TopologyPlan,
-                                  workspace: str | Path) -> str | None:
+def _membership_source_refs_error(
+    operation: MembershipRepair, plan: TopologyPlan, workspace: str | Path
+) -> str | None:
     """Recheck the frozen old comparisons before dissolving their association."""
     refs: list[RemoteBranchRef] = []
     expected: list[str] = []
     for pr in operation.source_prs:
-        refs.extend((RemoteBranchRef(operation.repository, f"refs/heads/{pr.head_branch}"),
-                     RemoteBranchRef(operation.repository, f"refs/heads/{pr.base_branch}")))
+        refs.extend(
+            (
+                RemoteBranchRef(operation.repository, f"refs/heads/{pr.head_branch}"),
+                RemoteBranchRef(operation.repository, f"refs/heads/{pr.base_branch}"),
+            )
+        )
         expected.extend((pr.reported_head_commit_id, pr.reported_base_commit_id))
     # Repeated predecessor refs are intentional; observe them once and compare by key.
     unique = tuple(dict.fromkeys(refs))
-    observed = {item.ref: item.commit_id for item in _topology_refs(plan, workspace, unique)}
+    observed = {
+        item.ref: item.commit_id for item in _topology_refs(plan, workspace, unique)
+    }
     for ref, oid in zip(refs, expected, strict=True):
         if observed.get(ref) != oid:
             return f"frozen live ref {ref.full_name} changed"
     return None
 
 
-def _build_membership_final_state(operation: MembershipRepair, state: TrackedState) -> TrackedState:
-    desired = tuple(item.pr_identity for item in _membership_plan(operation).desired.active)
+def _build_membership_final_state(
+    operation: MembershipRepair, state: TrackedState
+) -> TrackedState:
+    desired = tuple(
+        item.pr_identity for item in _membership_plan(operation).desired.active
+    )
     if operation.source_tracked is None:
         source_ids = {pr.identity for pr in operation.source_prs}
         if any(
@@ -8914,27 +9514,51 @@ def _build_membership_final_state(operation: MembershipRepair, state: TrackedSta
         detached: tuple[PullRequestId, ...] = ()
         stacks = state.stacks
     else:
-        matches = tuple(item for item in state.stacks if item == operation.source_tracked)
+        matches = tuple(
+            item for item in state.stacks if item == operation.source_tracked
+        )
         if len(matches) != 1:
             raise Error("private state no longer contains the exact source record")
-        omitted = tuple(identity for identity in operation.source_tracked.ordered_prs if identity not in desired)
-        detached = tuple(dict.fromkeys((*operation.source_tracked.detached_prs, *omitted)))
-        stacks = tuple(item for item in state.stacks if item != operation.source_tracked)
+        omitted = tuple(
+            identity
+            for identity in operation.source_tracked.ordered_prs
+            if identity not in desired
+        )
+        detached = tuple(
+            dict.fromkeys((*operation.source_tracked.detached_prs, *omitted))
+        )
+        stacks = tuple(
+            item for item in state.stacks if item != operation.source_tracked
+        )
     if desired:
-        stacks += (TrackedStack(operation.repository, operation.base_branch, desired, detached),)
+        stacks += (
+            TrackedStack(
+                operation.repository, operation.base_branch, desired, detached
+            ),
+        )
     publications, adoptions = state.last_published_heads, state.last_adopted_heads
     source = {pr.identity: pr for pr in operation.source_prs}
     receipts: list[LastPublishedHead] = []
     for update in operation.head_updates:
-        identity = next(identity for identity, pr in source.items()
-                        if update.ref.full_name == f"refs/heads/{pr.head_branch}")
+        identity = next(
+            identity
+            for identity, pr in source.items()
+            if update.ref.full_name == f"refs/heads/{pr.head_branch}"
+        )
         receipts.append(LastPublishedHead(identity, update.ref, update.new_commit_id))
     for slot in operation.slots:
         assert slot.pr_identity is not None
-        receipts.append(LastPublishedHead(slot.pr_identity,
-            RemoteBranchRef(operation.repository, f"refs/heads/{slot.branch}"), slot.commit_id))
+        receipts.append(
+            LastPublishedHead(
+                slot.pr_identity,
+                RemoteBranchRef(operation.repository, f"refs/heads/{slot.branch}"),
+                slot.commit_id,
+            )
+        )
     keys = {(item.pr, item.ref) for item in receipts}
-    publications = tuple(item for item in publications if (item.pr, item.ref) not in keys) + tuple(receipts)
+    publications = tuple(
+        item for item in publications if (item.pr, item.ref) not in keys
+    ) + tuple(receipts)
     adoptions = tuple(item for item in adoptions if (item.pr, item.ref) not in keys)
     return TrackedState(stacks, publications, adoptions, state.boundary_aliases)
 
@@ -8945,73 +9569,162 @@ def resume_membership_repair(workspace: str | Path) -> MembershipRepairResult:
         try:
             operation_oid, raw = read_operation(workspace)
             if not isinstance(raw, MembershipRepair):
-                return Stopped("operation", "active operation is not a membership repair")
+                return Stopped(
+                    "operation", "active operation is not a membership repair"
+                )
             operation = raw
-            repository = _frozen_repository(operation.repository, operation.repository_name, cwd=workspace)
+            repository = _frozen_repository(
+                operation.repository, operation.repository_name, cwd=workspace
+            )
         except Error as exc:
             return Stopped("operation", str(exc))
 
         def save(**changes: object) -> None:
             nonlocal operation, operation_oid
             operation = replace(operation, **changes)
-            operation_oid = cas_write_membership_repair(workspace, operation_oid, operation)
+            operation_oid = cas_write_membership_repair(
+                workspace, operation_oid, operation
+            )
 
         try:
-            if operation.phase is not MembershipRepairPhase.COMMITTING and read_ref_oid(workspace, STATE_REF) != operation.expected_state_oid:
-                return Stopped("state", "private state changed while operation is active")
+            if (
+                operation.phase is not MembershipRepairPhase.COMMITTING
+                and read_ref_oid(workspace, STATE_REF) != operation.expected_state_oid
+            ):
+                return Stopped(
+                    "state", "private state changed while operation is active"
+                )
             if operation.phase is MembershipRepairPhase.PREPARING_BOOKMARKS:
                 stopped = _prepare_publication_bookmarks(workspace, operation)  # type: ignore[arg-type]
-                if stopped: return stopped
+                if stopped:
+                    return stopped
                 save(phase=MembershipRepairPhase.PUBLISHING_NEW_REFS)
             if operation.phase is MembershipRepairPhase.PUBLISHING_NEW_REFS:
                 stopped = _prepare_publication_tracking(workspace, operation)  # type: ignore[arg-type]
-                if stopped: return stopped
+                if stopped:
+                    return stopped
                 _local, readbacks = observe_publication_slots(workspace, operation)  # type: ignore[arg-type]
                 actions = classify_publication_recovery(operation, readbacks)  # type: ignore[arg-type]
-                if isinstance(actions, Stopped): return actions
-                pending = tuple(slot for slot, action in zip(operation.slots, actions, strict=True)
-                                if slot.phase is NewPRPhase.NOT_ATTEMPTED and action is PublicationRecoveryAction.PUSH)
+                if isinstance(actions, Stopped):
+                    return actions
+                pending = tuple(
+                    slot
+                    for slot, action in zip(operation.slots, actions, strict=True)
+                    if slot.phase is NewPRPhase.NOT_ATTEMPTED
+                    and action is PublicationRecoveryAction.PUSH
+                )
                 if pending:
-                    save(slots=tuple(replace(slot, phase=NewPRPhase.PUBLICATION_POSSIBLY_SENT) if slot in pending else slot for slot in operation.slots))
-                retries = tuple(slot for slot, action in zip(operation.slots, actions, strict=True) if action is PublicationRecoveryAction.PUSH)
-                if retries: push_new_slot_refs(workspace, operation, retries)  # type: ignore[arg-type]
+                    save(
+                        slots=tuple(
+                            replace(slot, phase=NewPRPhase.PUBLICATION_POSSIBLY_SENT)
+                            if slot in pending
+                            else slot
+                            for slot in operation.slots
+                        )
+                    )
+                retries = tuple(
+                    slot
+                    for slot, action in zip(operation.slots, actions, strict=True)
+                    if action is PublicationRecoveryAction.PUSH
+                )
+                if retries:
+                    push_new_slot_refs(workspace, operation, retries)  # type: ignore[arg-type]
                 _local, readbacks = observe_publication_slots(workspace, operation)  # type: ignore[arg-type]
                 actions = classify_publication_recovery(operation, readbacks)  # type: ignore[arg-type]
-                if isinstance(actions, Stopped): return actions
+                if isinstance(actions, Stopped):
+                    return actions
                 for slot, action in zip(operation.slots, actions, strict=True):
-                    if action is PublicationRecoveryAction.TRACK: track_publication_bookmark(workspace, operation, slot)  # type: ignore[arg-type]
+                    if action is PublicationRecoveryAction.TRACK:
+                        track_publication_bookmark(workspace, operation, slot)  # type: ignore[arg-type]
                 if PublicationRecoveryAction.TRACK in actions:
                     _local, readbacks = observe_publication_slots(workspace, operation)  # type: ignore[arg-type]
                     actions = classify_publication_recovery(operation, readbacks)  # type: ignore[arg-type]
-                if isinstance(actions, Stopped) or any(item is not PublicationRecoveryAction.READY for item in actions):
-                    return actions if isinstance(actions, Stopped) else Stopped("publish", "new refs are not exact and tracked")
-                save(slots=tuple(replace(slot, phase=NewPRPhase.READY) for slot in operation.slots), phase=MembershipRepairPhase.CREATING_PRS)
+                if isinstance(actions, Stopped) or any(
+                    item is not PublicationRecoveryAction.READY for item in actions
+                ):
+                    return (
+                        actions
+                        if isinstance(actions, Stopped)
+                        else Stopped("publish", "new refs are not exact and tracked")
+                    )
+                save(
+                    slots=tuple(
+                        replace(slot, phase=NewPRPhase.READY)
+                        for slot in operation.slots
+                    ),
+                    phase=MembershipRepairPhase.CREATING_PRS,
+                )
             if operation.phase is MembershipRepairPhase.CREATING_PRS:
                 for index, slot in enumerate(operation.slots):
                     if slot.phase is NewPRPhase.READY:
-                        slot = replace(slot, phase=NewPRPhase.POSSIBLY_SENT); slots = list(operation.slots); slots[index] = slot; save(slots=tuple(slots))
-                        try: matches = (create_slot_pull_request(workspace, operation, slot),)  # type: ignore[arg-type]
-                        except Error: matches = find_slot_pull_requests(workspace, operation, slot)  # type: ignore[arg-type]
+                        slot = replace(slot, phase=NewPRPhase.POSSIBLY_SENT)
+                        slots = list(operation.slots)
+                        slots[index] = slot
+                        save(slots=tuple(slots))
+                        try:
+                            matches = (
+                                create_slot_pull_request(workspace, operation, slot),
+                            )  # type: ignore[arg-type]
+                        except Error:
+                            matches = find_slot_pull_requests(
+                                workspace, operation, slot
+                            )  # type: ignore[arg-type]
                     elif slot.phase is NewPRPhase.POSSIBLY_SENT:
                         matches = find_slot_pull_requests(workspace, operation, slot)  # type: ignore[arg-type]
-                    else: matches = ()
+                    else:
+                        matches = ()
                     if slot.phase is NewPRPhase.POSSIBLY_SENT:
-                        valid = tuple(pr for pr in matches if _slot_pr_matches(slot, pr, initial=True))
-                        if len(valid) != 1: return Stopped("create-pr", "possibly sent; marker lookup did not find exactly one matching PR")
-                        slot = replace(slot, phase=NewPRPhase.BOUND, pr_identity=valid[0].identity, pr_number=valid[0].number)
-                        slots = list(operation.slots); slots[index] = slot; save(slots=tuple(slots))
+                        valid = tuple(
+                            pr
+                            for pr in matches
+                            if _slot_pr_matches(slot, pr, initial=True)
+                        )
+                        if len(valid) != 1:
+                            return Stopped(
+                                "create-pr",
+                                "possibly sent; marker lookup did not find exactly one matching PR",
+                            )
+                        slot = replace(
+                            slot,
+                            phase=NewPRPhase.BOUND,
+                            pr_identity=valid[0].identity,
+                            pr_number=valid[0].number,
+                        )
+                        slots = list(operation.slots)
+                        slots[index] = slot
+                        save(slots=tuple(slots))
                     if slot.phase is NewPRPhase.BOUND:
                         assert slot.pr_identity is not None
-                        update_frozen_pr_metadata(workspace, PRMetadataUpdate(slot.pr_identity, slot.title, slot.body))
-                        found = find_slot_pull_requests(workspace, operation, slot, marker_only=False)  # type: ignore[arg-type]
-                        if len(tuple(pr for pr in found if pr.identity == slot.pr_identity and _slot_pr_matches(slot, pr, initial=False))) != 1:
-                            return Stopped("metadata", "bound PR did not reach frozen metadata")
-                        slots = list(operation.slots); slots[index] = replace(slot, phase=NewPRPhase.VERIFIED); save(slots=tuple(slots))
+                        update_frozen_pr_metadata(
+                            workspace,
+                            PRMetadataUpdate(slot.pr_identity, slot.title, slot.body),
+                        )
+                        found = find_slot_pull_requests(
+                            workspace, operation, slot, marker_only=False
+                        )  # type: ignore[arg-type]
+                        if (
+                            len(
+                                tuple(
+                                    pr
+                                    for pr in found
+                                    if pr.identity == slot.pr_identity
+                                    and _slot_pr_matches(slot, pr, initial=False)
+                                )
+                            )
+                            != 1
+                        ):
+                            return Stopped(
+                                "metadata", "bound PR did not reach frozen metadata"
+                            )
+                        slots = list(operation.slots)
+                        slots[index] = replace(slot, phase=NewPRPhase.VERIFIED)
+                        save(slots=tuple(slots))
                 save(phase=MembershipRepairPhase.UNSTACKING_SOURCE)
             plan = _membership_plan(operation)
             if operation.phase is MembershipRepairPhase.UNSTACKING_SOURCE:
                 refs_error = _membership_source_refs_error(operation, plan, workspace)
-                if refs_error: return Stopped("revalidate", refs_error)
+                if refs_error:
+                    return Stopped("revalidate", refs_error)
                 if isinstance(operation.source_membership, StandalonePullRequestSet):
                     sources = tuple(
                         _observe_topology_pr(
@@ -9029,8 +9742,20 @@ def resume_membership_repair(workspace: str | Path) -> MembershipRepairResult:
                     )
                 if isinstance(operation.source_membership, ServerStackMembership):
                     if stack is not None and not operation.source_unstack_possibly_sent:
-                        save(source_unstack_possibly_sent=True); run_stack_unstack(workspace, plan, operation.source_membership.server_stack_number)
-                    if prove_stack_dissolved(repository, operation.source_membership.server_stack_number, cwd=workspace) is not StackDissolution.ABSENT:
+                        save(source_unstack_possibly_sent=True)
+                        run_stack_unstack(
+                            workspace,
+                            plan,
+                            operation.source_membership.server_stack_number,
+                        )
+                    if (
+                        prove_stack_dissolved(
+                            repository,
+                            operation.source_membership.server_stack_number,
+                            cwd=workspace,
+                        )
+                        is not StackDissolution.ABSENT
+                    ):
                         return Stopped("unstack", "old stack dissolution is unproven")
                     sources, _stack = _observe_source_association(
                         _membership_carrier(operation).plan,
@@ -9038,130 +9763,368 @@ def resume_membership_repair(workspace: str | Path) -> MembershipRepairResult:
                         allow_dissolved=True,
                         cwd=workspace,
                     )
-                if any(item.stack_id is not None for item in sources): return Stopped("unstack", "source stack still survives")
+                if any(item.stack_id is not None for item in sources):
+                    return Stopped("unstack", "source stack still survives")
                 save(phase=MembershipRepairPhase.TRANSITIONING_BASES)
             if operation.phase is MembershipRepairPhase.TRANSITIONING_BASES:
-                all_sources, _stack = _membership_projection(operation, repository, workspace)
+                all_sources, _stack = _membership_projection(
+                    operation, repository, workspace
+                )
                 if any(item.stack_id is not None for item in all_sources):
-                    return Stopped("temporary-base", "a source or new PR is not standalone")
+                    return Stopped(
+                        "temporary-base", "a source or new PR is not standalone"
+                    )
                 refs = tuple(item.ref for item in operation.temporary_bases)
-                values = tuple(item.commit_id for item in _topology_refs(plan, workspace, refs))
-                old = tuple(item.old_base_commit_id for item in operation.temporary_bases)
+                values = tuple(
+                    item.commit_id for item in _topology_refs(plan, workspace, refs)
+                )
+                old = tuple(
+                    item.old_base_commit_id for item in operation.temporary_bases
+                )
                 if values == (None,) * len(refs) and refs:
-                    create_temporary_bases(workspace, operation.push_url, operation.temporary_bases)
-                    values = tuple(item.commit_id for item in _topology_refs(plan, workspace, refs))
-                if values != old: return Stopped("temporary-bases", "temporary-base readback is absent, mixed, or foreign")
+                    create_temporary_bases(
+                        workspace, operation.push_url, operation.temporary_bases
+                    )
+                    values = tuple(
+                        item.commit_id for item in _topology_refs(plan, workspace, refs)
+                    )
+                if values != old:
+                    return Stopped(
+                        "temporary-bases",
+                        "temporary-base readback is absent, mixed, or foreign",
+                    )
                 frozen = {pr.identity: pr for pr in operation.source_prs}
                 for item in operation.temporary_bases:
-                    source = _observe_topology_pr(repository, frozen[item.pr_identity], by_node_id=True, cwd=workspace)
+                    source = _observe_topology_pr(
+                        repository,
+                        frozen[item.pr_identity],
+                        by_node_id=True,
+                        cwd=workspace,
+                    )
                     name = item.ref.full_name.removeprefix("refs/heads/")
-                    if source.stack_id is not None: return Stopped("temporary-base", "a stack association reappeared")
+                    if source.stack_id is not None:
+                        return Stopped(
+                            "temporary-base", "a stack association reappeared"
+                        )
                     if source.pr.base_branch == name:
                         if item.pr_identity in operation.base_transitions_possibly_sent:
-                            save(base_transitions_possibly_sent=tuple(identity for identity in operation.base_transitions_possibly_sent if identity != item.pr_identity))
+                            save(
+                                base_transitions_possibly_sent=tuple(
+                                    identity
+                                    for identity in operation.base_transitions_possibly_sent
+                                    if identity != item.pr_identity
+                                )
+                            )
                         continue
                     if source.pr.base_branch != name:
-                        if source.pr.base_branch != frozen[item.pr_identity].base_branch: return Stopped("temporary-base", "PR base is foreign")
+                        if (
+                            source.pr.base_branch
+                            != frozen[item.pr_identity].base_branch
+                        ):
+                            return Stopped("temporary-base", "PR base is foreign")
                         if item.pr_identity in operation.base_transitions_possibly_sent:
-                            return Stopped("temporary-base", "possibly sent base edit still reads as its old base")
-                        save(base_transitions_possibly_sent=(*operation.base_transitions_possibly_sent, item.pr_identity))
-                        run_pr_base_edit(workspace, plan, item.pr_identity, source.pr.base_branch, name)
-                        if _observe_topology_pr(repository, frozen[item.pr_identity], by_node_id=True, cwd=workspace).pr.base_branch != name: return Stopped("temporary-base", "base edit did not read back")
-                        save(base_transitions_possibly_sent=tuple(identity for identity in operation.base_transitions_possibly_sent if identity != item.pr_identity))
+                            return Stopped(
+                                "temporary-base",
+                                "possibly sent base edit still reads as its old base",
+                            )
+                        save(
+                            base_transitions_possibly_sent=(
+                                *operation.base_transitions_possibly_sent,
+                                item.pr_identity,
+                            )
+                        )
+                        run_pr_base_edit(
+                            workspace,
+                            plan,
+                            item.pr_identity,
+                            source.pr.base_branch,
+                            name,
+                        )
+                        if (
+                            _observe_topology_pr(
+                                repository,
+                                frozen[item.pr_identity],
+                                by_node_id=True,
+                                cwd=workspace,
+                            ).pr.base_branch
+                            != name
+                        ):
+                            return Stopped(
+                                "temporary-base", "base edit did not read back"
+                            )
+                        save(
+                            base_transitions_possibly_sent=tuple(
+                                identity
+                                for identity in operation.base_transitions_possibly_sent
+                                if identity != item.pr_identity
+                            )
+                        )
                 save(phase=MembershipRepairPhase.PUBLISHING)
             if operation.phase is MembershipRepairPhase.PUBLISHING:
-                refs = tuple(item.ref for item in operation.head_updates) + tuple(item.ref for item in operation.temporary_bases)
-                old = tuple(item.expected_old_commit_id for item in operation.head_updates) + tuple(item.old_base_commit_id for item in operation.temporary_bases)
-                final = tuple(item.new_commit_id for item in operation.head_updates) + tuple(item.new_base_commit_id for item in operation.temporary_bases)
-                values = tuple(item.commit_id for item in _topology_refs(plan, workspace, refs))
+                refs = tuple(item.ref for item in operation.head_updates) + tuple(
+                    item.ref for item in operation.temporary_bases
+                )
+                old = tuple(
+                    item.expected_old_commit_id for item in operation.head_updates
+                ) + tuple(item.old_base_commit_id for item in operation.temporary_bases)
+                final = tuple(
+                    item.new_commit_id for item in operation.head_updates
+                ) + tuple(item.new_base_commit_id for item in operation.temporary_bases)
+                values = tuple(
+                    item.commit_id for item in _topology_refs(plan, workspace, refs)
+                )
                 if values == old and refs:
-                    save(publication_possibly_sent=tuple(item.ref for item in operation.head_updates))
-                    move_temporary_bases(workspace, operation.push_url, operation.head_updates, operation.temporary_bases)
-                    values = tuple(item.commit_id for item in _topology_refs(plan, workspace, refs))
-                if values != final: return Stopped("publish", "transition readback is old, mixed, or foreign")
+                    save(
+                        publication_possibly_sent=tuple(
+                            item.ref for item in operation.head_updates
+                        )
+                    )
+                    move_temporary_bases(
+                        workspace,
+                        operation.push_url,
+                        operation.head_updates,
+                        operation.temporary_bases,
+                    )
+                    values = tuple(
+                        item.commit_id for item in _topology_refs(plan, workspace, refs)
+                    )
+                if values != final:
+                    return Stopped(
+                        "publish", "transition readback is old, mixed, or foreign"
+                    )
                 save(phase=MembershipRepairPhase.RELINKING)
             if operation.phase is MembershipRepairPhase.RELINKING:
-                bases = _topology_desired_bases(plan); frozen = {pr.identity: pr for pr in plan.dependencies.prs}
-                metadata = {item.pr_identity: item for item in operation.metadata_updates}
+                bases = _topology_desired_bases(plan)
+                frozen = {pr.identity: pr for pr in plan.dependencies.prs}
+                metadata = {
+                    item.pr_identity: item for item in operation.metadata_updates
+                }
                 for wanted in plan.desired.active:
-                    source = _observe_topology_pr(repository, frozen[wanted.pr_identity], by_node_id=True, expected_head_commit_id=wanted.desired_commit_id, cwd=workspace)
-                    if source.stack_id is not None: return Stopped("relink", "a stack association reappeared")
-                    if source.pr.base_branch == bases[wanted.pr_identity] and wanted.pr_identity in operation.base_transitions_possibly_sent:
-                        save(base_transitions_possibly_sent=tuple(identity for identity in operation.base_transitions_possibly_sent if identity != wanted.pr_identity))
+                    source = _observe_topology_pr(
+                        repository,
+                        frozen[wanted.pr_identity],
+                        by_node_id=True,
+                        expected_head_commit_id=wanted.desired_commit_id,
+                        cwd=workspace,
+                    )
+                    if source.stack_id is not None:
+                        return Stopped("relink", "a stack association reappeared")
+                    if (
+                        source.pr.base_branch == bases[wanted.pr_identity]
+                        and wanted.pr_identity
+                        in operation.base_transitions_possibly_sent
+                    ):
+                        save(
+                            base_transitions_possibly_sent=tuple(
+                                identity
+                                for identity in operation.base_transitions_possibly_sent
+                                if identity != wanted.pr_identity
+                            )
+                        )
                     if source.pr.base_branch != bases[wanted.pr_identity]:
-                        if wanted.pr_identity in operation.base_transitions_possibly_sent:
-                            return Stopped("relink", "possibly sent final base edit still reads as its old base")
-                        save(base_transitions_possibly_sent=(*operation.base_transitions_possibly_sent, wanted.pr_identity))
-                        run_pr_base_edit(workspace, plan, wanted.pr_identity, source.pr.base_branch, bases[wanted.pr_identity])
-                        verified = _observe_topology_pr(repository, frozen[wanted.pr_identity], by_node_id=True, expected_head_commit_id=wanted.desired_commit_id, cwd=workspace)
-                        if verified.pr.base_branch != bases[wanted.pr_identity]: return Stopped("relink", "final base edit did not read back")
-                        save(base_transitions_possibly_sent=tuple(identity for identity in operation.base_transitions_possibly_sent if identity != wanted.pr_identity))
+                        if (
+                            wanted.pr_identity
+                            in operation.base_transitions_possibly_sent
+                        ):
+                            return Stopped(
+                                "relink",
+                                "possibly sent final base edit still reads as its old base",
+                            )
+                        save(
+                            base_transitions_possibly_sent=(
+                                *operation.base_transitions_possibly_sent,
+                                wanted.pr_identity,
+                            )
+                        )
+                        run_pr_base_edit(
+                            workspace,
+                            plan,
+                            wanted.pr_identity,
+                            source.pr.base_branch,
+                            bases[wanted.pr_identity],
+                        )
+                        verified = _observe_topology_pr(
+                            repository,
+                            frozen[wanted.pr_identity],
+                            by_node_id=True,
+                            expected_head_commit_id=wanted.desired_commit_id,
+                            cwd=workspace,
+                        )
+                        if verified.pr.base_branch != bases[wanted.pr_identity]:
+                            return Stopped(
+                                "relink", "final base edit did not read back"
+                            )
+                        save(
+                            base_transitions_possibly_sent=tuple(
+                                identity
+                                for identity in operation.base_transitions_possibly_sent
+                                if identity != wanted.pr_identity
+                            )
+                        )
                     update = metadata.get(wanted.pr_identity)
-                    if update is not None and (source.pr.title, source.pr.body) != (update.title, update.body):
+                    if update is not None and (source.pr.title, source.pr.body) != (
+                        update.title,
+                        update.body,
+                    ):
                         update_frozen_pr_metadata(workspace, update)
                 if len(plan.desired.active) >= 2 and not operation.relink_possibly_sent:
-                    save(relink_possibly_sent=True); run_topology_stack_link(workspace, plan)
-                sources, stack = _membership_projection(operation, repository, workspace)
+                    save(relink_possibly_sent=True)
+                    run_topology_stack_link(workspace, plan)
+                sources, stack = _membership_projection(
+                    operation, repository, workspace
+                )
                 error = _membership_projection_error(operation, sources, stack)
-                if error: return Stopped("relink", error)
-                save(phase=MembershipRepairPhase.VERIFYING, resulting_stack=stack.identity if stack else None)
+                if error:
+                    return Stopped("relink", error)
+                save(
+                    phase=MembershipRepairPhase.VERIFYING,
+                    resulting_stack=stack.identity if stack else None,
+                )
             if operation.phase is MembershipRepairPhase.VERIFYING:
                 for _ in range(2):
-                    sources, stack = _membership_projection(operation, repository, workspace)
+                    sources, stack = _membership_projection(
+                        operation, repository, workspace
+                    )
                     error = _membership_projection_error(operation, sources, stack)
-                    if error: return Stopped("verify", error)
+                    if error:
+                        return Stopped("verify", error)
                 state_oid, state = read_state(workspace)
-                if state_oid != operation.expected_state_oid: return Stopped("state", "private state changed before commit")
-                final_json = state_to_json(_build_membership_final_state(operation, state))
-                final_oid = _run(["git", f"--git-dir={git_common_dir(workspace)}", "hash-object", "-w", "--stdin"], stdin=final_json).strip()
-                save(phase=MembershipRepairPhase.COMMITTING, final_state_json=final_json, final_state_oid=final_oid)
+                if state_oid != operation.expected_state_oid:
+                    return Stopped("state", "private state changed before commit")
+                final_json = state_to_json(
+                    _build_membership_final_state(operation, state)
+                )
+                final_oid = _run(
+                    [
+                        "git",
+                        f"--git-dir={git_common_dir(workspace)}",
+                        "hash-object",
+                        "-w",
+                        "--stdin",
+                    ],
+                    stdin=final_json,
+                ).strip()
+                save(
+                    phase=MembershipRepairPhase.COMMITTING,
+                    final_state_json=final_json,
+                    final_state_oid=final_oid,
+                )
             if operation.phase is MembershipRepairPhase.COMMITTING:
                 current = read_ref_oid(workspace, STATE_REF)
                 if current == operation.expected_state_oid:
-                    sources, stack = _membership_projection(operation, repository, workspace)
+                    sources, stack = _membership_projection(
+                        operation, repository, workspace
+                    )
                     error = _membership_projection_error(operation, sources, stack)
-                    if error: return Stopped("verify", error)
+                    if error:
+                        return Stopped("verify", error)
                     assert operation.final_state_json is not None
-                    if cas_write_state(workspace, current, parse_state(operation.final_state_json)) != operation.final_state_oid: return Stopped("state", "committed state differs from frozen OID")
-                elif current != operation.final_state_oid: return Stopped("state", "private state is neither expected nor final")
+                    if (
+                        cas_write_state(
+                            workspace, current, parse_state(operation.final_state_json)
+                        )
+                        != operation.final_state_oid
+                    ):
+                        return Stopped(
+                            "state", "committed state differs from frozen OID"
+                        )
+                elif current != operation.final_state_oid:
+                    return Stopped(
+                        "state", "private state is neither expected nor final"
+                    )
                 # Refuse cleanup while any PR still names an operation-owned base.
-                sources, _stack = _membership_projection(operation, repository, workspace)
-                names = {item.ref.full_name.removeprefix("refs/heads/") for item in operation.temporary_bases}
-                if any(item.pr.base_branch in names for item in sources): return Stopped("cleanup", "a PR still uses a temporary base")
-                for item, live in zip(operation.temporary_bases, _topology_refs(plan, workspace, tuple(x.ref for x in operation.temporary_bases)), strict=True):
-                    if live.commit_id is None: continue
-                    if live.commit_id != item.new_base_commit_id: return Stopped("cleanup", "temporary base branch moved externally")
-                    subprocess.run(_delete_temporary_base_command(workspace, plan, item), text=True, capture_output=True, check=False)
-                    if _topology_refs(plan, workspace, (item.ref,)) != (LiveRemoteRef(item.ref, None),): return Stopped("cleanup", "temporary-base deletion was not verified")
+                sources, _stack = _membership_projection(
+                    operation, repository, workspace
+                )
+                names = {
+                    item.ref.full_name.removeprefix("refs/heads/")
+                    for item in operation.temporary_bases
+                }
+                if any(item.pr.base_branch in names for item in sources):
+                    return Stopped("cleanup", "a PR still uses a temporary base")
+                for item, live in zip(
+                    operation.temporary_bases,
+                    _topology_refs(
+                        plan, workspace, tuple(x.ref for x in operation.temporary_bases)
+                    ),
+                    strict=True,
+                ):
+                    if live.commit_id is None:
+                        continue
+                    if live.commit_id != item.new_base_commit_id:
+                        return Stopped(
+                            "cleanup", "temporary base branch moved externally"
+                        )
+                    subprocess.run(
+                        _delete_temporary_base_command(workspace, plan, item),
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    if _topology_refs(plan, workspace, (item.ref,)) != (
+                        LiveRemoteRef(item.ref, None),
+                    ):
+                        return Stopped(
+                            "cleanup", "temporary-base deletion was not verified"
+                        )
                 cas_delete_operation(workspace, operation_oid)
-                return MembershipRepairVerified(tuple(item.pr_identity for item in plan.desired.active))
+                return MembershipRepairVerified(
+                    tuple(item.pr_identity for item in plan.desired.active)
+                )
         except Error as exc:
             return Stopped(operation.phase.value, str(exc))
         return Stopped("operation", "membership operation reached no terminal state")
 
 
-def resume_preserved_prefix_repair(workspace: str | Path) -> PreservedPrefixRepairResult:
+def resume_preserved_prefix_repair(
+    workspace: str | Path,
+) -> PreservedPrefixRepairResult:
     with repository_lock(workspace):
         try:
             operation_oid, raw = read_operation(workspace)
             if not isinstance(raw, PreservedPrefixRepair):
-                return Stopped("operation", "active operation is not a preserved-prefix repair")
+                return Stopped(
+                    "operation", "active operation is not a preserved-prefix repair"
+                )
             operation = raw
             plan = operation.plan.carrier
+
             def save(**changes) -> None:
                 nonlocal operation, operation_oid
                 operation = replace(operation, **changes)
-                operation_oid = cas_write_preserved_prefix_repair(workspace, operation_oid, operation)
+                operation_oid = cas_write_preserved_prefix_repair(
+                    workspace, operation_oid, operation
+                )
+
             def refs() -> tuple[str | None, ...]:
-                targets = tuple(item.ref for item in plan.head_updates) + (operation.plan.boundary.ref, operation.plan.integration.ref)
-                return tuple(item.commit_id for item in _topology_refs(plan, workspace, targets))
-            old = tuple(item.expected_old_commit_id for item in plan.head_updates) + (operation.plan.boundary.commit_id, operation.plan.integration.commit_id)
-            final = tuple(item.new_commit_id for item in plan.head_updates) + (operation.plan.integration.commit_id, operation.plan.integration.commit_id)
-            if operation.phase is not PreservedPrefixRepairPhase.COMMITTING and read_ref_oid(workspace, STATE_REF) != plan.dependencies.state_blob_oid:
-                return Stopped("state", "private state changed while operation is active")
+                targets = tuple(item.ref for item in plan.head_updates) + (
+                    operation.plan.boundary.ref,
+                    operation.plan.integration.ref,
+                )
+                return tuple(
+                    item.commit_id for item in _topology_refs(plan, workspace, targets)
+                )
+
+            old = tuple(item.expected_old_commit_id for item in plan.head_updates) + (
+                operation.plan.boundary.commit_id,
+                operation.plan.integration.commit_id,
+            )
+            final = tuple(item.new_commit_id for item in plan.head_updates) + (
+                operation.plan.integration.commit_id,
+                operation.plan.integration.commit_id,
+            )
+            if (
+                operation.phase is not PreservedPrefixRepairPhase.COMMITTING
+                and read_ref_oid(workspace, STATE_REF)
+                != plan.dependencies.state_blob_oid
+            ):
+                return Stopped(
+                    "state", "private state changed while operation is active"
+                )
             if operation.phase is PreservedPrefixRepairPhase.PUBLISHING:
                 error = _preserved_error(operation, workspace, "full")
-                if error is not None: return Stopped("publish", error)
+                if error is not None:
+                    return Stopped("publish", error)
                 values = refs()
                 if values == old:
                     save(publication_possibly_sent=True)
@@ -9169,58 +10132,106 @@ def resume_preserved_prefix_repair(workspace: str | Path) -> PreservedPrefixRepa
                     values = refs()
                 if values != final:
                     classification = "old" if values == old else "mixed-or-foreign"
-                    return Stopped("publish", f"atomic publication readback is {classification}")
+                    return Stopped(
+                        "publish", f"atomic publication readback is {classification}"
+                    )
                 save(phase=PreservedPrefixRepairPhase.UNSTACKING)
             if operation.phase is PreservedPrefixRepairPhase.UNSTACKING:
                 # Every mutation gets a fresh automation/identity read before it.
                 error = _preserved_error(operation, workspace, "full")
-                if refs() != final: return Stopped("unstack", "refs changed before unstack")
+                if refs() != final:
+                    return Stopped("unstack", "refs changed before unstack")
                 if error is None:
                     if operation.unstack_possibly_sent:
-                        return Stopped("unstack", "possibly sent unstack still reads as its old membership")
+                        return Stopped(
+                            "unstack",
+                            "possibly sent unstack still reads as its old membership",
+                        )
                     save(unstack_possibly_sent=True)
                     run_stack_unstack(workspace, plan, operation.plan.stack.number)
                 error = _preserved_error(operation, workspace, "prefix")
-                if error is not None: return Stopped("unstack", f"partial or unsafe unstack: {error}")
+                if error is not None:
+                    return Stopped("unstack", f"partial or unsafe unstack: {error}")
                 save(phase=PreservedPrefixRepairPhase.RELINKING)
             if operation.phase is PreservedPrefixRepairPhase.RELINKING:
                 error = _preserved_error(operation, workspace, "prefix")
-                if refs() != final: return Stopped("relink", "refs changed before relink")
+                if refs() != final:
+                    return Stopped("relink", "refs changed before relink")
                 final_error = _preserved_error(operation, workspace, "final")
                 if error is None:
                     if operation.relink_possibly_sent:
-                        return Stopped("relink", "possibly sent stack add still reads as its old membership")
+                        return Stopped(
+                            "relink",
+                            "possibly sent stack add still reads as its old membership",
+                        )
                     save(relink_possibly_sent=True)
                     run_preserved_prefix_stack_link(workspace, operation)
                     final_error = _preserved_error(operation, workspace, "final")
                 elif final_error is not None:
                     return Stopped("relink", error)
                 error = final_error
-                if error is not None: return Stopped("relink", f"same-ID link readback failed: {error}")
+                if error is not None:
+                    return Stopped("relink", f"same-ID link readback failed: {error}")
                 save(phase=PreservedPrefixRepairPhase.VERIFYING)
             if operation.phase is PreservedPrefixRepairPhase.VERIFYING:
                 for _ in range(2):
                     error = _preserved_error(operation, workspace, "final")
-                    if error is not None: return Stopped("verify", error)
-                    if refs() != final: return Stopped("verify", "heads, boundary, or integration changed")
+                    if error is not None:
+                        return Stopped("verify", error)
+                    if refs() != final:
+                        return Stopped(
+                            "verify", "heads, boundary, or integration changed"
+                        )
                 state_oid, state = read_state(workspace)
-                if state_oid != plan.dependencies.state_blob_oid: return Stopped("state", "private state changed before commit")
-                final_json = state_to_json(_build_preserved_prefix_state(operation, state))
-                final_oid = _run(["git", f"--git-dir={git_common_dir(workspace)}", "hash-object", "-w", "--stdin"], stdin=final_json).strip()
-                save(phase=PreservedPrefixRepairPhase.COMMITTING, final_state_json=final_json, final_state_oid=final_oid)
+                if state_oid != plan.dependencies.state_blob_oid:
+                    return Stopped("state", "private state changed before commit")
+                final_json = state_to_json(
+                    _build_preserved_prefix_state(operation, state)
+                )
+                final_oid = _run(
+                    [
+                        "git",
+                        f"--git-dir={git_common_dir(workspace)}",
+                        "hash-object",
+                        "-w",
+                        "--stdin",
+                    ],
+                    stdin=final_json,
+                ).strip()
+                save(
+                    phase=PreservedPrefixRepairPhase.COMMITTING,
+                    final_state_json=final_json,
+                    final_state_oid=final_oid,
+                )
             if operation.phase is PreservedPrefixRepairPhase.COMMITTING:
                 current = read_ref_oid(workspace, STATE_REF)
                 if current == plan.dependencies.state_blob_oid:
                     error = _preserved_error(operation, workspace, "final")
-                    if error is not None or refs() != final: return Stopped("verify", error or "final refs changed")
+                    if error is not None or refs() != final:
+                        return Stopped("verify", error or "final refs changed")
                     assert operation.final_state_json is not None
-                    if cas_write_state(workspace, current, parse_state(operation.final_state_json)) != operation.final_state_oid: return Stopped("state", "committed state differs from frozen OID")
+                    if (
+                        cas_write_state(
+                            workspace, current, parse_state(operation.final_state_json)
+                        )
+                        != operation.final_state_oid
+                    ):
+                        return Stopped(
+                            "state", "committed state differs from frozen OID"
+                        )
                 elif current != operation.final_state_oid:
-                    return Stopped("state", "private state is neither expected nor final")
+                    return Stopped(
+                        "state", "private state is neither expected nor final"
+                    )
                 cas_delete_operation(workspace, operation_oid)
-                return PreservedPrefixRepairVerified(tuple(item.pr_identity for item in plan.desired.active))
+                return PreservedPrefixRepairVerified(
+                    tuple(item.pr_identity for item in plan.desired.active)
+                )
         except Error as exc:
-            return Stopped(operation.phase.value if "operation" in locals() else "operation", str(exc))
+            return Stopped(
+                operation.phase.value if "operation" in locals() else "operation",
+                str(exc),
+            )
     return Stopped("operation", "preserved-prefix operation reached no terminal state")
 
 
@@ -9302,7 +10313,7 @@ def observe_historical_pull_request_collisions(
                 f"base{index}: pullRequests(first: 100, states: [OPEN, CLOSED, MERGED], baseRefName: ${variable}) {{ {fields} }}",
             )
         )
-    query = f"""query({', '.join(definitions)}) {{
+    query = f"""query({", ".join(definitions)}) {{
   repository(owner: $owner, name: $name) {{
     id
     {chr(10).join(selections)}
@@ -9318,21 +10329,20 @@ def observe_historical_pull_request_collisions(
         {"data"},
         "GitHub historical collision response",
     )
-    data = _exact_record(
-        response["data"], {"repository"}, "historical collision data"
-    )
+    data = _exact_record(response["data"], {"repository"}, "historical collision data")
     raw_repository = data["repository"]
     if raw_repository is None:
         raise IncompleteSource("GitHub repository is unavailable")
     aliases = {
-        f"{kind}{index}"
-        for index in range(len(branches))
-        for kind in ("head", "base")
+        f"{kind}{index}" for index in range(len(branches)) for kind in ("head", "base")
     }
     record = _exact_record(
         raw_repository, {"id", *aliases}, "historical collision repository"
     )
-    if _text(record["id"], "historical collision repository ID") != repository.identity.node_id:
+    if (
+        _text(record["id"], "historical collision repository ID")
+        != repository.identity.node_id
+    ):
         raise SourceMismatch("push destination and historical PR repository differ")
     result: dict[PullRequestId, GitHubPullRequest] = {}
     for alias in sorted(aliases):
@@ -9392,7 +10402,7 @@ def observe_open_pull_request_candidates(
       pageInfo {{ hasNextPage }}
     }}"""
         )
-    query = f"""query({', '.join(definitions)}) {{
+    query = f"""query({", ".join(definitions)}) {{
   repository(owner: $owner, name: $name) {{
     id
     {chr(10).join(selections)}
@@ -9421,13 +10431,17 @@ def observe_open_pull_request_candidates(
     result: list[GitHubPullRequestSource] = []
     for index, branch in enumerate(branches):
         connection = _exact_record(
-            record[f"candidate{index}"], {"nodes", "pageInfo"}, "candidate PR connection"
+            record[f"candidate{index}"],
+            {"nodes", "pageInfo"},
+            "candidate PR connection",
         )
         page = _exact_record(
             connection["pageInfo"], {"hasNextPage"}, "candidate PR page"
         )
         if page["hasNextPage"] is not False:
-            raise SourceMismatch(f"multiple open pull requests use head branch {branch}")
+            raise SourceMismatch(
+                f"multiple open pull requests use head branch {branch}"
+            )
         nodes = connection["nodes"]
         if not isinstance(nodes, list):
             raise MalformedSource("candidate pull request nodes must be an array")
@@ -9436,13 +10450,19 @@ def observe_open_pull_request_candidates(
                 raise MalformedSource("candidate pull request node must be an object")
             number = node.get("number")
             if type(number) is not int:
-                raise MalformedSource("candidate pull request number must be an integer")
+                raise MalformedSource(
+                    "candidate pull request number must be an integer"
+                )
             source = _parse_pr_source(node, repository, number)
             if source.pr.head_branch != branch:
-                raise SourceMismatch("GitHub returned a different candidate head branch")
+                raise SourceMismatch(
+                    "GitHub returned a different candidate head branch"
+                )
             result.append(source)
     if len({item.pr.identity for item in result}) != len(result):
-        raise SourceMismatch("candidate head branches resolve to overlapping pull requests")
+        raise SourceMismatch(
+            "candidate head branches resolve to overlapping pull requests"
+        )
     return tuple(result)
 
 
@@ -9561,7 +10581,9 @@ def classify_complete_membership_boundaries(
             "duplicate-selection", "stack", "selected boundaries must be unique"
         )
     for pr in prs:
-        bookmarks = tuple(item for item in local.local_bookmarks if item.name == pr.head_branch)
+        bookmarks = tuple(
+            item for item in local.local_bookmarks if item.name == pr.head_branch
+        )
         if len(bookmarks) != 1 or not isinstance(bookmarks[0].target, CommitTarget):
             return _block(
                 "ambiguous-boundary",
@@ -9616,7 +10638,8 @@ def selected_boundary_bookmark_names(
                 bookmark.target.commit_id in selected_ids
                 or (
                     bookmark.target.commit_id in by_commit
-                    and by_commit[bookmark.target.commit_id].change_id in selected_changes
+                    and by_commit[bookmark.target.commit_id].change_id
+                    in selected_changes
                 )
             )
         )
@@ -9629,14 +10652,19 @@ def resolve_standalone_membership_boundaries(
     selected_pr: PullRequestId,
     sources: Sequence[GitHubPullRequestSource],
     commits: Sequence[ObservedCommit],
-) -> tuple[
-    tuple[CompleteMembershipBoundary, ...],
-    tuple[GitHubPullRequestSource, ...],
-    str,
-] | Blocked:
+) -> (
+    tuple[
+        tuple[CompleteMembershipBoundary, ...],
+        tuple[GitHubPullRequestSource, ...],
+        str,
+    ]
+    | Blocked
+):
     """Resolve desired boundaries and prove the old standalone source chain."""
     if len({commit.commit_id for commit in commits}) != len(commits):
-        return _block("duplicate-selection", "stack", "selected boundaries must be unique")
+        return _block(
+            "duplicate-selection", "stack", "selected boundaries must be unique"
+        )
     by_commit = {commit.commit_id: commit for commit in local.commits}
     used: set[PullRequestId] = set()
     resolved: list[CompleteMembershipBoundary] = []
@@ -9674,7 +10702,9 @@ def resolve_standalone_membership_boundaries(
             )
         used.add(source.pr.identity)
         matched_sources.append(source)
-        resolved.append(ExistingMembershipBoundary(source.pr.identity, commit.commit_id))
+        resolved.append(
+            ExistingMembershipBoundary(source.pr.identity, commit.commit_id)
+        )
     if selected_pr not in used:
         return _block(
             "incomplete-observation",
@@ -9781,24 +10811,63 @@ def prepare_membership_repair(
         else StandalonePullRequestSet(source_ids)
     )
     membership_ids = (
-        (snapshot.membership.pr,)
-        if isinstance(snapshot.membership, StandalonePullRequest)
-        else snapshot.membership.ordered_prs
-    ) if standalone_sources is None else source_ids
+        (
+            (snapshot.membership.pr,)
+            if isinstance(snapshot.membership, StandalonePullRequest)
+            else snapshot.membership.ordered_prs
+        )
+        if standalone_sources is None
+        else source_ids
+    )
     if snapshot.tool_state.operation_blob_oid is not None:
-        return _block("operation-fenced", OPERATION_REF, "a pending operation fences planning")
-    if (not boundaries or source_ids != membership_ids or len(set(source_ids)) != len(source_ids)
-            or any(pr.state is not PullRequestState.OPEN for pr in source_prs)):
-        return _block("incomplete-membership", "stack", "repair requires one exact fully-open source membership")
-    if any(pr.head_repository != snapshot.repository or pr.identity.repository != snapshot.repository for pr in source_prs):
+        return _block(
+            "operation-fenced", OPERATION_REF, "a pending operation fences planning"
+        )
+    if (
+        not boundaries
+        or source_ids != membership_ids
+        or len(set(source_ids)) != len(source_ids)
+        or any(pr.state is not PullRequestState.OPEN for pr in source_prs)
+    ):
+        return _block(
+            "incomplete-membership",
+            "stack",
+            "repair requires one exact fully-open source membership",
+        )
+    if any(
+        pr.head_repository != snapshot.repository
+        or pr.identity.repository != snapshot.repository
+        for pr in source_prs
+    ):
         return _block("nonlocal-pr", "stack", "repair requires repository-local PRs")
     if any(pr.auto_merge_enabled or pr.in_merge_queue for pr in source_prs):
-        return _block("active-automation", "stack", "automation blocks membership repair")
-    overlapping = tuple(stack for stack in snapshot.tool_state.state.stacks if stack.repository == snapshot.repository and set(source_ids).intersection((*stack.ordered_prs, *stack.detached_prs)))
+        return _block(
+            "active-automation", "stack", "automation blocks membership repair"
+        )
+    overlapping = tuple(
+        stack
+        for stack in snapshot.tool_state.state.stacks
+        if stack.repository == snapshot.repository
+        and set(source_ids).intersection((*stack.ordered_prs, *stack.detached_prs))
+    )
     if standalone_sources is None:
-        exact = tuple(stack for stack in overlapping if stack.base_branch == (source_prs[0].base_branch if isinstance(snapshot.membership, StandalonePullRequest) else snapshot.membership.base_branch) and stack.ordered_prs == source_ids)
+        exact = tuple(
+            stack
+            for stack in overlapping
+            if stack.base_branch
+            == (
+                source_prs[0].base_branch
+                if isinstance(snapshot.membership, StandalonePullRequest)
+                else snapshot.membership.base_branch
+            )
+            and stack.ordered_prs == source_ids
+        )
         if len(exact) != 1 or len(overlapping) != 1:
-            return _block("tracked-source-mismatch", "stack", "source must have one exact, nonoverlapping tracked record")
+            return _block(
+                "tracked-source-mismatch",
+                "stack",
+                "source must have one exact, nonoverlapping tracked record",
+            )
         tracked: TrackedStack | None = exact[0]
         base_branch = tracked.base_branch
     else:
@@ -9816,11 +10885,28 @@ def prepare_membership_repair(
                 "standalone repair requires one frozen ultimate base",
             )
         base_branch = standalone_base_branch
-    semantic = [[snapshot.repository.host, snapshot.repository.node_id], [item.node_id for item in source_ids], base_branch,
-                [["existing", item.pr_identity.node_id, item.commit_id] if isinstance(item, ExistingMembershipBoundary) else ["new", item.commit_id] for item in boundaries]]
-    digest = hashlib.sha256(json.dumps(semantic, separators=(",", ":")).encode()).hexdigest()[:24]
-    new_boundaries = tuple(item for item in boundaries if isinstance(item, NewMembershipBoundary))
-    protected = (base_branch, *(pr.head_branch for pr in source_prs), *_managed_branch_names(snapshot.tool_state.state))
+    semantic = [
+        [snapshot.repository.host, snapshot.repository.node_id],
+        [item.node_id for item in source_ids],
+        base_branch,
+        [
+            ["existing", item.pr_identity.node_id, item.commit_id]
+            if isinstance(item, ExistingMembershipBoundary)
+            else ["new", item.commit_id]
+            for item in boundaries
+        ],
+    ]
+    digest = hashlib.sha256(
+        json.dumps(semantic, separators=(",", ":")).encode()
+    ).hexdigest()[:24]
+    new_boundaries = tuple(
+        item for item in boundaries if isinstance(item, NewMembershipBoundary)
+    )
+    protected = (
+        base_branch,
+        *(pr.head_branch for pr in source_prs),
+        *_managed_branch_names(snapshot.tool_state.state),
+    )
     publication = (
         resolve_first_publication_assignments(
             workspace,
@@ -9839,26 +10925,47 @@ def prepare_membership_repair(
     refs = {item.ref: item for item in snapshot.live_refs}
     base = refs.get(RemoteBranchRef(snapshot.repository, f"refs/heads/{base_branch}"))
     if base is None or base.commit_id is None:
-        return _block("base-disagrees", base_branch, "target branch was not authoritatively observed")
+        return _block(
+            "base-disagrees",
+            base_branch,
+            "target branch was not authoritatively observed",
+        )
     by_pr = {pr.identity: pr for pr in source_prs}
     by_commit = {commit.commit_id: commit for commit in snapshot.local.commits}
     # Preserve every old comparison before constructing the desired map.
     for pr in source_prs:
-        head = refs.get(RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.head_branch}"))
-        literal = refs.get(RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.base_branch}"))
+        head = refs.get(
+            RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.head_branch}")
+        )
+        literal = refs.get(
+            RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.base_branch}")
+        )
         moving_external_base = (
             standalone_sources is not None and pr.identity == source_prs[0].identity
         )
-        if (head is None or head.commit_id != pr.reported_head_commit_id or literal is None
-                or (not moving_external_base
-                    and literal.commit_id != pr.reported_base_commit_id)
-                or pr.reported_base_commit_id == pr.reported_head_commit_id
-                or (standalone_sources is None and not _comparison_is_nonempty_linear_and_conflict_free(
+        if (
+            head is None
+            or head.commit_id != pr.reported_head_commit_id
+            or literal is None
+            or (
+                not moving_external_base
+                and literal.commit_id != pr.reported_base_commit_id
+            )
+            or pr.reported_base_commit_id == pr.reported_head_commit_id
+            or (
+                standalone_sources is None
+                and not _comparison_is_nonempty_linear_and_conflict_free(
                     snapshot.local.commits,
                     pr.reported_base_commit_id,
                     pr.reported_head_commit_id,
-                ))):
-            return _block("invalid-old-comparison", pr.identity.node_id, "old comparison is not exact and nonempty")
+                )
+            )
+        ):
+            return _block(
+                "invalid-old-comparison",
+                pr.identity.node_id,
+                "old comparison is not exact and nonempty",
+            )
     desired: list[DesiredMembershipEntry] = []
     slots: list[NewPRSlot] = []
     updates: list[PlannedHeadUpdate] = []
@@ -9868,22 +10975,40 @@ def prepare_membership_repair(
     new_ordinal = 0
     for boundary in boundaries:
         commit = by_commit.get(boundary.commit_id)
-        if (commit is None or commit.has_conflicts or boundary.commit_id == predecessor_commit
-                or ((standalone_sources is None or desired)
-                    and not _comparison_is_nonempty_linear_and_conflict_free(
-                        snapshot.local.commits, predecessor_commit, boundary.commit_id
-                    ))):
-            return _block("invalid-desired-comparison", boundary.commit_id, "desired segment is absent, nonlinear, empty, or conflicted")
+        if (
+            commit is None
+            or commit.has_conflicts
+            or boundary.commit_id == predecessor_commit
+            or (
+                (standalone_sources is None or desired)
+                and not _comparison_is_nonempty_linear_and_conflict_free(
+                    snapshot.local.commits, predecessor_commit, boundary.commit_id
+                )
+            )
+        ):
+            return _block(
+                "invalid-desired-comparison",
+                boundary.commit_id,
+                "desired segment is absent, nonlinear, empty, or conflicted",
+            )
         metadata = _metadata(commit.description)
         if metadata is None:
-            return _block("title-missing", boundary.commit_id, "selected revision has no title")
+            return _block(
+                "title-missing", boundary.commit_id, "selected revision has no title"
+            )
         if isinstance(boundary, ExistingMembershipBoundary):
             pr = by_pr.get(boundary.pr_identity)
             if pr is None:
-                return _block("foreign-desired", boundary.pr_identity.node_id, "desired PR is not in source")
+                return _block(
+                    "foreign-desired",
+                    boundary.pr_identity.node_id,
+                    "desired PR is not in source",
+                )
             desired.append(ExistingMembershipEntry(pr.identity))
             wanted = DesiredExistingPR(pr.identity, boundary.commit_id, *metadata)
-            head = refs[RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.head_branch}")]
+            head = refs[
+                RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.head_branch}")
+            ]
             planned = _plan_head_update(
                 snapshot.local.commits,
                 snapshot.tool_state.state,
@@ -9891,35 +11016,98 @@ def prepare_membership_repair(
                 head,
                 allow_bootstrap=bootstrap_local_wins,
             )
-            if isinstance(planned, Blocked): return planned
-            updates.extend(planned); metadata_updates.extend(_metadata_updates(pr, wanted))
-            temporary_specs.append((pr.identity, pr.reported_base_commit_id, predecessor_commit))
+            if isinstance(planned, Blocked):
+                return planned
+            updates.extend(planned)
+            metadata_updates.extend(_metadata_updates(pr, wanted))
+            temporary_specs.append(
+                (pr.identity, pr.reported_base_commit_id, predecessor_commit)
+            )
             predecessor_branch = pr.head_branch
         else:
             new_ordinal += 1
             slot_id = f"membership-{digest}-{new_ordinal}"
             branch = publication_by_commit[boundary.commit_id]
-            matches = tuple(item for item in snapshot.local.local_bookmarks if item.name == branch)
-            if not matches: setup = BookmarkSetup.CREATE
-            elif len(matches) == 1 and isinstance(matches[0].target, CommitTarget) and matches[0].target.commit_id == boundary.commit_id: setup = BookmarkSetup.KEEP
-            else: return _block("bookmark-setup-changed", branch, "publication bookmark is not absent or exact")
+            matches = tuple(
+                item for item in snapshot.local.local_bookmarks if item.name == branch
+            )
+            if not matches:
+                setup = BookmarkSetup.CREATE
+            elif (
+                len(matches) == 1
+                and isinstance(matches[0].target, CommitTarget)
+                and matches[0].target.commit_id == boundary.commit_id
+            ):
+                setup = BookmarkSetup.KEEP
+            else:
+                return _block(
+                    "bookmark-setup-changed",
+                    branch,
+                    "publication bookmark is not absent or exact",
+                )
             desired.append(NewMembershipEntry(slot_id))
-            slots.append(NewPRSlot(slot_id, branch, boundary.commit_id, setup, predecessor_branch, *metadata))
+            slots.append(
+                NewPRSlot(
+                    slot_id,
+                    branch,
+                    boundary.commit_id,
+                    setup,
+                    predecessor_branch,
+                    *metadata,
+                )
+            )
             predecessor_branch = branch
         predecessor_commit = boundary.commit_id
-    temporary_refs = tuple(RemoteBranchRef(snapshot.repository, f"refs/heads/jj-stack/temporary-bases/{digest}/{index}") for index in range(1, len(temporary_specs) + 1))
-    absences = (() if not temporary_refs else observe_live_refs(
-        snapshot.push_url, snapshot.repository,
-        tuple(item.full_name for item in temporary_refs), cwd=workspace
-    ))
-    if tuple(item.ref for item in absences) != temporary_refs or any(item.commit_id is not None for item in absences):
-        return _block("temporary-base-occupied", "stack", "temporary base absence observations are incomplete or occupied")
-    temporary = tuple(PlannedTemporaryBase(identity, absence.ref, old, new) for (identity, old, new), absence in zip(temporary_specs, absences, strict=True))
-    operation = MembershipRepair(snapshot.repository, repository.name_with_owner, snapshot.push_url, remote,
-        snapshot.local.effective_config, snapshot.local.workspace_targets, base_branch, snapshot.tool_state.state_blob_oid,
-        source_membership, source_prs, tracked, tuple(desired), tuple(slots), tuple(updates), temporary, tuple(metadata_updates))
-    try: _validate_membership_repair(operation)
-    except ValueError as exc: return _block("invalid-membership-repair", "stack", str(exc))
+    temporary_refs = tuple(
+        RemoteBranchRef(
+            snapshot.repository, f"refs/heads/jj-stack/temporary-bases/{digest}/{index}"
+        )
+        for index in range(1, len(temporary_specs) + 1)
+    )
+    absences = (
+        ()
+        if not temporary_refs
+        else observe_live_refs(
+            snapshot.push_url,
+            snapshot.repository,
+            tuple(item.full_name for item in temporary_refs),
+            cwd=workspace,
+        )
+    )
+    if tuple(item.ref for item in absences) != temporary_refs or any(
+        item.commit_id is not None for item in absences
+    ):
+        return _block(
+            "temporary-base-occupied",
+            "stack",
+            "temporary base absence observations are incomplete or occupied",
+        )
+    temporary = tuple(
+        PlannedTemporaryBase(identity, absence.ref, old, new)
+        for (identity, old, new), absence in zip(temporary_specs, absences, strict=True)
+    )
+    operation = MembershipRepair(
+        snapshot.repository,
+        repository.name_with_owner,
+        snapshot.push_url,
+        remote,
+        snapshot.local.effective_config,
+        snapshot.local.workspace_targets,
+        base_branch,
+        snapshot.tool_state.state_blob_oid,
+        source_membership,
+        source_prs,
+        tracked,
+        tuple(desired),
+        tuple(slots),
+        tuple(updates),
+        temporary,
+        tuple(metadata_updates),
+    )
+    try:
+        _validate_membership_repair(operation)
+    except ValueError as exc:
+        return _block("invalid-membership-repair", "stack", str(exc))
     return operation
 
 
@@ -9944,12 +11132,16 @@ def _desired_from_assignments(
             )
         metadata = _metadata(commit.description)
         if metadata is None:
-            return _block("title-missing", assignment.commit_id, "selected revision has no title")
+            return _block(
+                "title-missing", assignment.commit_id, "selected revision has no title"
+            )
         desired.append(DesiredExistingPR(pr.identity, commit.commit_id, *metadata))
     return DesiredStack(repository, base_branch, tuple(desired))
 
 
-def _snapshot_matches_tracked_topology(snapshot: Snapshot, tracked: TrackedStack) -> bool:
+def _snapshot_matches_tracked_topology(
+    snapshot: Snapshot, tracked: TrackedStack
+) -> bool:
     if isinstance(snapshot.membership, StandalonePullRequest):
         membership = (snapshot.membership.pr,)
         base = snapshot.pull_requests[0].base_branch
@@ -9995,7 +11187,9 @@ def plan_explicit_tracked_restore(
                 )
             boundaries.append(commit)
     else:
-        boundaries = list(observe_revision_boundaries(workspace, intent.revision, config_keys))
+        boundaries = list(
+            observe_revision_boundaries(workspace, intent.revision, config_keys)
+        )
     assignments = _assign_pr_boundaries(snapshot.local, prs, boundaries)
     if isinstance(assignments, Blocked):
         return assignments
@@ -10034,10 +11228,14 @@ def plan_explicit_tracked_restore(
         tuple(ref.full_name for ref in source.temporary_base_refs),
         cwd=workspace,
     )
-    return plan_tracked_restore(complete_tracked_restore_planning_input(source, absences))
+    return plan_tracked_restore(
+        complete_tracked_restore_planning_input(source, absences)
+    )
 
 
-def _implicit_existing_boundaries(snapshot: Snapshot) -> tuple[ObservedCommit, ...] | Blocked:
+def _implicit_existing_boundaries(
+    snapshot: Snapshot,
+) -> tuple[ObservedCommit, ...] | Blocked:
     by_commit = {commit.commit_id: commit for commit in snapshot.local.commits}
     result: list[ObservedCommit] = []
     for pr in snapshot.pull_requests:
@@ -10097,7 +11295,8 @@ def plan_explicit_existing(
     tracked_candidates = tuple(
         stack
         for stack in snapshot.tool_state.state.stacks
-        if stack.repository == snapshot.repository and selected_identity in stack.ordered_prs
+        if stack.repository == snapshot.repository
+        and selected_identity in stack.ordered_prs
     )
     if len(tracked_candidates) > 1:
         return _block(
@@ -10124,12 +11323,16 @@ def plan_explicit_existing(
             config_keys=config_keys,
         )
 
-    open_prs = tuple(pr for pr in snapshot.pull_requests if pr.state is PullRequestState.OPEN)
+    open_prs = tuple(
+        pr for pr in snapshot.pull_requests if pr.state is PullRequestState.OPEN
+    )
     if intent.revision is None:
         boundaries = _implicit_existing_boundaries(snapshot)
         if isinstance(boundaries, Blocked):
             return boundaries
-        assignments = _assign_pr_boundaries(snapshot.local, snapshot.pull_requests, boundaries)
+        assignments = _assign_pr_boundaries(
+            snapshot.local, snapshot.pull_requests, boundaries
+        )
         if isinstance(assignments, Blocked):
             return assignments
         selection: StackSelection | Blocked = StackSelection(
@@ -10170,7 +11373,9 @@ def plan_explicit_existing(
                 config_keys=config_keys,
             )
             if replace(local, commits=()) != replace(focused_local, commits=()):
-                raise SourceMismatch("local observation changed during standalone resolution")
+                raise SourceMismatch(
+                    "local observation changed during standalone resolution"
+                )
             snapshot = replace(snapshot, local=focused_local)
         else:
             if intent.bootstrap_local_wins:
@@ -10182,7 +11387,9 @@ def plan_explicit_existing(
             classified = classify_complete_membership_boundaries(
                 snapshot.local,
                 open_prs
-                if any(pr.state is PullRequestState.MERGED for pr in snapshot.pull_requests)
+                if any(
+                    pr.state is PullRequestState.MERGED for pr in snapshot.pull_requests
+                )
                 else snapshot.pull_requests,
                 boundaries,
             )
@@ -10195,9 +11402,7 @@ def plan_explicit_existing(
         )
         has_new = any(isinstance(item, NewMembershipBoundary) for item in classified)
         source_ids = tuple(pr.identity for pr in open_prs)
-        if standalone_sources is not None and (
-            len(standalone_sources) > 1 or has_new
-        ):
+        if standalone_sources is not None and (len(standalone_sources) > 1 or has_new):
             assert standalone_repository is not None
             source_prs = tuple(item.pr for item in standalone_sources)
             ref_names = tuple(
@@ -10241,7 +11446,8 @@ def plan_explicit_existing(
                 item.pr_identity
                 for item in classified[: len(source_ids)]
                 if isinstance(item, ExistingMembershipBoundary)
-            ) == source_ids
+            )
+            == source_ids
             and all(
                 isinstance(item, NewMembershipBoundary)
                 for item in classified[len(source_ids) :]
@@ -10255,7 +11461,10 @@ def plan_explicit_existing(
             )
         existing_count = 0
         for pr, commit in zip(open_prs, boundaries):
-            if _one_bookmark_target(snapshot.local, None, pr.head_branch) != commit.commit_id:
+            if (
+                _one_bookmark_target(snapshot.local, None, pr.head_branch)
+                != commit.commit_id
+            ):
                 break
             existing_count += 1
         if existing_count == len(open_prs) and len(boundaries) > existing_count:
@@ -10297,7 +11506,9 @@ def plan_explicit_existing(
                     snapshot.pull_requests,
                 ),
             )
-        assignments = _assign_pr_boundaries(snapshot.local, snapshot.pull_requests, boundaries)
+        assignments = _assign_pr_boundaries(
+            snapshot.local, snapshot.pull_requests, boundaries
+        )
         if isinstance(assignments, Blocked):
             return assignments
         selection = StackSelection(
@@ -10319,13 +11530,16 @@ def plan_explicit_existing(
     selected = tuple(item.pr_identity for item in desired.active)
     if selected == source_open:
         local_boundaries = tuple(
-            _one_bookmark_target(snapshot.local, None, pr.head_branch) for pr in open_prs
+            _one_bookmark_target(snapshot.local, None, pr.head_branch)
+            for pr in open_prs
         )
         desired_boundaries = tuple(item.desired_commit_id for item in desired.active)
         if (
             desired_boundaries == local_boundaries
             and snapshot.tool_state.operation_blob_oid is None
-            and all(not pr.auto_merge_enabled and not pr.in_merge_queue for pr in open_prs)
+            and all(
+                not pr.auto_merge_enabled and not pr.in_merge_queue for pr in open_prs
+            )
         ):
             adoption = inspect_remote_restack(snapshot, remote)
             if isinstance(adoption, RemoteRestackAdoption):
@@ -10355,7 +11569,9 @@ def plan_explicit_new(
     selected = observe_revision_boundaries(workspace, intent.revision, config_keys)
     if not selected:
         return _block(
-            "empty-publication", intent.revision, "new publication requires a nonempty revset"
+            "empty-publication",
+            intent.revision,
+            "new publication requires a nonempty revset",
         )
     local = observe_local(workspace, revision="all()", config_keys=config_keys)
     remote = resolve_remote(local, requested_remote)
@@ -10421,7 +11637,8 @@ def render_explicit(value: ExplicitPlan | ExplicitResult) -> str:
             for item in value.boundaries
         )
         lines.extend(
-            f"  - affected workspace {name}" for name, _change in value.workspace_change_ids
+            f"  - affected workspace {name}"
+            for name, _change in value.workspace_change_ids
         )
         return "\n".join(lines)
     if isinstance(value, FirstPublication):
@@ -10432,7 +11649,8 @@ def render_explicit(value: ExplicitPlan | ExplicitResult) -> str:
     if isinstance(value, MembershipRepair):
         slots = {slot.slot_id: slot for slot in value.slots}
         retained = {
-            item.pr_identity for item in value.desired
+            item.pr_identity
+            for item in value.desired
             if isinstance(item, ExistingMembershipEntry)
         }
         lines = [
@@ -10445,7 +11663,9 @@ def render_explicit(value: ExplicitPlan | ExplicitResult) -> str:
                 lines.append(f"    - existing {item.pr_identity.node_id}")
             else:
                 slot = slots[item.slot_id]
-                lines.append(f"    - new {slot.slot_id}: {slot.commit_id} as {slot.branch} onto {slot.base_branch}")
+                lines.append(
+                    f"    - new {slot.slot_id}: {slot.commit_id} as {slot.branch} onto {slot.base_branch}"
+                )
         detached = (
             ()
             if value.source_tracked is None
@@ -10473,7 +11693,10 @@ def render_explicit(value: ExplicitPlan | ExplicitResult) -> str:
                 f"    - {item.ref.full_name}: {item.expected_old_commit_id} -> {item.new_commit_id}"
                 for item in replacements
             )
-        lines.append("  detached: " + (", ".join(item.node_id for item in detached) if detached else "none"))
+        lines.append(
+            "  detached: "
+            + (", ".join(item.node_id for item in detached) if detached else "none")
+        )
         return "\n".join(lines)
     if isinstance(value, PreservedPrefixRepair):
         plan = value.plan

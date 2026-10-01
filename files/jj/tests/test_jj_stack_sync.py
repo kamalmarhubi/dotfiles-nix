@@ -74,7 +74,9 @@ def local_with_remotes(
     remotes: tuple[str, ...], *, git_push: str | None = None
 ) -> sync.LocalObservation:
     config = () if git_push is None else (("git.push", git_push),)
-    return sync.LocalObservation("/repo", "op", config, (), (), (), (), (), "/git", remotes)
+    return sync.LocalObservation(
+        "/repo", "op", config, (), (), (), (), (), "/git", remotes
+    )
 
 
 def test_remote_resolution_uses_explicit_native_and_conventional_precedence() -> None:
@@ -212,9 +214,7 @@ def test_real_jj_observation_distinguishes_bookmark_and_tracking_sources(
     jj(jj_repo, "git", "push", "--bookmark", "topic")
     commit_id = jj(jj_repo, "log", "-r", "topic", "--no-graph", "-T", "commit_id")
 
-    tracked = sync.observe_local(
-        jj_repo, revision="all()", config_keys=("git.push",)
-    )
+    tracked = sync.observe_local(jj_repo, revision="all()", config_keys=("git.push",))
     assert sync.LocalBookmark("topic", sync.CommitTarget(commit_id)) in (
         tracked.local_bookmarks
     )
@@ -233,9 +233,7 @@ def test_real_jj_observation_distinguishes_bookmark_and_tracking_sources(
     )
 
     jj(jj_repo, "bookmark", "untrack", "topic@origin")
-    untracked = sync.observe_local(
-        jj_repo, revision="all()", config_keys=("git.push",)
-    )
+    untracked = sync.observe_local(jj_repo, revision="all()", config_keys=("git.push",))
     assert (
         sync.JjRemoteBookmark(
             "origin",
@@ -251,18 +249,14 @@ def test_real_jj_observation_distinguishes_bookmark_and_tracking_sources(
     )
 
     jj(jj_repo, "bookmark", "delete", "topic")
-    absent = sync.observe_local(
-        jj_repo, revision="all()", config_keys=("git.push",)
-    )
+    absent = sync.observe_local(jj_repo, revision="all()", config_keys=("git.push",))
     assert all(bookmark.name != "topic" for bookmark in absent.local_bookmarks)
 
 
 def test_private_inspection_fetch_is_invisible_to_jj_and_cleans_refs(
     jj_repo: Path, tmp_path: Path
 ) -> None:
-    observed = sync.observe_local(
-        jj_repo, revision="topic", config_keys=("git.push",)
-    )
+    observed = sync.observe_local(jj_repo, revision="topic", config_keys=("git.push",))
     topic = next(
         item.target.commit_id
         for item in observed.local_bookmarks
@@ -338,9 +332,7 @@ def test_real_jj_observation_parses_conflicted_local_bookmark(jj_repo: Path) -> 
     # the observer, which must pin one operation without doing that mutation.
     jj(jj_repo, "bookmark", "list", "--all")
 
-    observed = sync.observe_local(
-        jj_repo, revision="all()", config_keys=("git.push",)
-    )
+    observed = sync.observe_local(jj_repo, revision="all()", config_keys=("git.push",))
     topic = next(
         bookmark for bookmark in observed.local_bookmarks if bookmark.name == "topic"
     )
@@ -822,7 +814,9 @@ def test_github_effects_send_exact_frozen_rest_requests(monkeypatch) -> None:
         ),
     ]
     with pytest.raises(ValueError, match="possibly-sent"):
-        sync.send_github_effect(dataclasses.replace(effects[0], phase=sync.GitHubEffectPhase.NOT_ATTEMPTED))
+        sync.send_github_effect(
+            dataclasses.replace(effects[0], phase=sync.GitHubEffectPhase.NOT_ATTEMPTED)
+        )
 
 
 def test_github_transport_rejects_errors_partial_data_and_repository_mismatch(
@@ -1199,9 +1193,7 @@ def preserved_prefix_case(
         boundary_aliases=aliases,
     )
     refs = tuple(
-        dataclasses.replace(item, commit_id=boundary)
-        if item.ref == alias_ref
-        else item
+        dataclasses.replace(item, commit_id=boundary) if item.ref == alias_ref else item
         for item in observed.live_refs
     )
     observed = dataclasses.replace(
@@ -1270,10 +1262,15 @@ def test_preserved_prefix_planner_alias_ownership_cases() -> None:
             ),
         ),
     )
-    assert sync.plan_preserved_prefix_repair(correct, desired, repository, "origin") is None
+    assert (
+        sync.plan_preserved_prefix_repair(correct, desired, repository, "origin")
+        is None
+    )
 
     absent, absent_desired, _ = preserved_prefix_case(boundary=None, owned=False)
-    created = sync.plan_preserved_prefix_repair(absent, absent_desired, repository, "origin")
+    created = sync.plan_preserved_prefix_repair(
+        absent, absent_desired, repository, "origin"
+    )
     assert isinstance(created, sync.PreservedPrefixRepair)
     assert created.plan.ownership.created
 
@@ -1306,7 +1303,9 @@ def test_preserved_prefix_planner_alias_ownership_cases() -> None:
 def test_preserved_prefix_atomic_push_contains_all_updates_and_exact_lease(
     monkeypatch, boundary: str | None, lease: str
 ) -> None:
-    operation = preserved_prefix_operation(boundary=boundary, owned=boundary is not None)
+    operation = preserved_prefix_operation(
+        boundary=boundary, owned=boundary is not None
+    )
     seen: list[str] = []
     monkeypatch.setattr(sync, "git_common_dir", lambda _workspace: Path("/git"))
     monkeypatch.setattr(
@@ -1320,7 +1319,10 @@ def test_preserved_prefix_atomic_push_contains_all_updates_and_exact_lease(
     assert f"--force-with-lease=refs/heads/topic-1:{lease}" in seen
     for update in operation.plan.carrier.head_updates:
         assert f"{update.new_commit_id}:{update.ref.full_name}" in seen
-        assert f"--force-with-lease={update.ref.full_name}:{update.expected_old_commit_id}" in seen
+        assert (
+            f"--force-with-lease={update.ref.full_name}:{update.expected_old_commit_id}"
+            in seen
+        )
     assert f"{'b' * 40}:refs/heads/topic-1" in seen
 
 
@@ -1356,14 +1358,20 @@ def test_preserved_prefix_final_state_separates_receipts_and_alias_ownership() -
         item.pr_identity for item in operation.plan.carrier.desired.active
     }
     assert final.boundary_aliases == (operation.plan.ownership,)
-    assert all(item.ref != operation.plan.boundary.ref for item in final.last_published_heads)
+    assert all(
+        item.ref != operation.plan.boundary.ref for item in final.last_published_heads
+    )
 
 
 def test_preserved_prefix_render_apply_and_resume_dispatch(monkeypatch) -> None:
     operation = preserved_prefix_operation()
     assert "preserved-prefix repair" in sync.render_explicit(operation)
-    monkeypatch.setattr(sync, "start_preserved_prefix_repair", lambda value, workspace: "fence")
-    monkeypatch.setattr(sync, "resume_preserved_prefix_repair", lambda workspace: "resumed")
+    monkeypatch.setattr(
+        sync, "start_preserved_prefix_repair", lambda value, workspace: "fence"
+    )
+    monkeypatch.setattr(
+        sync, "resume_preserved_prefix_repair", lambda workspace: "resumed"
+    )
     assert sync.apply_explicit(operation, "/repo") == "resumed"
     monkeypatch.setattr(sync, "read_operation", lambda workspace: ("oid", operation))
     assert sync.resume_operation("/repo") == "resumed"
@@ -1388,13 +1396,17 @@ def test_preserved_prefix_push_classifies_old_final_and_mixed_readback(
         values[0] = final[0]
     pushed = []
     monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
-    monkeypatch.setattr(sync, "read_operation", lambda _workspace: ("op-oid", operation))
+    monkeypatch.setattr(
+        sync, "read_operation", lambda _workspace: ("op-oid", operation)
+    )
     monkeypatch.setattr(sync, "read_ref_oid", lambda _workspace, _ref: "state-oid")
     monkeypatch.setattr(sync, "_preserved_error", lambda *_args: None)
     monkeypatch.setattr(
-        sync, "_topology_refs", lambda _plan, _workspace, _refs: tuple(
+        sync,
+        "_topology_refs",
+        lambda _plan, _workspace, _refs: tuple(
             sync.LiveRemoteRef(ref, oid) for ref, oid in zip(_refs, values, strict=True)
-        )
+        ),
     )
     monkeypatch.setattr(
         sync,
@@ -1409,7 +1421,11 @@ def test_preserved_prefix_push_classifies_old_final_and_mixed_readback(
 
     monkeypatch.setattr(sync, "push_preserved_prefix_updates", push)
     # Stop after publication so this test isolates its readback classifier.
-    monkeypatch.setattr(sync, "run_stack_unstack", lambda *_args: (_ for _ in ()).throw(sync.Error("stop")))
+    monkeypatch.setattr(
+        sync,
+        "run_stack_unstack",
+        lambda *_args: (_ for _ in ()).throw(sync.Error("stop")),
+    )
     result = sync.resume_preserved_prefix_repair("/repo")
     assert bool(pushed) is (readback == "old")
     if readback == "mixed":
@@ -1432,13 +1448,19 @@ def test_preserved_prefix_partial_unstack_blocks_without_replaying(monkeypatch) 
     monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
     monkeypatch.setattr(sync, "read_operation", lambda _workspace: ("oid", operation))
     monkeypatch.setattr(sync, "read_ref_oid", lambda *_args: "state-oid")
-    monkeypatch.setattr(sync, "cas_write_preserved_prefix_repair", lambda *_args: "oid2")
     monkeypatch.setattr(
-        sync, "_topology_refs", lambda _plan, _workspace, refs: tuple(
-            sync.LiveRemoteRef(ref, oid) for ref, oid in zip(refs, final, strict=True)
-        )
+        sync, "cas_write_preserved_prefix_repair", lambda *_args: "oid2"
     )
-    monkeypatch.setattr(sync, "_preserved_error", lambda _op, _ws, expected: "partial membership")
+    monkeypatch.setattr(
+        sync,
+        "_topology_refs",
+        lambda _plan, _workspace, refs: tuple(
+            sync.LiveRemoteRef(ref, oid) for ref, oid in zip(refs, final, strict=True)
+        ),
+    )
+    monkeypatch.setattr(
+        sync, "_preserved_error", lambda _op, _ws, expected: "partial membership"
+    )
     monkeypatch.setattr(sync, "run_stack_unstack", lambda *_args: calls.append(True))
     result = sync.resume_preserved_prefix_repair("/repo")
     assert isinstance(result, sync.Stopped)
@@ -1464,16 +1486,22 @@ def test_preserved_prefix_final_relink_readback_does_not_replay(monkeypatch) -> 
     monkeypatch.setattr(sync, "read_operation", lambda _workspace: ("oid", operation))
     monkeypatch.setattr(sync, "read_ref_oid", lambda *_args: "state-oid")
     monkeypatch.setattr(
-        sync, "_topology_refs", lambda _plan, _workspace, refs: tuple(
+        sync,
+        "_topology_refs",
+        lambda _plan, _workspace, refs: tuple(
             sync.LiveRemoteRef(ref, oid) for ref, oid in zip(refs, final, strict=True)
-        )
+        ),
     )
     monkeypatch.setattr(
         sync,
         "_preserved_error",
-        lambda _op, _workspace, expected: "not prefix" if expected == "prefix" else None,
+        lambda _op, _workspace, expected: "not prefix"
+        if expected == "prefix"
+        else None,
     )
-    monkeypatch.setattr(sync, "run_preserved_prefix_stack_link", lambda *_args: links.append(True))
+    monkeypatch.setattr(
+        sync, "run_preserved_prefix_stack_link", lambda *_args: links.append(True)
+    )
     monkeypatch.setattr(
         sync,
         "cas_write_preserved_prefix_repair",
@@ -1488,7 +1516,9 @@ def test_preserved_prefix_final_relink_readback_does_not_replay(monkeypatch) -> 
     assert links == []
 
 
-def test_preserved_prefix_repeated_verification_commits_state_before_fence(monkeypatch) -> None:
+def test_preserved_prefix_repeated_verification_commits_state_before_fence(
+    monkeypatch,
+) -> None:
     operation = dataclasses.replace(
         preserved_prefix_operation(), phase=sync.PreservedPrefixRepairPhase.VERIFYING
     )
@@ -1502,13 +1532,17 @@ def test_preserved_prefix_repeated_verification_commits_state_before_fence(monke
     events: list[str] = []
     projections: list[str] = []
     monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
-    monkeypatch.setattr(sync, "read_operation", lambda _workspace: ("operation-oid", operation))
+    monkeypatch.setattr(
+        sync, "read_operation", lambda _workspace: ("operation-oid", operation)
+    )
     monkeypatch.setattr(sync, "read_ref_oid", lambda _workspace, _ref: current[0])
     monkeypatch.setattr(sync, "read_state", lambda _workspace: (current[0], state))
     monkeypatch.setattr(
-        sync, "_topology_refs", lambda _plan, _workspace, refs: tuple(
+        sync,
+        "_topology_refs",
+        lambda _plan, _workspace, refs: tuple(
             sync.LiveRemoteRef(ref, oid) for ref, oid in zip(refs, final, strict=True)
-        )
+        ),
     )
     monkeypatch.setattr(
         sync,
@@ -1516,7 +1550,9 @@ def test_preserved_prefix_repeated_verification_commits_state_before_fence(monke
         lambda _op, _workspace, expected: projections.append(expected) or None,
     )
     monkeypatch.setattr(sync, "_run", lambda *_args, **_kwargs: "final-oid\n")
-    monkeypatch.setattr(sync, "cas_write_preserved_prefix_repair", lambda *_args: "operation-oid-2")
+    monkeypatch.setattr(
+        sync, "cas_write_preserved_prefix_repair", lambda *_args: "operation-oid-2"
+    )
 
     def write_state(_workspace, _expected, _state):
         events.append("state")
@@ -1524,7 +1560,9 @@ def test_preserved_prefix_repeated_verification_commits_state_before_fence(monke
         return "final-oid"
 
     monkeypatch.setattr(sync, "cas_write_state", write_state)
-    monkeypatch.setattr(sync, "cas_delete_operation", lambda *_args: events.append("fence"))
+    monkeypatch.setattr(
+        sync, "cas_delete_operation", lambda *_args: events.append("fence")
+    )
     result = sync.resume_preserved_prefix_repair("/repo")
     assert isinstance(result, sync.PreservedPrefixRepairVerified)
     assert projections.count("final") >= 3
@@ -1559,16 +1597,18 @@ def test_explicit_merged_prefix_routes_to_preserved_prefix_repair(monkeypatch) -
     monkeypatch.setattr(
         sync, "observe_revision_boundaries", lambda *_args, **_kwargs: local.commits
     )
-    monkeypatch.setattr(sync, "observe_github_repository", lambda *_args, **_kwargs: repository)
+    monkeypatch.setattr(
+        sync, "observe_github_repository", lambda *_args, **_kwargs: repository
+    )
 
     result = sync.plan_explicit_existing(
         "/repo", sync.ExistingIntent(open_prs[0].number, "selected")
     )
 
     assert isinstance(result, sync.PreservedPrefixRepair)
-    assert tuple(item.pr_identity for item in result.plan.carrier.desired.active) == tuple(
-        pr.identity for pr in open_prs
-    )
+    assert tuple(
+        item.pr_identity for item in result.plan.carrier.desired.active
+    ) == tuple(pr.identity for pr in open_prs)
 
 
 def test_explicit_completed_stack_routes_new_suffix_to_append(monkeypatch) -> None:
@@ -1597,7 +1637,9 @@ def test_explicit_completed_stack_routes_new_suffix_to_append(monkeypatch) -> No
     monkeypatch.setattr(
         sync, "observe_revision_boundaries", lambda *_args, **_kwargs: (new_commit,)
     )
-    monkeypatch.setattr(sync, "observe_github_repository", lambda *_args, **_kwargs: repository)
+    monkeypatch.setattr(
+        sync, "observe_github_repository", lambda *_args, **_kwargs: repository
+    )
     monkeypatch.setattr(sync, "resolve_push_url", lambda *_args: observed.push_url)
     monkeypatch.setattr(
         sync,
@@ -1668,20 +1710,20 @@ def standalone_set_planning_case():
     for index in range(1, 5):
         prs.append(
             sync.GitHubPullRequest(
-            sync.PullRequestId(repository, f"PR_{index}"),
-            index,
-            sync.PullRequestState.OPEN,
-            False,
-            repository,
-            f"topic-{index}",
-            old_ids[index - 1],
-            "dev" if index == 1 else f"topic-{index - 1}",
-            base if index == 1 else old_ids[index - 2],
-            False,
-            False,
-            f"Title {index}",
-            f"Body {index}",
-        )
+                sync.PullRequestId(repository, f"PR_{index}"),
+                index,
+                sync.PullRequestState.OPEN,
+                False,
+                repository,
+                f"topic-{index}",
+                old_ids[index - 1],
+                "dev" if index == 1 else f"topic-{index - 1}",
+                base if index == 1 else old_ids[index - 2],
+                False,
+                False,
+                f"Title {index}",
+                f"Body {index}",
+            )
         )
     prs = tuple(prs)
     desired_by_branch = {
@@ -1693,7 +1735,7 @@ def standalone_set_planning_case():
     local = sync.LocalObservation(
         "/repo",
         "op",
-        (("stack.remote", "origin"),),
+        (("git.push", "origin"),),
         (("default", desired_ids[-1]),),
         tuple(
             sync.LocalBookmark(
@@ -1705,6 +1747,7 @@ def standalone_set_planning_case():
         (),
         tuple(commits),
         "/git",
+        ("origin",),
     )
     refs = (
         sync.LiveRemoteRef(
@@ -1721,6 +1764,7 @@ def standalone_set_planning_case():
     snapshot = sync.Snapshot(
         repository,
         "ssh://git@github.com/owner/repo.git",
+        "origin",
         local,
         sync.ToolStateRead(None, sync.EMPTY_STATE, None),
         (prs[0],),
@@ -1754,7 +1798,9 @@ def test_explicit_four_standalone_prs_plus_two_new_requires_scoped_bootstrap(
     monkeypatch.setattr(
         sync, "observe_revision_boundaries", lambda *_args, **_kwargs: boundaries
     )
-    monkeypatch.setattr(sync, "observe_github_repository", lambda *_args, **_kwargs: repository)
+    monkeypatch.setattr(
+        sync, "observe_github_repository", lambda *_args, **_kwargs: repository
+    )
     candidate_calls = []
     monkeypatch.setattr(
         sync,
@@ -1780,9 +1826,7 @@ def test_explicit_four_standalone_prs_plus_two_new_requires_scoped_bootstrap(
 
     monkeypatch.setattr(sync, "observe_live_refs", observe_refs)
 
-    blocked = sync.plan_explicit_existing(
-        "/repo", sync.ExistingIntent(1, "selected")
-    )
+    blocked = sync.plan_explicit_existing("/repo", sync.ExistingIntent(1, "selected"))
     operation = sync.plan_explicit_existing(
         "/repo", sync.ExistingIntent(1, "selected", bootstrap_local_wins=True)
     )
@@ -1798,24 +1842,34 @@ def test_explicit_four_standalone_prs_plus_two_new_requires_scoped_bootstrap(
     assert len(operation.desired) == 6
     assert len(operation.slots) == 2
     assert candidate_calls == [("topic-1", "topic-2", "topic-3", "topic-4")] * 2
-    assert tuple(update.expected_old_commit_id for update in operation.head_updates) == (
-        old_ids[3], old_ids[0], old_ids[1], old_ids[2]
-    )
+    assert tuple(
+        update.expected_old_commit_id for update in operation.head_updates
+    ) == (old_ids[3], old_ids[0], old_ids[1], old_ids[2])
     assert tuple(update.new_commit_id for update in operation.head_updates) == (
-        desired_ids[0], desired_ids[3], desired_ids[4], desired_ids[5]
+        desired_ids[0],
+        desired_ids[3],
+        desired_ids[4],
+        desired_ids[5],
     )
     assert tuple(
         item.pr_identity if isinstance(item, sync.ExistingMembershipEntry) else None
         for item in operation.desired
-    ) == (sources[3].pr.identity, None, None, sources[0].pr.identity,
-          sources[1].pr.identity, sources[2].pr.identity)
+    ) == (
+        sources[3].pr.identity,
+        None,
+        None,
+        sources[0].pr.identity,
+        sources[1].pr.identity,
+        sources[2].pr.identity,
+    )
     assert all(
         isinstance(update.authority, sync.BootstrapLocalWins)
         for update in operation.head_updates
     )
-    assert sync.parse_membership_repair(
-        sync.membership_repair_to_json(operation)
-    ) == operation
+    assert (
+        sync.parse_membership_repair(sync.membership_repair_to_json(operation))
+        == operation
+    )
     rendered = sync.render_explicit(operation)
     assert "ultimate base: dev" in rendered
     assert "one-shot bootstrap replacements" in rendered
@@ -1827,9 +1881,7 @@ def test_explicit_four_standalone_prs_plus_two_new_requires_scoped_bootstrap(
             dataclasses.replace(
                 slot,
                 phase=sync.NewPRPhase.VERIFIED,
-                pr_identity=sync.PullRequestId(
-                    operation.repository, f"PR_new_{index}"
-                ),
+                pr_identity=sync.PullRequestId(operation.repository, f"PR_new_{index}"),
                 pr_number=10 + index,
             )
             for index, slot in enumerate(operation.slots, start=1)
@@ -1857,9 +1909,7 @@ def test_explicit_four_standalone_prs_plus_two_new_requires_scoped_bootstrap(
     } | {
         (
             slot.pr_identity,
-            sync.RemoteBranchRef(
-                operation.repository, f"refs/heads/{slot.branch}"
-            ),
+            sync.RemoteBranchRef(operation.repository, f"refs/heads/{slot.branch}"),
             slot.commit_id,
         )
         for slot in bound.slots
@@ -1890,7 +1940,8 @@ def test_standalone_set_resolution_blocks_unproven_associations(
     elif mutation == "foreign":
         fork = sync.GitHubRepositoryId("github.com", "R_fork")
         candidates[1] = dataclasses.replace(
-            candidates[1], pr=dataclasses.replace(candidates[1].pr, head_repository=fork)
+            candidates[1],
+            pr=dataclasses.replace(candidates[1].pr, head_repository=fork),
         )
     elif mutation == "incomplete":
         commits = (*boundaries[:3], *boundaries[4:])
@@ -1971,7 +2022,9 @@ def test_standalone_source_graph_fails_closed(shape: str, code: str) -> None:
     assert result.reasons[0].code == code
 
 
-def test_standalone_set_membership_repair_revalidates_without_unstack(monkeypatch) -> None:
+def test_standalone_set_membership_repair_revalidates_without_unstack(
+    monkeypatch,
+) -> None:
     operation = membership_operation()
     source = sync.StandalonePullRequestSet(
         tuple(pr.identity for pr in operation.source_prs)
@@ -1991,12 +2044,21 @@ def test_standalone_set_membership_repair_revalidates_without_unstack(monkeypatc
         ),
     )
     repository = sync.GitHubRepository(
-        operation.repository, operation.repository_name, "https://github.com/owner/repo", "main"
+        operation.repository,
+        operation.repository_name,
+        "https://github.com/owner/repo",
+        "main",
     )
     monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
-    monkeypatch.setattr(sync, "read_operation", lambda _workspace: ("operation-oid", operation))
-    monkeypatch.setattr(sync, "_frozen_repository", lambda *_args, **_kwargs: repository)
-    monkeypatch.setattr(sync, "read_ref_oid", lambda *_args: operation.expected_state_oid)
+    monkeypatch.setattr(
+        sync, "read_operation", lambda _workspace: ("operation-oid", operation)
+    )
+    monkeypatch.setattr(
+        sync, "_frozen_repository", lambda *_args, **_kwargs: repository
+    )
+    monkeypatch.setattr(
+        sync, "read_ref_oid", lambda *_args: operation.expected_state_oid
+    )
     monkeypatch.setattr(sync, "_membership_source_refs_error", lambda *_args: None)
     monkeypatch.setattr(
         sync,
@@ -2006,11 +2068,15 @@ def test_standalone_set_membership_repair_revalidates_without_unstack(monkeypatc
     monkeypatch.setattr(
         sync, "run_stack_unstack", lambda *_args: pytest.fail("unstack requested")
     )
-    monkeypatch.setattr(sync, "cas_write_membership_repair", lambda *_args: "operation-oid")
+    monkeypatch.setattr(
+        sync, "cas_write_membership_repair", lambda *_args: "operation-oid"
+    )
     monkeypatch.setattr(
         sync,
         "_membership_projection",
-        lambda *_args: (_ for _ in ()).throw(sync.Error("stop after association check")),
+        lambda *_args: (_ for _ in ()).throw(
+            sync.Error("stop after association check")
+        ),
     )
 
     result = sync.resume_membership_repair("/repo")
@@ -2172,9 +2238,7 @@ def topology_input(
     receipts = tuple(
         sync.LastPublishedHead(
             pr.identity,
-            sync.RemoteBranchRef(
-                observed.repository, f"refs/heads/{pr.head_branch}"
-            ),
+            sync.RemoteBranchRef(observed.repository, f"refs/heads/{pr.head_branch}"),
             pr.reported_head_commit_id,
         )
         for pr in observed.pull_requests
@@ -2219,9 +2283,7 @@ def topology_input(
         "https://github.com/owner/repo",
         "main",
     )
-    source = sync.prepare_topology_planning(
-        observed, repository, "origin", desired
-    )
+    source = sync.prepare_topology_planning(observed, repository, "origin", desired)
     assert isinstance(source, sync.TopologyPlanningSource)
     return sync.complete_topology_planning_input(
         source,
@@ -2337,9 +2399,7 @@ def test_tracked_restore_blocks_multiple_surviving_stacks() -> None:
             ),
         ),
     )
-    result = sync.plan_tracked_restore(
-        dataclasses.replace(value, observation=changed)
-    )
+    result = sync.plan_tracked_restore(dataclasses.replace(value, observation=changed))
     assert isinstance(result, sync.Blocked)
     assert result.reasons[0].code == "ambiguous-membership"
 
@@ -2348,9 +2408,7 @@ def test_tracked_restore_final_state_preserves_detached_without_head_receipts() 
     value = tracked_restore_input()
     detached = sync.PullRequestId(value.observation.tracked.repository, "PR_detached")
     tracked = dataclasses.replace(value.observation.tracked, detached_prs=(detached,))
-    state = dataclasses.replace(
-        value.observation.tool_state.state, stacks=(tracked,)
-    )
+    state = dataclasses.replace(value.observation.tool_state.state, stacks=(tracked,))
     observation = dataclasses.replace(
         value.observation,
         tracked=tracked,
@@ -2428,9 +2486,7 @@ def test_topology_temporary_base_names_are_stable_and_require_absence() -> None:
 
     changed_goal = dataclasses.replace(
         desired,
-        active=(
-            dataclasses.replace(desired.active[0], desired_commit_id="9" * 40),
-        ),
+        active=(dataclasses.replace(desired.active[0], desired_commit_id="9" * 40),),
     )
     changed = sync.prepare_topology_planning(
         observed, repository, "origin", changed_goal
@@ -2454,9 +2510,9 @@ def test_topology_temporary_base_names_are_stable_and_require_absence() -> None:
     assert isinstance(stable, sync.TopologyPlanningSource)
     assert stable.naming_digest == first.naming_digest
     assert stable.temporary_base_refs == first.temporary_base_refs
-    assert tuple(ref.full_name.rsplit("/", 1)[1] for ref in first.temporary_base_refs) == (
-        "1",
-    )
+    assert tuple(
+        ref.full_name.rsplit("/", 1)[1] for ref in first.temporary_base_refs
+    ) == ("1",)
     assert first.temporary_base_refs[0].full_name.startswith(
         "refs/heads/jj-stack/temporary-bases/"
     )
@@ -2554,8 +2610,13 @@ def membership_operation() -> sync.MembershipRepair:
     assert isinstance(plan.source, sync.ServerStackMembership)
     source = plan.source
     slot = sync.NewPRSlot(
-        "slot-new", "new-branch", "9" * 40, sync.BookmarkSetup.CREATE,
-        "topic-1", "New", "body",
+        "slot-new",
+        "new-branch",
+        "9" * 40,
+        sync.BookmarkSetup.CREATE,
+        "topic-1",
+        "New",
+        "body",
     )
     return sync.MembershipRepair(
         plan.repository,
@@ -2567,9 +2628,14 @@ def membership_operation() -> sync.MembershipRepair:
         "main",
         plan.dependencies.state_blob_oid,
         source,
-        tuple(pr for pr in plan.dependencies.prs if pr.state is sync.PullRequestState.OPEN),
+        tuple(
+            pr for pr in plan.dependencies.prs if pr.state is sync.PullRequestState.OPEN
+        ),
         sync.TrackedStack(plan.repository, "main", source.ordered_prs, ()),
-        (sync.ExistingMembershipEntry(source.ordered_prs[0]), sync.NewMembershipEntry(slot.slot_id)),
+        (
+            sync.ExistingMembershipEntry(source.ordered_prs[0]),
+            sync.NewMembershipEntry(slot.slot_id),
+        ),
         (slot,),
         plan.head_updates,
         plan.temporary_bases,
@@ -2592,14 +2658,21 @@ def test_membership_repair_rejects_duplicate_desired_entries(duplicate: str) -> 
     operation = membership_operation()
     entry = operation.desired[0 if duplicate == "identity" else 1]
     with pytest.raises(ValueError, match="desired membership"):
-        sync.membership_repair_to_json(dataclasses.replace(operation, desired=operation.desired + (entry,)))
+        sync.membership_repair_to_json(
+            dataclasses.replace(operation, desired=operation.desired + (entry,))
+        )
 
 
 def test_membership_repair_rejects_source_goal_mismatch() -> None:
     operation = membership_operation()
     foreign = sync.PullRequestId(operation.repository, "PR_not_in_source")
     with pytest.raises(ValueError, match="desired membership"):
-        sync.membership_repair_to_json(dataclasses.replace(operation, desired=(sync.ExistingMembershipEntry(foreign), *operation.desired[1:])))
+        sync.membership_repair_to_json(
+            dataclasses.replace(
+                operation,
+                desired=(sync.ExistingMembershipEntry(foreign), *operation.desired[1:]),
+            )
+        )
 
 
 def test_membership_repair_committing_requires_frozen_final_state() -> None:
@@ -2618,8 +2691,13 @@ def test_membership_repair_committing_requires_frozen_final_state() -> None:
     with pytest.raises(ValueError, match="freeze final state"):
         sync.membership_repair_to_json(operation)
     final_json = sync.state_to_json(sync.EMPTY_STATE)
-    committed = dataclasses.replace(operation, final_state_json=final_json, final_state_oid="f" * 40)
-    assert sync.parse_membership_repair(sync.membership_repair_to_json(committed)) == committed
+    committed = dataclasses.replace(
+        operation, final_state_json=final_json, final_state_oid="f" * 40
+    )
+    assert (
+        sync.parse_membership_repair(sync.membership_repair_to_json(committed))
+        == committed
+    )
 
 
 def test_membership_repair_reobserves_source_after_unstack(monkeypatch) -> None:
@@ -2636,25 +2714,65 @@ def test_membership_repair_reobserves_source_after_unstack(monkeypatch) -> None:
         phase=sync.MembershipRepairPhase.UNSTACKING_SOURCE,
     )
     repository = sync.GitHubRepository(
-        operation.repository, operation.repository_name, "https://github.com/owner/repo", "main"
+        operation.repository,
+        operation.repository_name,
+        "https://github.com/owner/repo",
+        "main",
     )
-    frozen = tuple(sync.GitHubPullRequestSource(pr, operation.source_membership.server_stack_id, "main")
-                   for pr in operation.source_prs)
-    standalone = tuple(sync.GitHubPullRequestSource(pr, None, None) for pr in operation.source_prs)
-    observations = iter(((frozen, sync.GitHubStackSource(operation.source_membership.stack, "main", operation.source_prs)),
-                         (standalone, None)))
+    frozen = tuple(
+        sync.GitHubPullRequestSource(
+            pr, operation.source_membership.server_stack_id, "main"
+        )
+        for pr in operation.source_prs
+    )
+    standalone = tuple(
+        sync.GitHubPullRequestSource(pr, None, None) for pr in operation.source_prs
+    )
+    observations = iter(
+        (
+            (
+                frozen,
+                sync.GitHubStackSource(
+                    operation.source_membership.stack, "main", operation.source_prs
+                ),
+            ),
+            (standalone, None),
+        )
+    )
     calls: list[str] = []
 
     monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
-    monkeypatch.setattr(sync, "read_operation", lambda _workspace: ("operation-oid", operation))
-    monkeypatch.setattr(sync, "_frozen_repository", lambda *_args, **_kwargs: repository)
-    monkeypatch.setattr(sync, "read_ref_oid", lambda *_args: operation.expected_state_oid)
+    monkeypatch.setattr(
+        sync, "read_operation", lambda _workspace: ("operation-oid", operation)
+    )
+    monkeypatch.setattr(
+        sync, "_frozen_repository", lambda *_args, **_kwargs: repository
+    )
+    monkeypatch.setattr(
+        sync, "read_ref_oid", lambda *_args: operation.expected_state_oid
+    )
     monkeypatch.setattr(sync, "_membership_source_refs_error", lambda *_args: None)
-    monkeypatch.setattr(sync, "_observe_source_association", lambda *_args, **_kwargs: next(observations))
-    monkeypatch.setattr(sync, "run_stack_unstack", lambda *_args: calls.append("unstack"))
-    monkeypatch.setattr(sync, "prove_stack_dissolved", lambda *_args, **_kwargs: sync.StackDissolution.ABSENT)
-    monkeypatch.setattr(sync, "cas_write_membership_repair", lambda *_args: "operation-oid")
-    monkeypatch.setattr(sync, "_membership_projection", lambda *_args: (_ for _ in ()).throw(sync.Error("stop after unstack")))
+    monkeypatch.setattr(
+        sync,
+        "_observe_source_association",
+        lambda *_args, **_kwargs: next(observations),
+    )
+    monkeypatch.setattr(
+        sync, "run_stack_unstack", lambda *_args: calls.append("unstack")
+    )
+    monkeypatch.setattr(
+        sync,
+        "prove_stack_dissolved",
+        lambda *_args, **_kwargs: sync.StackDissolution.ABSENT,
+    )
+    monkeypatch.setattr(
+        sync, "cas_write_membership_repair", lambda *_args: "operation-oid"
+    )
+    monkeypatch.setattr(
+        sync,
+        "_membership_projection",
+        lambda *_args: (_ for _ in ()).throw(sync.Error("stop after unstack")),
+    )
 
     result = sync.resume_membership_repair("/repo")
 
@@ -2854,7 +2972,9 @@ def test_detached_number_resolution_queries_only_bounded_nodes(monkeypatch) -> N
     assert isinstance(sync.resolve_detached_association("/work", 99), sync.Blocked)
 
 
-def test_close_detached_accepts_lost_response_after_closed_readback(monkeypatch) -> None:
+def test_close_detached_accepts_lost_response_after_closed_readback(
+    monkeypatch,
+) -> None:
     repository = sync.GitHubRepositoryId("github.example", "R")
     detached = sync.PullRequestId(repository, "PR_detached")
     state = sync.TrackedState(
@@ -3613,11 +3733,15 @@ def test_remote_restack_adoption_uses_merged_head_as_old_suffix_base(
         observed.repository, "owner/repo", "https://github.com/owner/repo", "main"
     )
     segments: list[tuple[str, str]] = []
-    monkeypatch.setattr(sync, "observe_github_repository", lambda *_args, **_kwargs: repository)
+    monkeypatch.setattr(
+        sync, "observe_github_repository", lambda *_args, **_kwargs: repository
+    )
     monkeypatch.setattr(
         sync,
         "_git_refs",
-        lambda _git_dir, *names: "ordinary" if names == ("refs/heads", "refs/remotes") else "",
+        lambda _git_dir, *names: "ordinary"
+        if names == ("refs/heads", "refs/remotes")
+        else "",
     )
     monkeypatch.setattr(sync, "_fetch_inspection_refs", lambda *_args: None)
     monkeypatch.setattr(sync, "pin_operation", lambda *_args: local.operation_id)
@@ -4295,9 +4419,7 @@ def test_native_first_publication_establishes_tracking_without_moving_workspace(
 
     assert isinstance(stopped, sync.Stopped)
     assert stopped.stage == "create-pr"
-    observed = sync.observe_local(
-        repo, revision=commit_id, config_keys=("git.push",)
-    )
+    observed = sync.observe_local(repo, revision=commit_id, config_keys=("git.push",))
     assert (
         sync.LocalBookmark(branch, sync.CommitTarget(commit_id))
         in observed.local_bookmarks
@@ -4426,21 +4548,27 @@ def test_partial_native_publication_recovers_before_any_pr_effect(
 
     def observe(_workspace, current):
         local = sync.LocalObservation(
-            "/repo", "op", current.effective_config, current.workspace_targets,
+            "/repo",
+            "op",
+            current.effective_config,
+            current.workspace_targets,
             tuple(
                 sync.LocalBookmark(slot.branch, sync.CommitTarget(slot.commit_id))
                 for slot in current.slots
             ),
-            (), (), (), "/git",
+            (),
+            (),
+            (),
+            "/git",
         )
         return local, tuple(
             sync.PublicationSlotReadback(
                 slot.slot_id,
                 sync.CommitTarget(slot.commit_id),
                 sync.CommitTarget(slot.commit_id)
-                if index == 0 or second_ready else None,
-                sync.TrackingState.TRACKED
-                if index == 0 or second_ready else None,
+                if index == 0 or second_ready
+                else None,
+                sync.TrackingState.TRACKED if index == 0 or second_ready else None,
                 slot.commit_id if index == 0 or second_ready else None,
             )
             for index, slot in enumerate(current.slots)
@@ -4506,7 +4634,11 @@ def test_stack_mutation_uses_frozen_repository_and_only_new_append_suffix(
     operation = dataclasses.replace(
         operation,
         slots=tuple(
-            dataclasses.replace(slot, pr_identity=sync.PullRequestId(operation.repository, f"PR_{index}"), pr_number=index)
+            dataclasses.replace(
+                slot,
+                pr_identity=sync.PullRequestId(operation.repository, f"PR_{index}"),
+                pr_number=index,
+            )
             for index, slot in enumerate(operation.slots, start=1)
         ),
     )
@@ -4554,7 +4686,9 @@ def test_append_preserves_merged_prefix_and_uses_current_integration_anchor(
             observed.local,
             commits=(
                 *observed.local.commits,
-                sync.ObservedCommit(new, (predecessor,), "new", "New\n\nBody", False, False),
+                sync.ObservedCommit(
+                    new, (predecessor,), "new", "New\n\nBody", False, False
+                ),
             ),
         ),
     )
@@ -4603,7 +4737,10 @@ def test_append_preserves_merged_prefix_and_uses_current_integration_anchor(
     assert operation.slots[0].base_branch == (
         "topic-2" if merged_prefix == 1 else "main"
     )
-    assert sync.parse_first_publication(sync.first_publication_to_json(operation)) == operation
+    assert (
+        sync.parse_first_publication(sync.first_publication_to_json(operation))
+        == operation
+    )
 
 
 def test_completed_stack_append_records_only_reopened_active_members() -> None:
@@ -4990,11 +5127,20 @@ def test_apply_updates_metadata_for_every_planned_pr(monkeypatch) -> None:
     assert updates == list(plan.metadata_updates)
 
 
-def test_apply_revalidation_ignores_jj_operation_but_detects_relevant_drift() -> None:
+def test_apply_revalidation_ignores_operation_and_git_push_but_detects_drift() -> None:
     observed, plan = standalone_plan(desired="2" * 40, live="1" * 40, parent="1" * 40)
     unrelated = dataclasses.replace(
         observed,
-        local=dataclasses.replace(observed.local, operation_id="new-jj-operation"),
+        local=dataclasses.replace(
+            observed.local,
+            operation_id="new-jj-operation",
+            effective_config=tuple(
+                item
+                for item in observed.local.effective_config
+                if item[0] != "git.push"
+            )
+            + (("git.push", "later-default"),),
+        ),
     )
     assert sync.validate_frozen_dependencies(plan, unrelated) is None
 
@@ -5669,7 +5815,9 @@ def test_selected_boundary_bookmark_names_uses_exact_and_change_aliases() -> Non
     )
 
 
-def test_standalone_membership_resolution_orders_source_chain_and_new_boundary() -> None:
+def test_standalone_membership_resolution_orders_source_chain_and_new_boundary() -> (
+    None
+):
     repository = sync.GitHubRepositoryId("github.com", "R_repo")
     first_id, new_id, last_id, rewritten_id = (character * 40 for character in "1234")
     commits = (
@@ -5689,14 +5837,34 @@ def test_standalone_membership_resolution_orders_source_chain_and_new_boundary()
         commits=(*commits, rewritten),
     )
     first_pr = sync.GitHubPullRequest(
-        sync.PullRequestId(repository, "PR_1"), 1, sync.PullRequestState.OPEN,
-        False, repository, "topic-1", first_id, "dev", "0" * 40,
-        False, False, "One", "",
+        sync.PullRequestId(repository, "PR_1"),
+        1,
+        sync.PullRequestState.OPEN,
+        False,
+        repository,
+        "topic-1",
+        first_id,
+        "dev",
+        "0" * 40,
+        False,
+        False,
+        "One",
+        "",
     )
     last_pr = sync.GitHubPullRequest(
-        sync.PullRequestId(repository, "PR_2"), 2, sync.PullRequestState.OPEN,
-        False, repository, "topic-2", rewritten_id, "topic-1", first_id,
-        False, False, "Two", "",
+        sync.PullRequestId(repository, "PR_2"),
+        2,
+        sync.PullRequestState.OPEN,
+        False,
+        repository,
+        "topic-2",
+        rewritten_id,
+        "topic-1",
+        first_id,
+        False,
+        False,
+        "Two",
+        "",
     )
     first = sync.GitHubPullRequestSource(first_pr, None, None)
     last = sync.GitHubPullRequestSource(last_pr, None, None)

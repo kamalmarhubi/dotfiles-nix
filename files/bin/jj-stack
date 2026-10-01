@@ -1,0 +1,154 @@
+#!/usr/bin/env sh
+# ruff: noqa: E402
+
+# Keep the installed command self-contained while allowing this file to remain
+# importable as Python in launcher tests.
+"""true"
+if command -v uv >/dev/null; then
+  exec uv run --script "$0" "$@"
+elif command -v pipx >/dev/null; then
+  exec pipx run "$0" "$@"
+else
+  echo "Neither uv nor pipx are available" >&2
+  exit 1
+fi
+"""
+
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["markdown-it-py==4.2.0"]
+# ///
+
+"""Explicit command-line boundary for jj stack synchronization."""
+
+import argparse
+import sys
+from pathlib import Path
+
+import jj_stack_sync as sync
+
+
+def positive_number(value: str) -> int:
+    try:
+        number = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a positive integer") from None
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(prog="jj stack", allow_abbrev=False)
+    commands = result.add_subparsers(dest="command", required=True)
+
+    sync_parser = commands.add_parser("sync", allow_abbrev=False)
+    intent = sync_parser.add_mutually_exclusive_group()
+    intent.add_argument("--pr", type=positive_number)
+    intent.add_argument("--new", action="store_true")
+    intent.add_argument("--resume", action="store_true")
+    sync_parser.add_argument("-r", dest="revision")
+    sync_parser.add_argument("--base")
+    sync_parser.add_argument("--remote")
+    sync_parser.add_argument("--dry-run", action="store_true")
+    sync_parser.add_argument("--yes", action="store_true")
+    sync_parser.add_argument("--bootstrap-local-wins", action="store_true")
+
+    detached = commands.add_parser("detached", allow_abbrev=False)
+    detached_commands = detached.add_subparsers(dest="detached_command", required=True)
+    detached_commands.add_parser("list", allow_abbrev=False)
+    for name in ("close", "forget"):
+        child = detached_commands.add_parser(name, allow_abbrev=False)
+        child.add_argument("--pr", required=True, type=positive_number)
+    return result
+
+
+def intent_from_args(
+    args: argparse.Namespace, cli: argparse.ArgumentParser
+) -> sync.ExplicitIntent:
+    if args.pr is None and not args.new and not args.resume:
+        cli.error("explicit intent is required: use --pr, --new, or --resume")
+    if args.new:
+        if args.bootstrap_local_wins:
+            cli.error("--bootstrap-local-wins is only valid with --pr and -r")
+        if args.revision is None:
+            cli.error("--new requires -r")
+        return sync.NewIntent(args.revision, args.base)
+    if args.resume:
+        if (
+            args.revision is not None
+            or args.base is not None
+            or args.remote is not None
+            or args.dry_run
+            or args.bootstrap_local_wins
+        ):
+            cli.error(
+                "--resume is incompatible with -r, --base, --remote, --dry-run, and --bootstrap-local-wins"
+            )
+        return sync.ResumeIntent()
+    if args.base is not None:
+        cli.error("--base is only valid with --new")
+    if args.bootstrap_local_wins and args.revision is None:
+        cli.error("--bootstrap-local-wins requires -r")
+    return sync.ExistingIntent(
+        args.pr, args.revision, bootstrap_local_wins=args.bootstrap_local_wins
+    )
+
+
+def run_sync(args: argparse.Namespace, cli: argparse.ArgumentParser) -> int:
+    intent = intent_from_args(args, cli)
+    plan = (
+        sync.plan_explicit(Path.cwd(), intent)
+        if args.remote is None
+        else sync.plan_explicit(Path.cwd(), intent, requested_remote=args.remote)
+    )
+    print(sync.render_explicit(plan))
+    if isinstance(plan, sync.Blocked):
+        return 2
+    if isinstance(plan, sync.NoOp) or args.dry_run:
+        return 0
+    if not args.yes:
+        if not sys.stdin.isatty():
+            cli.error("mutation requires --yes when stdin is noninteractive")
+        if input("Apply this plan? [y/N] ").strip().lower() not in {"y", "yes"}:
+            return 0
+    result = sync.apply_explicit(plan, Path.cwd())
+    print(sync.render_explicit(result))
+    return 2 if isinstance(result, (sync.Stopped, sync.Blocked)) else 0
+
+
+def run_detached(args: argparse.Namespace) -> int:
+    workspace = Path.cwd()
+    if args.detached_command == "list":
+        print(
+            sync.render_detached_associations(
+                sync.list_detached_associations(workspace)
+            )
+        )
+        return 0
+    selected = sync.resolve_detached_association(workspace, args.pr)
+    if isinstance(selected, sync.Blocked):
+        print(sync.render_explicit(selected))
+        return 2
+    if args.detached_command == "close":
+        result = sync.close_detached_association(workspace, selected)
+    else:
+        result = sync.forget_detached_association(workspace, selected)
+    print(sync.render_detached_result(result))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    cli = parser()
+    args = cli.parse_args(argv)
+    try:
+        if args.command == "sync":
+            return run_sync(args, cli)
+        return run_detached(args)
+    except sync.Error as error:
+        print(f"jj stack: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
