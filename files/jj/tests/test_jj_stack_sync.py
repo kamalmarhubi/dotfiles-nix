@@ -2095,6 +2095,129 @@ def github_for_topology(
     return server, FakeGitHubClient(server)
 
 
+def membership_operation() -> sync.MembershipRepair:
+    plan = sync.plan_topology(topology_input((2, 1)))
+    assert isinstance(plan, sync.TopologyPlan)
+    assert isinstance(plan.source, sync.ServerStackMembership)
+    source = plan.source
+    slot = sync.NewPRSlot(
+        "slot-new", "new-branch", "9" * 40, sync.BookmarkSetup.CREATE,
+        "topic-1", "New", "body",
+    )
+    return sync.MembershipRepair(
+        plan.repository,
+        plan.repository_name,
+        plan.dependencies.push_url,
+        plan.remote,
+        plan.dependencies.effective_config,
+        (("default", "change-id"),),
+        "main",
+        plan.dependencies.state_blob_oid,
+        source,
+        tuple(pr for pr in plan.dependencies.prs if pr.state is sync.PullRequestState.OPEN),
+        sync.TrackedStack(plan.repository, "main", source.ordered_prs, ()),
+        (sync.ExistingMembershipEntry(source.ordered_prs[0]), sync.NewMembershipEntry(slot.slot_id)),
+        (slot,),
+        plan.head_updates,
+        plan.temporary_bases,
+    )
+
+
+def test_membership_repair_round_trip_is_exact_and_strict() -> None:
+    operation = membership_operation()
+    encoded = sync.membership_repair_to_json(operation)
+    assert sync.parse_membership_repair(encoded) == operation
+    assert sync.parse_operation(encoded) == operation
+    malformed = json.loads(encoded)
+    malformed["slots"][0]["unknown"] = True
+    with pytest.raises(sync.Error, match="unexpected fields"):
+        sync.parse_membership_repair(json.dumps(malformed))
+
+
+def test_membership_render_uses_numbers_and_only_reports_new_detachments() -> None:
+    operation = membership_operation()
+    historical = sync.PullRequestId(operation.repository, 99)
+    assert operation.source_tracked is not None
+    operation = dataclasses.replace(
+        operation,
+        source_tracked=dataclasses.replace(
+            operation.source_tracked,
+            detached_prs=(historical,),
+        ),
+    )
+
+    rendered = sync.render_explicit(operation)
+
+    assert "existing #1" in rendered
+    assert "detached: #2" in rendered
+    assert "PR_" not in rendered
+
+
+@pytest.mark.parametrize("duplicate", ("identity", "slot"))
+def test_membership_repair_rejects_duplicate_desired_entries(duplicate: str) -> None:
+    operation = membership_operation()
+    entry = operation.desired[0 if duplicate == "identity" else 1]
+    with pytest.raises(ValueError, match="desired membership"):
+        sync.membership_repair_to_json(dataclasses.replace(operation, desired=operation.desired + (entry,)))
+
+
+def test_membership_repair_rejects_source_goal_mismatch() -> None:
+    operation = membership_operation()
+    foreign = sync.PullRequestId(operation.repository, 99)
+    with pytest.raises(ValueError, match="desired membership"):
+        sync.membership_repair_to_json(dataclasses.replace(operation, desired=(sync.ExistingMembershipEntry(foreign), *operation.desired[1:])))
+
+
+def test_membership_repair_committing_requires_frozen_final_state() -> None:
+    initial = membership_operation()
+    verified_slot = dataclasses.replace(
+        initial.slots[0],
+        phase=sync.NewPRPhase.VERIFIED,
+        pr_identity=initial.source_tracked.ordered_prs[1],
+    )
+    operation = dataclasses.replace(
+        initial,
+        slots=(verified_slot,),
+        phase=sync.MembershipRepairPhase.COMMITTING,
+    )
+    with pytest.raises(ValueError, match="freeze final state"):
+        sync.membership_repair_to_json(operation)
+    final_json = sync.state_to_json(sync.EMPTY_STATE)
+    committed = dataclasses.replace(operation, final_state_json=final_json, final_state_oid="f" * 40)
+    assert sync.parse_membership_repair(sync.membership_repair_to_json(committed)) == committed
+
+
+def test_membership_repair_reobserves_source_after_unstack(monkeypatch) -> None:
+    initial = membership_operation()
+    slot = dataclasses.replace(
+        initial.slots[0],
+        phase=sync.NewPRPhase.VERIFIED,
+        pr_identity=sync.PullRequestId(initial.repository, 9),
+    )
+    operation = dataclasses.replace(
+        initial,
+        slots=(slot,),
+        phase=sync.MembershipRepairPhase.UNSTACKING_SOURCE,
+    )
+    plan = sync._membership_plan(operation)
+    assert isinstance(plan.source, sync.ServerStackMembership)
+    server, client = github_for_topology(plan)
+    repository = server.read_repository(operation.repository)
+
+    monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
+    monkeypatch.setattr(sync, "read_operation", lambda _workspace: ("operation-oid", operation))
+    monkeypatch.setattr(sync, "read_ref_oid", lambda *_args: operation.expected_state_oid)
+    monkeypatch.setattr(sync, "_membership_source_refs_error", lambda *_args: None)
+    monkeypatch.setattr(sync, "cas_write_membership_repair", lambda *_args: "operation-oid")
+    monkeypatch.setattr(sync, "_membership_projection", lambda *_args: (_ for _ in ()).throw(sync.Error("stop after unstack")))
+
+    result = sync.resume_membership_repair("/repo", client)
+
+    assert server.read_stack(repository, plan.source.stack.identity) is None
+    assert isinstance(result, sync.Stopped)
+    assert result.stage == sync.MembershipRepairPhase.TRANSITIONING_BASES
+
+
 @pytest.mark.parametrize("initial", ("absent", "exact"))
 def test_topology_creation_reconciles_complete_readback(
     monkeypatch, initial: str

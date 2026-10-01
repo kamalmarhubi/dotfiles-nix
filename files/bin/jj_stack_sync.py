@@ -353,6 +353,17 @@ class StandalonePullRequest:
 
 
 @dataclass(frozen=True)
+class StandalonePullRequestSet:
+    """Explicitly resolved repository-local PRs with no server stack association."""
+
+    prs: tuple[PullRequestId, ...]
+
+    def __post_init__(self) -> None:
+        if not self.prs or len(set(self.prs)) != len(self.prs):
+            raise ValueError("standalone PR set must be nonempty and unique")
+        if any(pr.repository != self.prs[0].repository for pr in self.prs):
+            raise ValueError("standalone PR set must belong to one repository")
+@dataclass(frozen=True)
 class ServerStackMembership:
     """Complete ordered membership for the stack containing selected_pr."""
 
@@ -386,6 +397,7 @@ class ServerStackMembership:
 
 
 PullRequestMembership = StandalonePullRequest | ServerStackMembership
+MembershipRepairSource = PullRequestMembership | StandalonePullRequestSet
 
 
 @dataclass(frozen=True)
@@ -460,7 +472,7 @@ class TrackedRestoreSource:
     current_stack: ServerStackMembership | None
 
 
-TopologySource = PullRequestMembership | TrackedRestoreSource
+TopologySource = PullRequestMembership | StandalonePullRequestSet | TrackedRestoreSource
 
 
 @dataclass(frozen=True)
@@ -785,6 +797,7 @@ class ExistingFirstPublicationPR:
     draft: bool
     title: str
     body: str
+    state: PullRequestState = PullRequestState.OPEN
 
 
 @dataclass(frozen=True)
@@ -810,6 +823,14 @@ class FirstPublication:
     @property
     def existing_prs(self) -> tuple[PullRequestId, ...]:
         return tuple(member.identity for member in self.existing_members)
+
+    @property
+    def active_existing_prs(self) -> tuple[PullRequestId, ...]:
+        return tuple(
+            member.identity
+            for member in self.existing_members
+            if member.state is PullRequestState.OPEN
+        )
 
 
 @dataclass(frozen=True)
@@ -915,6 +936,66 @@ class TopologyRepairVerified:
     ordered_prs: tuple[PullRequestId, ...]
 
 
+class MembershipRepairPhase(StrEnum):
+    PREPARING_BOOKMARKS = "preparing-bookmarks"
+    PUBLISHING_NEW_REFS = "publishing-new-refs"
+    CREATING_PRS = "creating-prs"
+    UNSTACKING_SOURCE = "unstacking-source"
+    TRANSITIONING_BASES = "transitioning-bases"
+    PUBLISHING = "publishing"
+    RELINKING = "relinking"
+    VERIFYING = "verifying"
+    COMMITTING = "committing"
+
+
+@dataclass(frozen=True)
+class ExistingMembershipEntry:
+    pr_identity: PullRequestId
+
+
+@dataclass(frozen=True)
+class NewMembershipEntry:
+    slot_id: str
+
+
+DesiredMembershipEntry = ExistingMembershipEntry | NewMembershipEntry
+
+
+@dataclass(frozen=True)
+class MembershipRepair:
+    """Frozen transaction for a complete mixed existing/new membership goal."""
+
+    repository: GitHubRepositoryId
+    repository_name: str
+    push_url: str
+    remote: str
+    effective_config: tuple[tuple[str, str], ...]
+    workspace_targets: tuple[tuple[str, str], ...]
+    base_branch: str
+    expected_state_oid: str | None
+    source_membership: MembershipRepairSource
+    source_prs: tuple[GitHubPullRequest, ...]
+    source_tracked: TrackedStack | None
+    desired: tuple[DesiredMembershipEntry, ...]
+    slots: tuple[NewPRSlot, ...]
+    head_updates: tuple[PlannedHeadUpdate, ...]
+    temporary_bases: tuple[PlannedTemporaryBase, ...]
+    metadata_updates: tuple[PRMetadataUpdate, ...] = ()
+    phase: MembershipRepairPhase = MembershipRepairPhase.PREPARING_BOOKMARKS
+    source_unstack_possibly_sent: bool = False
+    base_transitions_possibly_sent: tuple[PullRequestId, ...] = ()
+    publication_possibly_sent: tuple[RemoteBranchRef, ...] = ()
+    relink_possibly_sent: bool = False
+    resulting_stack: GitHubStackId | None = None
+    final_state_json: str | None = None
+    final_state_oid: str | None = None
+
+
+@dataclass(frozen=True)
+class MembershipRepairVerified:
+    ordered_prs: tuple[PullRequestId, ...]
+
+
 class StackDissolution(StrEnum):
     ABSENT = "absent"
     PRESENT = "present"
@@ -970,14 +1051,14 @@ ApplyResult = Verified | Stopped
 AdoptionResult = AdoptionVerified | Stopped
 FirstPublicationResult = FirstPublicationVerified | Stopped
 TopologyRepairResult = TopologyRepairVerified | Stopped
-Operation = FirstPublication | TopologyRepair
+MembershipRepairResult = MembershipRepairVerified | Stopped
+Operation = FirstPublication | TopologyRepair | MembershipRepair
 
 
 @dataclass(frozen=True)
 class ExistingIntent:
     pr_number: int
     revision: str | None = None
-    bootstrap_local_wins: bool = False
 
 
 @dataclass(frozen=True)
@@ -1022,6 +1103,7 @@ ExplicitPlan = (
     | RemoteRestackAdoption
     | FirstPublication
     | TopologyPlan
+    | MembershipRepair
     | PersistedOperation
 )
 ExplicitResult = (
@@ -1029,6 +1111,7 @@ ExplicitResult = (
     | AdoptionResult
     | FirstPublicationResult
     | TopologyRepairResult
+    | MembershipRepairResult
     | Blocked
 )
 
@@ -3125,6 +3208,8 @@ def topology_repair_to_json(operation: TopologyRepair) -> str:
     encoded_source = payload["plan"]["dependencies"]["source"]
     if isinstance(source, TrackedRestoreSource):
         encoded_source["source_kind"] = "tracked-restore"
+    elif isinstance(source, StandalonePullRequestSet):
+        encoded_source["source_kind"] = "standalone-set"
     else:
         encoded_source["source_kind"] = (
             "standalone" if isinstance(source, StandalonePullRequest) else "server-stack"
@@ -3270,6 +3355,16 @@ def parse_topology_repair(data: str) -> TopologyRepair:
         if kind == "standalone":
             return StandalonePullRequest(
                 pid(record(raw, {"pr"}, "standalone source")["pr"])
+            )
+        if kind == "standalone-set":
+            return StandalonePullRequestSet(
+                tuple(
+                    pid(item)
+                    for item in seq(
+                        record(raw, {"prs"}, "standalone-set source")["prs"],
+                        "standalone-set PRs",
+                    )
+                )
             )
         source = record(raw, {"selected_pr", "stack", "ordered_prs"}, "stack source")
         if kind != "server-stack":
@@ -3493,6 +3588,331 @@ def _parse_topology_pr(value, record, rid, pid, sid, text, boolean) -> GitHubPul
     )
 
 
+def _validate_membership_repair(operation: MembershipRepair) -> None:
+    if (
+        not re.fullmatch(r"[^/]+/[^/]+", operation.repository_name)
+        or not operation.push_url
+        or not operation.remote
+        or not operation.base_branch
+    ):
+        raise ValueError("membership repair repository and source must be frozen")
+    if (
+        len({key for key, _value in operation.effective_config})
+        != len(operation.effective_config)
+        or any(not key for key, _value in operation.effective_config)
+        or not operation.workspace_targets
+        or len({name for name, _target in operation.workspace_targets})
+        != len(operation.workspace_targets)
+        or any(not name or not target for name, target in operation.workspace_targets)
+    ):
+        raise ValueError("membership repair config and workspaces must be complete")
+    source = (
+        (operation.source_membership.pr,)
+        if isinstance(operation.source_membership, StandalonePullRequest)
+        else operation.source_membership.prs
+        if isinstance(operation.source_membership, StandalonePullRequestSet)
+        else operation.source_membership.ordered_prs
+    )
+    observed = tuple(pr.identity for pr in operation.source_prs)
+    if (
+        observed != source
+        or any(pr.state is not PullRequestState.OPEN for pr in operation.source_prs)
+        or any(identity.repository != operation.repository for identity in source)
+    ):
+        raise ValueError("membership repair source observations do not match")
+    if isinstance(operation.source_membership, StandalonePullRequestSet):
+        if operation.source_tracked is not None:
+            raise ValueError("standalone-set repair must not claim a tracked source")
+    elif (
+        operation.source_tracked is None
+        or operation.source_tracked.repository != operation.repository
+        or operation.source_tracked.base_branch != operation.base_branch
+        or operation.source_tracked.ordered_prs != source
+    ):
+        raise ValueError("membership repair tracked source does not match")
+    existing = tuple(
+        item.pr_identity
+        for item in operation.desired
+        if isinstance(item, ExistingMembershipEntry)
+    )
+    desired_slots = tuple(
+        item.slot_id
+        for item in operation.desired
+        if isinstance(item, NewMembershipEntry)
+    )
+    slot_ids = tuple(slot.slot_id for slot in operation.slots)
+    if (
+        not operation.desired
+        or len(set(existing)) != len(existing)
+        or any(identity not in source for identity in existing)
+        or len(set(desired_slots)) != len(desired_slots)
+        or desired_slots != tuple(item for item in desired_slots if item)
+        or len(set(slot_ids)) != len(slot_ids)
+        or set(desired_slots) != set(slot_ids)
+        or len(desired_slots) != len(slot_ids)
+    ):
+        raise ValueError("membership repair desired membership does not match source and slots")
+    slot_by_id = {slot.slot_id: slot for slot in operation.slots}
+    pr_by_id = {pr.identity: pr for pr in operation.source_prs}
+    previous_branch = operation.base_branch
+    previous_commit: str | None = None
+    for item in operation.desired:
+        if isinstance(item, ExistingMembershipEntry):
+            pr = pr_by_id[item.pr_identity]
+            previous_branch = pr.head_branch
+            updates = tuple(
+                update for update in operation.head_updates
+                if update.ref.full_name == f"refs/heads/{pr.head_branch}"
+            )
+            previous_commit = updates[0].new_commit_id if updates else pr.head_oid
+        else:
+            slot = slot_by_id[item.slot_id]
+            if slot.base_branch != previous_branch:
+                raise ValueError("membership repair slot predecessor is not frozen exactly")
+            previous_branch, previous_commit = slot.branch, slot.commit_id
+    metadata_ids = tuple(item.pr_identity for item in operation.metadata_updates)
+    if len(set(metadata_ids)) != len(metadata_ids) or any(identity not in existing for identity in metadata_ids):
+        raise ValueError("membership repair metadata updates are not desired existing PRs")
+    refs = tuple(update.ref for update in operation.head_updates)
+    temporary_refs = tuple(item.ref for item in operation.temporary_bases)
+    if (
+        len(set(refs)) != len(refs)
+        or len(set(temporary_refs)) != len(temporary_refs)
+        or set(refs) & set(temporary_refs)
+        or len({item.pr_identity for item in operation.temporary_bases})
+        != len(operation.temporary_bases)
+    ):
+        raise ValueError("membership repair refs and temporary resources must be unique")
+    phase_order = list(MembershipRepairPhase)
+    phase_index = phase_order.index(operation.phase)
+    slot_phases = {slot.phase for slot in operation.slots}
+    if operation.slots and operation.phase is MembershipRepairPhase.PREPARING_BOOKMARKS and slot_phases != {
+        NewPRPhase.NOT_ATTEMPTED
+    }:
+        raise ValueError("bookmark preparation has incompatible slot progress")
+    if operation.phase is MembershipRepairPhase.PUBLISHING_NEW_REFS and not slot_phases <= {
+        NewPRPhase.NOT_ATTEMPTED,
+        NewPRPhase.PUBLICATION_POSSIBLY_SENT,
+        NewPRPhase.READY,
+    }:
+        raise ValueError("new-ref publication has incompatible slot progress")
+    if operation.phase is MembershipRepairPhase.CREATING_PRS and not slot_phases <= {
+        NewPRPhase.READY,
+        NewPRPhase.POSSIBLY_SENT,
+        NewPRPhase.BOUND,
+        NewPRPhase.VERIFIED,
+    }:
+        raise ValueError("PR creation has incompatible slot progress")
+    if operation.slots and phase_index >= 3 and slot_phases != {NewPRPhase.VERIFIED}:
+        raise ValueError("source mutation requires every new PR verified")
+    if operation.source_unstack_possibly_sent and phase_index < 3:
+        raise ValueError("source unstack marker is incompatible with phase")
+    if (
+        isinstance(operation.source_membership, StandalonePullRequestSet)
+        and operation.source_unstack_possibly_sent
+    ):
+        raise ValueError("standalone-set repair cannot send an unstack request")
+    if operation.base_transitions_possibly_sent and phase_index < 4:
+        raise ValueError("base transition markers are incompatible with phase")
+    if operation.publication_possibly_sent and phase_index < 5:
+        raise ValueError("publication markers are incompatible with phase")
+    if operation.relink_possibly_sent and phase_index < 6:
+        raise ValueError("relink marker is incompatible with phase")
+    if not set(operation.base_transitions_possibly_sent) <= {
+        item.pr_identity for item in operation.temporary_bases
+    } or not set(operation.publication_possibly_sent) <= set(refs):
+        raise ValueError("membership repair progress references unowned resources")
+    committing = operation.phase is MembershipRepairPhase.COMMITTING
+    if committing != (
+        operation.final_state_json is not None and operation.final_state_oid is not None
+    ):
+        raise ValueError("committing membership repair must freeze final state")
+    if operation.final_state_json is not None:
+        parse_state(operation.final_state_json)
+
+
+def _membership_carrier(operation: MembershipRepair) -> TopologyRepair:
+    """Reuse the strict topology leaf codec without nesting an operation on disk."""
+    dependencies = TopologyDependencies(
+        operation.effective_config,
+        operation.push_url,
+        operation.expected_state_oid,
+        None,
+        operation.source_prs,
+        operation.source_membership,
+        tuple(LiveRemoteRef(ref, None) for ref in operation.publication_possibly_sent),
+        (),
+    )
+    plan = TopologyPlan(
+        operation.repository,
+        operation.repository_name,
+        operation.remote,
+        DesiredStack(operation.repository, operation.base_branch, ()),
+        operation.base_transitions_possibly_sent,
+        operation.head_updates,
+        operation.temporary_bases,
+        operation.source_tracked,
+        dependencies,
+    )
+    return TopologyRepair(plan)
+
+
+def membership_repair_to_json(operation: MembershipRepair) -> str:
+    _validate_membership_repair(operation)
+    carrier = json.loads(topology_repair_to_json(_membership_carrier(operation)))
+    plan = carrier["plan"]
+    payload = asdict(operation)
+    payload["operation_kind"] = "membership-repair"
+    payload["source_membership"] = plan["dependencies"]["source"]
+    payload["source_prs"] = plan["dependencies"]["prs"]
+    payload["source_tracked"] = plan["tracking_update"]
+    payload["head_updates"] = plan["head_updates"]
+    payload["temporary_bases"] = plan["temporary_bases"]
+    payload["base_transitions_possibly_sent"] = plan["detached_prs"]
+    payload["publication_possibly_sent"] = [
+        item["ref"] for item in plan["dependencies"]["live_heads"]
+    ]
+    payload["desired"] = [
+        {
+            "entry_kind": "existing",
+            "pr_identity": asdict(item.pr_identity),
+        }
+        if isinstance(item, ExistingMembershipEntry)
+        else {"entry_kind": "new", "slot_id": item.slot_id}
+        for item in operation.desired
+    ]
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), default=lambda value: value.value if isinstance(value, Enum) else TypeError()) + "\n"
+
+
+def parse_membership_repair(data: str) -> MembershipRepair:
+    try:
+        raw = json.loads(data)
+        names = {field.name for field in dataclasses.fields(MembershipRepair)} | {"operation_kind"}
+        if not isinstance(raw, dict) or set(raw) != names:
+            raise ValueError("operation has unexpected fields")
+        if raw["operation_kind"] != "membership-repair":
+            raise ValueError("operation kind is invalid")
+        if not isinstance(raw["desired"], list) or not isinstance(raw["slots"], list):
+            raise ValueError("desired and slots must be arrays")
+        # The topology decoder is the canonical strict codec for shared source,
+        # PR, authority, ref, temporary-base, and tracked-state leaf values.
+        carrier = {
+            "operation_kind": "topology-repair",
+            "plan": {
+                "repository": raw["repository"],
+                "repository_name": raw["repository_name"],
+                "remote": raw["remote"],
+                "desired": {"repository": raw["repository"], "base_branch": raw["base_branch"], "active": []},
+                "detached_prs": raw["base_transitions_possibly_sent"],
+                "head_updates": raw["head_updates"],
+                "temporary_bases": raw["temporary_bases"],
+                "tracking_update": raw["source_tracked"],
+                "dependencies": {
+                    "effective_config": raw["effective_config"], "push_url": raw["push_url"],
+                    "state_blob_oid": raw["expected_state_oid"], "operation_blob_oid": None,
+                    "prs": raw["source_prs"], "source": raw["source_membership"],
+                    "live_heads": [{"ref": item, "commit_id": None} for item in raw["publication_possibly_sent"]],
+                    "live_bases": [],
+                },
+            },
+            "phase": "creating-temporary-bases", "unstack_possibly_sent": False,
+            "temporary_bases_possibly_sent": [], "relink_possibly_sent": False,
+            "final_state_json": None, "final_state_oid": None,
+        }
+        parsed = parse_topology_repair(json.dumps(carrier)).plan
+        desired: list[DesiredMembershipEntry] = []
+        for item in raw["desired"]:
+            if not isinstance(item, dict):
+                raise ValueError("desired entry must be an object")
+            kind = item.get("entry_kind")
+            if kind == "existing" and set(item) == {"entry_kind", "pr_identity"}:
+                probe = dict(carrier)
+                probe["plan"] = dict(carrier["plan"])
+                probe["plan"]["detached_prs"] = [item["pr_identity"]]
+                identity = parse_topology_repair(json.dumps(probe)).plan.detached_prs[0]
+                desired.append(ExistingMembershipEntry(identity))
+            elif kind == "new" and set(item) == {"entry_kind", "slot_id"} and isinstance(item["slot_id"], str) and item["slot_id"]:
+                desired.append(NewMembershipEntry(item["slot_id"]))
+            else:
+                raise ValueError("desired entry has unexpected fields")
+        slots: list[NewPRSlot] = []
+        slot_names = {field.name for field in dataclasses.fields(NewPRSlot)}
+        for item in raw["slots"]:
+            if not isinstance(item, dict) or set(item) != slot_names:
+                raise ValueError("slot has unexpected fields")
+            probe = dict(carrier)
+            probe["plan"] = dict(carrier["plan"])
+            identity = item["pr_identity"]
+            parsed_identity = None
+            if identity is not None:
+                probe["plan"]["detached_prs"] = [identity]
+                parsed_identity = parse_topology_repair(json.dumps(probe)).plan.detached_prs[0]
+            scalar_names = ("slot_id", "branch", "commit_id", "base_branch", "title")
+            if any(not isinstance(item[name], str) or not item[name] for name in scalar_names) or not isinstance(item["body"], str):
+                raise ValueError("slot scalar fields are malformed")
+            slots.append(NewPRSlot(item["slot_id"], item["branch"], item["commit_id"], BookmarkSetup(item["bookmark_setup"]), item["base_branch"], item["title"], item["body"], NewPRPhase(item["phase"]), parsed_identity))
+        stack = raw["resulting_stack"]
+        resulting = None
+        if stack is not None:
+            if not isinstance(stack, dict) or set(stack) != {"repository", "number"}:
+                raise ValueError("resulting stack is malformed")
+            repository_id = stack["repository"]
+            number = stack["number"]
+            if (
+                not isinstance(repository_id, dict)
+                or set(repository_id) != {"host", "node_id"}
+                or not isinstance(repository_id["host"], str)
+                or not repository_id["host"]
+                or not isinstance(repository_id["node_id"], str)
+                or not repository_id["node_id"]
+                or type(number) is not int
+                or number <= 0
+            ):
+                raise ValueError("resulting stack is malformed")
+            resulting = GitHubStackId(
+                GitHubRepositoryId(repository_id["host"], repository_id["node_id"]),
+                number,
+            )
+        final_json, final_oid = raw["final_state_json"], raw["final_state_oid"]
+        if (final_json is not None and not isinstance(final_json, str)) or (final_oid is not None and not isinstance(final_oid, str)):
+            raise ValueError("final state fields must be text or null")
+        # Decode metadata identities through the already strict desired identity decoder.
+        metadata_by_number = {
+            item.pr_identity.number: item.pr_identity
+            for item in desired
+            if isinstance(item, ExistingMembershipEntry)
+        }
+        if not isinstance(raw["metadata_updates"], list) or any(
+            not isinstance(item, dict)
+            or set(item) != {"pr_identity", "title", "body"}
+            or not isinstance(item["pr_identity"], dict)
+            or set(item["pr_identity"]) != {"repository", "number"}
+            or item["pr_identity"].get("number") not in metadata_by_number
+            or item["pr_identity"] != asdict(
+                metadata_by_number.get(item["pr_identity"].get("number"))
+            )
+            or not isinstance(item["title"], str)
+            or not isinstance(item["body"], str)
+            for item in raw["metadata_updates"]
+        ):
+            raise ValueError("metadata updates are malformed")
+        decoded_metadata = tuple(
+            PRMetadataUpdate(
+                metadata_by_number[item["pr_identity"]["number"]],
+                item["title"],
+                item["body"],
+            )
+            for item in raw["metadata_updates"]
+        )
+        operation = MembershipRepair(parsed.repository, parsed.repository_name, parsed.dependencies.push_url, parsed.remote, parsed.dependencies.effective_config, tuple(tuple(item) for item in raw["workspace_targets"]), parsed.desired.base_branch, parsed.dependencies.state_blob_oid, parsed.source, parsed.dependencies.prs, parsed.tracking_update, tuple(desired), tuple(slots), parsed.head_updates, parsed.temporary_bases, decoded_metadata, MembershipRepairPhase(raw["phase"]), raw["source_unstack_possibly_sent"], parsed.detached_prs, tuple(item.ref for item in parsed.dependencies.live_heads), raw["relink_possibly_sent"], resulting, final_json, final_oid)  # type: ignore[arg-type]
+        if type(operation.source_unstack_possibly_sent) is not bool or type(operation.relink_possibly_sent) is not bool or any(not isinstance(item, list) or len(item) != 2 or not all(isinstance(value, str) for value in item) for item in raw["workspace_targets"]):
+            raise ValueError("progress or workspace fields are malformed")
+        _validate_membership_repair(operation)
+        return operation
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError, Error) as exc:
+        raise Error(f"invalid refs/jj-stack/operation payload: {exc}") from exc
+
+
 def parse_operation(data: str) -> Operation:
     try:
         raw = json.loads(data)
@@ -3505,6 +3925,8 @@ def parse_operation(data: str) -> Operation:
         return parse_first_publication(data)
     if kind == "topology-repair":
         return parse_topology_repair(data)
+    if kind == "membership-repair":
+        return parse_membership_repair(data)
     raise Error("invalid refs/jj-stack/operation payload: unknown operation_kind")
 
 
@@ -3587,6 +4009,31 @@ def cas_write_topology_repair(
         raise Error(
             "could not update operation ref" + (f": {detail}" if detail else "")
         )
+    return new_oid
+
+
+def cas_write_membership_repair(
+    workspace: str | Path,
+    expected_oid: str | None,
+    operation: MembershipRepair,
+) -> str:
+    common = git_common_dir(workspace)
+    new_oid = _run(
+        ["git", f"--git-dir={common}", "hash-object", "-w", "--stdin"],
+        stdin=membership_repair_to_json(operation),
+    ).strip()
+    expected = expected_oid or ("0" * len(new_oid))
+    result = subprocess.run(
+        ["git", f"--git-dir={common}", "update-ref", OPERATION_REF, new_oid, expected],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        if read_ref_oid(workspace, OPERATION_REF) != expected_oid:
+            raise ConcurrentUpdate("operation ref changed during compare-and-swap")
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise Error("could not update operation ref" + (f": {detail}" if detail else ""))
     return new_oid
 
 
@@ -7958,15 +8405,455 @@ def resume_topology_repair(
         return Stopped("operation", "topology operation reached no terminal state")
 
 
+def start_membership_repair(operation: MembershipRepair, workspace: str | Path) -> str:
+    """Fence a frozen membership transaction before performing any effect."""
+    _validate_membership_repair(operation)
+    if operation.phase is not MembershipRepairPhase.PREPARING_BOOKMARKS:
+        raise ValueError("a new membership repair must start before effects")
+    with repository_lock(workspace):
+        if read_ref_oid(workspace, STATE_REF) != operation.expected_state_oid:
+            raise ConcurrentUpdate("private state changed before operation start")
+        if read_ref_oid(workspace, OPERATION_REF) is not None:
+            raise ConcurrentUpdate("another operation is already active")
+        _local, readbacks = observe_publication_slots(workspace, operation)  # type: ignore[arg-type]
+        for slot, readback in zip(operation.slots, readbacks, strict=True):
+            if slot.bookmark_setup is BookmarkSetup.CREATE and readback.local_target is not None:
+                raise ConcurrentUpdate(f"CREATE bookmark {slot.branch} is no longer absent")
+            if slot.bookmark_setup is BookmarkSetup.KEEP and not _exact_target(readback.local_target, slot.commit_id):
+                raise ConcurrentUpdate(f"KEEP bookmark {slot.branch} moved")
+            if readback.live_commit_id is not None or not _absent_target(readback.remote_target):
+                raise ConcurrentUpdate(f"publication destination {slot.branch} is no longer absent")
+        refs = tuple(item.ref for item in operation.temporary_bases)
+        if _topology_refs(_membership_carrier(operation).plan, workspace, refs) != tuple(
+            LiveRemoteRef(ref, None) for ref in refs
+        ):
+            raise ConcurrentUpdate("a frozen temporary base branch is occupied")
+        return cas_write_membership_repair(workspace, None, operation)
+
+
+def _membership_plan(operation: MembershipRepair) -> TopologyPlan:
+    """Make an in-memory adapter for topology leaf commands; never persist it."""
+    slots = {slot.slot_id: slot for slot in operation.slots}
+    source = {pr.identity: pr for pr in operation.source_prs}
+    prs = list(operation.source_prs)
+    active: list[DesiredExistingPR] = []
+    metadata = {item.pr_identity: item for item in operation.metadata_updates}
+    updates = {item.ref.full_name: item for item in operation.head_updates}
+    for item in operation.desired:
+        if isinstance(item, ExistingMembershipEntry):
+            pr = source[item.pr_identity]
+            update = updates.get(f"refs/heads/{pr.head_branch}")
+            wanted = metadata.get(item.pr_identity)
+            active.append(DesiredExistingPR(item.pr_identity, update.new_commit_id if update else pr.head_oid,
+                                            wanted.title if wanted else pr.title, wanted.body if wanted else pr.body))
+        else:
+            slot = slots[item.slot_id]
+            if slot.pr_identity is None:
+                raise Error("new membership slot is not bound")
+            pr = GitHubPullRequest(slot.pr_identity, "<unobserved>", PullRequestState.OPEN, True,
+                                   operation.repository, slot.branch, slot.commit_id, slot.base_branch, "", False, False,
+                                   slot.title, slot.body, None)
+            prs.append(pr)
+            active.append(DesiredExistingPR(slot.pr_identity, slot.commit_id, slot.title, slot.body))
+    dependencies = TopologyDependencies(operation.effective_config, operation.push_url,
+        operation.expected_state_oid, None, tuple(prs), operation.source_membership, (), ())
+    detached = (
+        ()
+        if operation.source_tracked is None
+        else tuple(identity for identity in operation.source_tracked.ordered_prs
+                   if identity not in {item.pr_identity for item in active})
+    )
+    return TopologyPlan(operation.repository, operation.repository_name, operation.remote,
+        DesiredStack(operation.repository, operation.base_branch, tuple(active)), detached,
+        operation.head_updates, operation.temporary_bases, None, dependencies)
+
+
+def _membership_projection(
+    github: GitHubClient,
+    operation: MembershipRepair,
+    repository: GitHubRepository,
+) -> tuple[tuple[GitHubPullRequest, ...], GitHubStack | None]:
+    plan = _membership_plan(operation)
+    sources = github.pull_requests(tuple(pr.identity for pr in plan.dependencies.prs))
+    desired = tuple(item.pr_identity for item in plan.desired.active)
+    ids = {
+        item.stack.identity
+        for item in sources
+        if item.identity in desired and item.stack is not None
+    }
+    stack = (
+        github.stack(repository, next(iter(ids)))
+        if len(desired) >= 2 and len(ids) == 1
+        else None
+    )
+    return sources, stack
+
+
+def _membership_projection_error(operation: MembershipRepair,
+                                 sources: Sequence[GitHubPullRequest],
+                                 stack: GitHubStack | None) -> str | None:
+    plan = _membership_plan(operation)
+    error = _topology_projection_error(plan, sources, stack)
+    if error is not None:
+        return error
+    omitted = (
+        set()
+        if operation.source_tracked is None
+        else set(operation.source_tracked.ordered_prs)
+        - {item.pr_identity for item in plan.desired.active}
+    )
+    frozen = {pr.identity: pr for pr in operation.source_prs}
+    actual = {item.identity: item for item in sources}
+    for identity in omitted:
+        old, now = frozen[identity], actual[identity]
+        if now.stack is not None or (now.head_oid, now.title, now.body, now.draft) != (
+            old.head_oid, old.title, old.body, old.draft
+        ):
+            return f"omitted pull request #{old.number} changed or is not standalone"
+    return None
+
+
+def _membership_source_refs_error(operation: MembershipRepair, plan: TopologyPlan,
+                                  workspace: str | Path) -> str | None:
+    """Recheck the frozen old comparisons before dissolving their association."""
+    refs: list[RemoteBranchRef] = []
+    expected: list[str] = []
+    for pr in operation.source_prs:
+        refs.extend((RemoteBranchRef(operation.repository, f"refs/heads/{pr.head_branch}"),
+                     RemoteBranchRef(operation.repository, f"refs/heads/{pr.base_branch}")))
+        if pr.head_oid is None or pr.base_oid is None:
+            return f"pull request #{pr.number} has incomplete commit observations"
+        expected.extend((pr.head_oid, pr.base_oid))
+    # Repeated predecessor refs are intentional; observe them once and compare by key.
+    unique = tuple(dict.fromkeys(refs))
+    observed = {item.ref: item.commit_id for item in _topology_refs(plan, workspace, unique)}
+    for ref, oid in zip(refs, expected, strict=True):
+        if observed.get(ref) != oid:
+            return f"frozen live ref {ref.full_name} changed"
+    return None
+
+
+def _build_membership_final_state(operation: MembershipRepair, state: TrackedState) -> TrackedState:
+    desired = tuple(item.pr_identity for item in _membership_plan(operation).desired.active)
+    if operation.source_tracked is None:
+        source_ids = {pr.identity for pr in operation.source_prs}
+        if any(
+            stack.repository == operation.repository
+            and source_ids.intersection((*stack.ordered_prs, *stack.detached_prs))
+            for stack in state.stacks
+        ):
+            raise Error("private state gained an overlapping standalone source record")
+        detached: tuple[PullRequestId, ...] = ()
+        stacks = state.stacks
+    else:
+        matches = tuple(item for item in state.stacks if item == operation.source_tracked)
+        if len(matches) != 1:
+            raise Error("private state no longer contains the exact source record")
+        omitted = tuple(identity for identity in operation.source_tracked.ordered_prs if identity not in desired)
+        detached = tuple(dict.fromkeys((*operation.source_tracked.detached_prs, *omitted)))
+        stacks = tuple(item for item in state.stacks if item != operation.source_tracked)
+    if desired:
+        stacks += (TrackedStack(operation.repository, operation.base_branch, desired, detached),)
+    publications, adoptions = state.last_published_heads, state.last_adopted_heads
+    source = {pr.identity: pr for pr in operation.source_prs}
+    receipts: list[LastPublishedHead] = []
+    for update in operation.head_updates:
+        identity = next(identity for identity, pr in source.items()
+                        if update.ref.full_name == f"refs/heads/{pr.head_branch}")
+        receipts.append(LastPublishedHead(identity, update.ref, update.new_commit_id))
+    for slot in operation.slots:
+        assert slot.pr_identity is not None
+        receipts.append(LastPublishedHead(slot.pr_identity,
+            RemoteBranchRef(operation.repository, f"refs/heads/{slot.branch}"), slot.commit_id))
+    keys = {(item.pr, item.ref) for item in receipts}
+    publications = tuple(item for item in publications if (item.pr, item.ref) not in keys) + tuple(receipts)
+    adoptions = tuple(item for item in adoptions if (item.pr, item.ref) not in keys)
+    return TrackedState(stacks, publications, adoptions)
+
+
+def resume_membership_repair(
+    workspace: str | Path, github: GitHubClient
+) -> MembershipRepairResult:
+    """Recover one mixed membership transaction entirely from its durable record."""
+    with repository_lock(workspace):
+        try:
+            operation_oid, raw = read_operation(workspace)
+            if not isinstance(raw, MembershipRepair):
+                return Stopped("operation", "active operation is not a membership repair")
+            operation = raw
+            repository = _frozen_repository(
+                github, operation.repository, operation.repository_name
+            )
+        except Error as exc:
+            return Stopped("operation", str(exc))
+
+        def save(**changes: object) -> None:
+            nonlocal operation, operation_oid
+            operation = replace(operation, **changes)
+            operation_oid = cas_write_membership_repair(workspace, operation_oid, operation)
+
+        try:
+            if operation.phase is not MembershipRepairPhase.COMMITTING and read_ref_oid(workspace, STATE_REF) != operation.expected_state_oid:
+                return Stopped("state", "private state changed while operation is active")
+            if operation.phase is MembershipRepairPhase.PREPARING_BOOKMARKS:
+                stopped = _prepare_publication_bookmarks(workspace, operation)  # type: ignore[arg-type]
+                if stopped: return stopped
+                save(phase=MembershipRepairPhase.PUBLISHING_NEW_REFS)
+            if operation.phase is MembershipRepairPhase.PUBLISHING_NEW_REFS:
+                stopped = _prepare_publication_tracking(workspace, operation)  # type: ignore[arg-type]
+                if stopped: return stopped
+                _local, readbacks = observe_publication_slots(workspace, operation)  # type: ignore[arg-type]
+                actions = classify_publication_recovery(operation, readbacks)  # type: ignore[arg-type]
+                if isinstance(actions, Stopped): return actions
+                pending = tuple(slot for slot, action in zip(operation.slots, actions, strict=True)
+                                if slot.phase is NewPRPhase.NOT_ATTEMPTED and action is PublicationRecoveryAction.PUSH)
+                if pending:
+                    save(slots=tuple(replace(slot, phase=NewPRPhase.PUBLICATION_POSSIBLY_SENT) if slot in pending else slot for slot in operation.slots))
+                retries = tuple(slot for slot, action in zip(operation.slots, actions, strict=True) if action is PublicationRecoveryAction.PUSH)
+                if retries: push_new_slot_refs(workspace, operation, retries)  # type: ignore[arg-type]
+                _local, readbacks = observe_publication_slots(workspace, operation)  # type: ignore[arg-type]
+                actions = classify_publication_recovery(operation, readbacks)  # type: ignore[arg-type]
+                if isinstance(actions, Stopped): return actions
+                for slot, action in zip(operation.slots, actions, strict=True):
+                    if action is PublicationRecoveryAction.TRACK: track_publication_bookmark(workspace, operation, slot)  # type: ignore[arg-type]
+                if PublicationRecoveryAction.TRACK in actions:
+                    _local, readbacks = observe_publication_slots(workspace, operation)  # type: ignore[arg-type]
+                    actions = classify_publication_recovery(operation, readbacks)  # type: ignore[arg-type]
+                if isinstance(actions, Stopped) or any(item is not PublicationRecoveryAction.READY for item in actions):
+                    return actions if isinstance(actions, Stopped) else Stopped("publish", "new refs are not exact and tracked")
+                save(slots=tuple(replace(slot, phase=NewPRPhase.READY) for slot in operation.slots), phase=MembershipRepairPhase.CREATING_PRS)
+            if operation.phase is MembershipRepairPhase.CREATING_PRS:
+                for index, slot in enumerate(operation.slots):
+                    if slot.phase is NewPRPhase.READY:
+                        slot = replace(slot, phase=NewPRPhase.POSSIBLY_SENT); slots = list(operation.slots); slots[index] = slot; save(slots=tuple(slots))
+                        returned: GitHubPullRequest | None = None
+                        try:
+                            created = github.create_pull_request(
+                                repository,
+                                head_branch=slot.branch,
+                                base_branch=slot.base_branch,
+                                title=slot.title,
+                                body=slot.initial_body,
+                                draft=True,
+                            )
+                            candidate = github.pull_requests((created,))[0]
+                            if _slot_pr_matches(operation.repository, slot, candidate, initial=True):
+                                returned = candidate
+                        except Error:
+                            pass
+                        matches = (
+                            (returned,)
+                            if returned is not None
+                            else tuple(
+                                pr
+                                for pr in github.find_pull_requests(
+                                    operation.repository, head_branches=(slot.branch,)
+                                )
+                                if slot.marker in pr.body
+                            )
+                        )
+                    elif slot.phase is NewPRPhase.POSSIBLY_SENT:
+                        matches = tuple(
+                            pr
+                            for pr in github.find_pull_requests(
+                                operation.repository, head_branches=(slot.branch,)
+                            )
+                            if slot.marker in pr.body
+                        )
+                    else: matches = ()
+                    if slot.phase is NewPRPhase.POSSIBLY_SENT:
+                        valid = tuple(pr for pr in matches if _slot_pr_matches(operation.repository, slot, pr, initial=True))
+                        if len(valid) != 1: return Stopped("create-pr", "possibly sent; marker lookup did not find exactly one matching PR")
+                        slot = replace(slot, phase=NewPRPhase.BOUND, pr_identity=valid[0].identity)
+                        slots = list(operation.slots); slots[index] = slot; save(slots=tuple(slots))
+                    if slot.phase is NewPRPhase.BOUND:
+                        assert slot.pr_identity is not None
+                        found = github.find_pull_requests(
+                            operation.repository, head_branches=(slot.branch,)
+                        )
+                        bound = tuple(pr for pr in found if pr.identity == slot.pr_identity)
+                        if len(bound) != 1:
+                            return Stopped("metadata", "bound PR is not uniquely observable")
+                        try:
+                            github.update_pull_request(
+                                repository,
+                                slot.pr_identity,
+                                title=slot.title,
+                                body=slot.body,
+                            )
+                        except Error:
+                            pass
+                        found = github.find_pull_requests(
+                            operation.repository, head_branches=(slot.branch,)
+                        )
+                        if len(tuple(pr for pr in found if pr.identity == slot.pr_identity and _slot_pr_matches(operation.repository, slot, pr, initial=False))) != 1:
+                            return Stopped("metadata", "bound PR did not reach frozen metadata")
+                        slots = list(operation.slots); slots[index] = replace(slot, phase=NewPRPhase.VERIFIED); save(slots=tuple(slots))
+                save(phase=MembershipRepairPhase.UNSTACKING_SOURCE)
+            plan = _membership_plan(operation)
+            if operation.phase is MembershipRepairPhase.UNSTACKING_SOURCE:
+                refs_error = _membership_source_refs_error(operation, plan, workspace)
+                if refs_error: return Stopped("revalidate", refs_error)
+                if isinstance(operation.source_membership, StandalonePullRequestSet):
+                    sources = github.pull_requests(
+                        tuple(pr.identity for pr in operation.source_prs)
+                    )
+                    stack = None
+                else:
+                    sources, stack = _observe_source_association(
+                        github,
+                        _membership_carrier(operation).plan,
+                        repository,
+                        allow_dissolved=True,
+                        cwd=workspace,
+                    )
+                if isinstance(operation.source_membership, ServerStackMembership):
+                    if stack is not None and not operation.source_unstack_possibly_sent:
+                        save(source_unstack_possibly_sent=True)
+                        try:
+                            run_stack_unstack(github, repository, operation.source_membership)
+                        except Error:
+                            pass
+                    if prove_stack_dissolved(github, repository, operation.source_membership.stack.identity) is not StackDissolution.ABSENT:
+                        return Stopped("unstack", "old stack dissolution is unproven")
+                    sources, _stack = _observe_source_association(
+                        github,
+                        _membership_carrier(operation).plan,
+                        repository,
+                        allow_dissolved=True,
+                        cwd=workspace,
+                    )
+                if any(item.stack is not None for item in sources): return Stopped("unstack", "source stack still survives")
+                save(phase=MembershipRepairPhase.TRANSITIONING_BASES)
+            if operation.phase is MembershipRepairPhase.TRANSITIONING_BASES:
+                all_sources, _stack = _membership_projection(github, operation, repository)
+                if any(item.stack is not None for item in all_sources):
+                    return Stopped("temporary-base", "a source or new PR is not standalone")
+                refs = tuple(item.ref for item in operation.temporary_bases)
+                values = tuple(item.commit_id for item in _topology_refs(plan, workspace, refs))
+                old = tuple(item.old_base_commit_id for item in operation.temporary_bases)
+                if values == (None,) * len(refs) and refs:
+                    create_temporary_bases(workspace, operation.push_url, operation.temporary_bases)
+                    values = tuple(item.commit_id for item in _topology_refs(plan, workspace, refs))
+                if values != old: return Stopped("temporary-bases", "temporary-base readback is absent, mixed, or foreign")
+                frozen = {pr.identity: pr for pr in operation.source_prs}
+                for item in operation.temporary_bases:
+                    source = _observe_topology_pr(github, repository, frozen[item.pr_identity], by_identity=True, cwd=workspace)
+                    name = item.ref.full_name.removeprefix("refs/heads/")
+                    if source.stack is not None: return Stopped("temporary-base", "a stack association reappeared")
+                    if source.base_branch == name:
+                        if item.pr_identity in operation.base_transitions_possibly_sent:
+                            save(base_transitions_possibly_sent=tuple(identity for identity in operation.base_transitions_possibly_sent if identity != item.pr_identity))
+                        continue
+                    if source.base_branch != name:
+                        if source.base_branch != frozen[item.pr_identity].base_branch: return Stopped("temporary-base", "PR base is foreign")
+                        if item.pr_identity in operation.base_transitions_possibly_sent:
+                            return Stopped("temporary-base", "possibly sent base edit still reads as its old base")
+                        save(base_transitions_possibly_sent=(*operation.base_transitions_possibly_sent, item.pr_identity))
+                        try:
+                            run_pr_base_edit(github, repository, item.pr_identity, name)
+                        except Error:
+                            pass
+                        if _observe_topology_pr(github, repository, frozen[item.pr_identity], by_identity=True, cwd=workspace).base_branch != name: return Stopped("temporary-base", "base edit did not read back")
+                        save(base_transitions_possibly_sent=tuple(identity for identity in operation.base_transitions_possibly_sent if identity != item.pr_identity))
+                save(phase=MembershipRepairPhase.PUBLISHING)
+            if operation.phase is MembershipRepairPhase.PUBLISHING:
+                refs = tuple(item.ref for item in operation.head_updates) + tuple(item.ref for item in operation.temporary_bases)
+                old = tuple(item.expected_old_commit_id for item in operation.head_updates) + tuple(item.old_base_commit_id for item in operation.temporary_bases)
+                final = tuple(item.new_commit_id for item in operation.head_updates) + tuple(item.new_base_commit_id for item in operation.temporary_bases)
+                values = tuple(item.commit_id for item in _topology_refs(plan, workspace, refs))
+                if values == old and refs:
+                    save(publication_possibly_sent=tuple(item.ref for item in operation.head_updates))
+                    move_temporary_bases(workspace, operation.push_url, operation.head_updates, operation.temporary_bases)
+                    values = tuple(item.commit_id for item in _topology_refs(plan, workspace, refs))
+                if values != final: return Stopped("publish", "transition readback is old, mixed, or foreign")
+                save(phase=MembershipRepairPhase.RELINKING)
+            if operation.phase is MembershipRepairPhase.RELINKING:
+                bases = _topology_desired_bases(plan); frozen = {pr.identity: pr for pr in plan.dependencies.prs}
+                metadata = {item.pr_identity: item for item in operation.metadata_updates}
+                for wanted in plan.desired.active:
+                    source = _observe_topology_pr(github, repository, frozen[wanted.pr_identity], by_identity=True, expected_head_commit_id=wanted.desired_commit_id, cwd=workspace)
+                    if source.stack is not None: return Stopped("relink", "a stack association reappeared")
+                    if source.base_branch == bases[wanted.pr_identity] and wanted.pr_identity in operation.base_transitions_possibly_sent:
+                        save(base_transitions_possibly_sent=tuple(identity for identity in operation.base_transitions_possibly_sent if identity != wanted.pr_identity))
+                    if source.base_branch != bases[wanted.pr_identity]:
+                        if wanted.pr_identity in operation.base_transitions_possibly_sent:
+                            return Stopped("relink", "possibly sent final base edit still reads as its old base")
+                        save(base_transitions_possibly_sent=(*operation.base_transitions_possibly_sent, wanted.pr_identity))
+                        try:
+                            run_pr_base_edit(github, repository, wanted.pr_identity, bases[wanted.pr_identity])
+                        except Error:
+                            pass
+                        verified = _observe_topology_pr(github, repository, frozen[wanted.pr_identity], by_identity=True, expected_head_commit_id=wanted.desired_commit_id, cwd=workspace)
+                        if verified.base_branch != bases[wanted.pr_identity]: return Stopped("relink", "final base edit did not read back")
+                        save(base_transitions_possibly_sent=tuple(identity for identity in operation.base_transitions_possibly_sent if identity != wanted.pr_identity))
+                    update = metadata.get(wanted.pr_identity)
+                    if update is not None and (source.title, source.body) != (update.title, update.body):
+                        try:
+                            github.update_pull_request(
+                                repository,
+                                update.pr_identity,
+                                title=update.title,
+                                body=update.body,
+                            )
+                        except Error:
+                            pass
+                if len(plan.desired.active) >= 2 and not operation.relink_possibly_sent:
+                    save(relink_possibly_sent=True)
+                    try:
+                        run_topology_stack_link(github, repository, plan)
+                    except Error:
+                        pass
+                sources, stack = _membership_projection(github, operation, repository)
+                error = _membership_projection_error(operation, sources, stack)
+                if error: return Stopped("relink", error)
+                save(phase=MembershipRepairPhase.VERIFYING, resulting_stack=stack.identity if stack else None)
+            if operation.phase is MembershipRepairPhase.VERIFYING:
+                for _ in range(2):
+                    sources, stack = _membership_projection(github, operation, repository)
+                    error = _membership_projection_error(operation, sources, stack)
+                    if error: return Stopped("verify", error)
+                state_oid, state = read_state(workspace)
+                if state_oid != operation.expected_state_oid: return Stopped("state", "private state changed before commit")
+                final_json = state_to_json(_build_membership_final_state(operation, state))
+                final_oid = _run(["git", f"--git-dir={git_common_dir(workspace)}", "hash-object", "-w", "--stdin"], stdin=final_json).strip()
+                save(phase=MembershipRepairPhase.COMMITTING, final_state_json=final_json, final_state_oid=final_oid)
+            if operation.phase is MembershipRepairPhase.COMMITTING:
+                current = read_ref_oid(workspace, STATE_REF)
+                if current == operation.expected_state_oid:
+                    sources, stack = _membership_projection(github, operation, repository)
+                    error = _membership_projection_error(operation, sources, stack)
+                    if error: return Stopped("verify", error)
+                    assert operation.final_state_json is not None
+                    if cas_write_state(workspace, current, parse_state(operation.final_state_json)) != operation.final_state_oid: return Stopped("state", "committed state differs from frozen OID")
+                elif current != operation.final_state_oid: return Stopped("state", "private state is neither expected nor final")
+                # Refuse cleanup while any PR still names an operation-owned base.
+                sources, _stack = _membership_projection(github, operation, repository)
+                names = {item.ref.full_name.removeprefix("refs/heads/") for item in operation.temporary_bases}
+                if any(item.base_branch in names for item in sources): return Stopped("cleanup", "a PR still uses a temporary base")
+                for item, live in zip(operation.temporary_bases, _topology_refs(plan, workspace, tuple(x.ref for x in operation.temporary_bases)), strict=True):
+                    if live.commit_id is None: continue
+                    if live.commit_id != item.new_base_commit_id: return Stopped("cleanup", "temporary base branch moved externally")
+                    subprocess.run(_delete_temporary_base_command(workspace, plan, item), text=True, capture_output=True, check=False)
+                    if _topology_refs(plan, workspace, (item.ref,)) != (LiveRemoteRef(item.ref, None),): return Stopped("cleanup", "temporary-base deletion was not verified")
+                cas_delete_operation(workspace, operation_oid)
+                return MembershipRepairVerified(tuple(item.pr_identity for item in plan.desired.active))
+        except Error as exc:
+            return Stopped(operation.phase.value, str(exc))
+        return Stopped("operation", "membership operation reached no terminal state")
+
+
 def resume_operation(
     workspace: str | Path, github: GitHubClient
-) -> FirstPublicationResult | TopologyRepairResult:
+) -> FirstPublicationResult | TopologyRepairResult | MembershipRepairResult:
     try:
         _oid, operation = read_operation(workspace)
     except Error as exc:
         return Stopped("operation", str(exc))
     if isinstance(operation, TopologyRepair):
         return resume_topology_repair(workspace, github)
+    if isinstance(operation, MembershipRepair):
+        return resume_membership_repair(workspace, github)
     return resume_first_publication(workspace, github)
 
 
@@ -8070,18 +8957,11 @@ def observe_historical_pull_request_collisions(
   }}
 }}"""
     response = _exact_record(
-        _command_json(
-            [
-                "gh",
-                "api",
-                "--hostname",
-                repository.identity.host,
-                "graphql",
-                "--input",
-                "-",
-            ],
+        _github_graphql(
+            repository.identity.host,
+            query,
+            variables,
             cwd=cwd,
-            stdin=json.dumps({"query": query, "variables": variables}),
         ),
         {"data"},
         "GitHub historical collision response",
@@ -8173,18 +9053,11 @@ def observe_open_pull_request_candidates(
   }}
 }}"""
     response = _exact_record(
-        _command_json(
-            [
-                "gh",
-                "api",
-                "--hostname",
-                repository.identity.host,
-                "graphql",
-                "--input",
-                "-",
-            ],
+        _github_graphql(
+            repository.identity.host,
+            query,
+            variables,
             cwd=cwd,
-            stdin=json.dumps({"query": query, "variables": variables}),
         ),
         {"data"},
         "GitHub open PR candidate response",
@@ -8324,6 +9197,62 @@ def _assign_pr_boundaries(
         used.add(matches[0])
         assignments.append(ExistingPRAssignment(matches[0], commit.commit_id))
     return tuple(assignments)
+
+
+def classify_complete_membership_boundaries(
+    local: LocalObservation,
+    prs: Sequence[GitHubPullRequest],
+    commits: Sequence[ObservedCommit],
+) -> tuple[CompleteMembershipBoundary, ...] | Blocked:
+    """Classify a complete oldest-first selection without positional inference.
+
+    A PR identity is retained only when its local bookmark points at the exact
+    selected commit or at a commit carrying the same jj change ID.  No-match is
+    a genuinely new slot; ambiguity and reuse are errors rather than new PRs.
+    """
+    by_commit = {commit.commit_id: commit for commit in local.commits}
+    if len({commit.commit_id for commit in commits}) != len(commits):
+        return _block(
+            "duplicate-selection", "stack", "selected boundaries must be unique"
+        )
+    for pr in prs:
+        bookmarks = tuple(item for item in local.local_bookmarks if item.name == pr.head_branch)
+        if len(bookmarks) != 1 or not isinstance(bookmarks[0].target, CommitTarget):
+            return _block(
+                "ambiguous-boundary",
+                f"PR #{pr.number}",
+                "every source PR head must have one exact local bookmark target",
+            )
+    result: list[CompleteMembershipBoundary] = []
+    used: set[PullRequestId] = set()
+    for commit in commits:
+        matches: list[PullRequestId] = []
+        for pr in prs:
+            target = _one_bookmark_target(local, None, pr.head_branch)
+            local_head = by_commit.get(target or "")
+            if target == commit.commit_id or (
+                local_head is not None and local_head.change_id == commit.change_id
+            ):
+                matches.append(pr.identity)
+        if len(matches) > 1:
+            return _block(
+                "ambiguous-boundary",
+                commit.commit_id,
+                "selected boundary matches multiple existing PR identities",
+            )
+        if not matches:
+            result.append(NewMembershipBoundary(commit.commit_id))
+            continue
+        identity = matches[0]
+        if identity in used:
+            return _block(
+                "duplicate-membership",
+                f"PR #{identity.number}",
+                "an existing PR may occupy only one desired boundary",
+            )
+        used.add(identity)
+        result.append(ExistingMembershipBoundary(identity, commit.commit_id))
+    return tuple(result)
 
 
 def selected_boundary_bookmark_names(
@@ -8477,6 +9406,172 @@ def resolve_standalone_membership_boundaries(
             "the standalone source graph is disconnected or cyclic",
         )
     return tuple(resolved), tuple(ordered), roots[0].base_branch
+
+
+def prepare_membership_repair(
+    workspace: str | Path,
+    snapshot: Snapshot,
+    repository: GitHubRepository,
+    remote: str,
+    boundaries: Sequence[CompleteMembershipBoundary],
+    *,
+    standalone_sources: Sequence[GitHubPullRequest] | None = None,
+    standalone_base_branch: str | None = None,
+) -> MembershipRepair | Blocked:
+    """Observe and freeze a mixed complete-membership transaction; never mutate."""
+    boundaries = tuple(boundaries)
+    standalone_sources = (
+        None if standalone_sources is None else tuple(standalone_sources)
+    )
+    source_prs = (
+        snapshot.pull_requests
+        if standalone_sources is None
+        else tuple(standalone_sources)
+    )
+    source_ids = tuple(pr.identity for pr in source_prs)
+    source_membership: MembershipRepairSource = (
+        snapshot.membership
+        if standalone_sources is None
+        else StandalonePullRequestSet(source_ids)
+    )
+    membership_ids = (
+        (snapshot.membership.pr,)
+        if isinstance(snapshot.membership, StandalonePullRequest)
+        else snapshot.membership.ordered_prs
+    ) if standalone_sources is None else source_ids
+    if snapshot.tool_state.operation_blob_oid is not None:
+        return _block("operation-fenced", OPERATION_REF, "a pending operation fences planning")
+    if (not boundaries or source_ids != membership_ids or len(set(source_ids)) != len(source_ids)
+            or any(pr.state is not PullRequestState.OPEN for pr in source_prs)):
+        return _block("incomplete-membership", "stack", "repair requires one exact fully-open source membership")
+    if any(pr.head_repository != snapshot.repository or pr.identity.repository != snapshot.repository for pr in source_prs):
+        return _block("nonlocal-pr", "stack", "repair requires repository-local PRs")
+    if any(pr.auto_merge_enabled or pr.in_merge_queue for pr in source_prs):
+        return _block("active-automation", "stack", "automation blocks membership repair")
+    overlapping = tuple(stack for stack in snapshot.tool_state.state.stacks if stack.repository == snapshot.repository and set(source_ids).intersection((*stack.ordered_prs, *stack.detached_prs)))
+    if standalone_sources is None:
+        exact = tuple(stack for stack in overlapping if stack.base_branch == (source_prs[0].base_branch if isinstance(snapshot.membership, StandalonePullRequest) else snapshot.membership.base_branch) and stack.ordered_prs == source_ids)
+        if len(exact) != 1 or len(overlapping) != 1:
+            return _block("tracked-source-mismatch", "stack", "source must have one exact, nonoverlapping tracked record")
+        tracked: TrackedStack | None = exact[0]
+        base_branch = tracked.base_branch
+    else:
+        if overlapping:
+            return _block(
+                "tracked-source-overlap",
+                "stack",
+                "explicit standalone PRs overlap existing tracked state",
+            )
+        tracked = None
+        if standalone_base_branch is None:
+            return _block(
+                "incomplete-source-graph",
+                "stack",
+                "standalone repair requires one frozen ultimate base",
+            )
+        base_branch = standalone_base_branch
+    semantic = [[snapshot.repository.host, snapshot.repository.node_id], [item.number for item in source_ids], base_branch,
+                [["existing", item.pr_identity.number, item.commit_id] if isinstance(item, ExistingMembershipBoundary) else ["new", item.commit_id] for item in boundaries]]
+    digest = hashlib.sha256(json.dumps(semantic, separators=(",", ":")).encode()).hexdigest()[:24]
+    new_boundaries = tuple(item for item in boundaries if isinstance(item, NewMembershipBoundary))
+    protected = (base_branch, *(pr.head_branch for pr in source_prs), *_managed_branch_names(snapshot.tool_state.state))
+    publication = (
+        resolve_first_publication_assignments(
+            workspace,
+            snapshot.local,
+            repository,
+            snapshot.push_url,
+            tuple(item.commit_id for item in new_boundaries),
+            protected,
+        )
+        if new_boundaries
+        else ()
+    )
+    if isinstance(publication, Blocked):
+        return publication
+    publication_by_commit = {item.commit_id: item.branch_name for item in publication}
+    refs = {item.ref: item for item in snapshot.live_refs}
+    base = refs.get(RemoteBranchRef(snapshot.repository, f"refs/heads/{base_branch}"))
+    if base is None or base.commit_id is None:
+        return _block("base-disagrees", base_branch, "target branch was not authoritatively observed")
+    by_pr = {pr.identity: pr for pr in source_prs}
+    by_commit = {commit.commit_id: commit for commit in snapshot.local.commits}
+    # Preserve every old comparison before constructing the desired map.
+    for pr in source_prs:
+        head = refs.get(RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.head_branch}"))
+        literal = refs.get(RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.base_branch}"))
+        moving_external_base = (
+            standalone_sources is not None and pr.identity == source_prs[0].identity
+        )
+        if (head is None or head.commit_id != pr.head_oid or literal is None
+                or (not moving_external_base
+                    and literal.commit_id != pr.base_oid)
+                or pr.base_oid == pr.head_oid
+                or (standalone_sources is None and not _comparison_is_nonempty_linear_and_conflict_free(
+                    snapshot.local.commits,
+                    pr.base_oid,
+                    pr.head_oid,
+                ))):
+            return _block("invalid-old-comparison", f"PR #{pr.number}", "old comparison is not exact and nonempty")
+    desired: list[DesiredMembershipEntry] = []
+    slots: list[NewPRSlot] = []
+    updates: list[PlannedHeadUpdate] = []
+    metadata_updates: list[PRMetadataUpdate] = []
+    temporary_specs: list[tuple[PullRequestId, str, str]] = []
+    predecessor_branch, predecessor_commit = base_branch, base.commit_id
+    new_ordinal = 0
+    for boundary in boundaries:
+        commit = by_commit.get(boundary.commit_id)
+        if (commit is None or commit.has_conflicts or boundary.commit_id == predecessor_commit
+                or ((standalone_sources is None or desired)
+                    and not _comparison_is_nonempty_linear_and_conflict_free(
+                        snapshot.local.commits, predecessor_commit, boundary.commit_id
+                    ))):
+            return _block("invalid-desired-comparison", boundary.commit_id, "desired segment is absent, nonlinear, empty, or conflicted")
+        metadata = _metadata(commit.description)
+        if metadata is None:
+            return _block("title-missing", boundary.commit_id, "selected revision has no title")
+        if isinstance(boundary, ExistingMembershipBoundary):
+            pr = by_pr.get(boundary.pr_identity)
+            if pr is None:
+                return _block("foreign-desired", f"PR #{boundary.pr_identity.number}", "desired PR is not in source")
+            desired.append(ExistingMembershipEntry(pr.identity))
+            wanted = DesiredExistingPR(pr.identity, boundary.commit_id, *metadata)
+            head = refs[RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.head_branch}")]
+            planned = _plan_head_update(
+                snapshot.local.commits, snapshot.tool_state.state, wanted, head
+            )
+            if isinstance(planned, Blocked): return planned
+            updates.extend(planned); metadata_updates.extend(_metadata_updates(pr, wanted))
+            assert pr.base_oid is not None
+            temporary_specs.append((pr.identity, pr.base_oid, predecessor_commit))
+            predecessor_branch = pr.head_branch
+        else:
+            new_ordinal += 1
+            slot_id = f"membership-{digest}-{new_ordinal}"
+            branch = publication_by_commit[boundary.commit_id]
+            matches = tuple(item for item in snapshot.local.local_bookmarks if item.name == branch)
+            if not matches: setup = BookmarkSetup.CREATE
+            elif len(matches) == 1 and isinstance(matches[0].target, CommitTarget) and matches[0].target.commit_id == boundary.commit_id: setup = BookmarkSetup.KEEP
+            else: return _block("bookmark-setup-changed", branch, "publication bookmark is not absent or exact")
+            desired.append(NewMembershipEntry(slot_id))
+            slots.append(NewPRSlot(slot_id, branch, boundary.commit_id, setup, predecessor_branch, *metadata))
+            predecessor_branch = branch
+        predecessor_commit = boundary.commit_id
+    temporary_refs = tuple(RemoteBranchRef(snapshot.repository, f"refs/heads/jj-stack/temporary-bases/{digest}/{index}") for index in range(1, len(temporary_specs) + 1))
+    absences = (() if not temporary_refs else observe_live_refs(
+        snapshot.push_url, snapshot.repository,
+        tuple(item.full_name for item in temporary_refs), cwd=workspace
+    ))
+    if tuple(item.ref for item in absences) != temporary_refs or any(item.commit_id is not None for item in absences):
+        return _block("temporary-base-occupied", "stack", "temporary base absence observations are incomplete or occupied")
+    temporary = tuple(PlannedTemporaryBase(identity, absence.ref, old, new) for (identity, old, new), absence in zip(temporary_specs, absences, strict=True))
+    operation = MembershipRepair(snapshot.repository, repository.name_with_owner, snapshot.push_url, remote,
+        snapshot.local.effective_config, snapshot.local.workspace_targets, base_branch, snapshot.tool_state.state_blob_oid,
+        source_membership, source_prs, tracked, tuple(desired), tuple(slots), tuple(updates), temporary, tuple(metadata_updates))
+    try: _validate_membership_repair(operation)
+    except ValueError as exc: return _block("invalid-membership-repair", "stack", str(exc))
+    return operation
 
 
 def _desired_from_assignments(
@@ -8721,7 +9816,7 @@ def plan_explicit_existing(
             )
             if isinstance(resolved, Blocked):
                 return resolved
-            _classified, standalone_sources, standalone_base_branch = resolved
+            classified, standalone_sources, standalone_base_branch = resolved
             focused_commits = observe_commits(
                 workspace,
                 local.operation_id,
@@ -8738,6 +9833,70 @@ def plan_explicit_existing(
                 ),
             )
             snapshot = replace(snapshot, local=replace(local, commits=focused_commits))
+        else:
+            classified = classify_complete_membership_boundaries(
+                snapshot.local, snapshot.pull_requests, boundaries
+            )
+        if isinstance(classified, Blocked):
+            return classified
+        classified_existing = tuple(
+            item.pr_identity
+            for item in classified
+            if isinstance(item, ExistingMembershipBoundary)
+        )
+        has_new = any(isinstance(item, NewMembershipBoundary) for item in classified)
+        source_ids = tuple(pr.identity for pr in open_prs)
+        if standalone_sources is not None and (
+            len(standalone_sources) > 1 or has_new
+        ):
+            assert standalone_repository is not None
+            source_prs = tuple(standalone_sources)
+            ref_names = tuple(
+                dict.fromkeys(
+                    (
+                        f"refs/heads/{standalone_base_branch}",
+                        *(f"refs/heads/{pr.head_branch}" for pr in source_prs),
+                        *(f"refs/heads/{pr.base_branch}" for pr in source_prs),
+                    )
+                )
+            )
+            standalone_snapshot = replace(
+                snapshot,
+                pull_requests=source_prs,
+                live_refs=observe_live_refs(
+                    snapshot.push_url,
+                    snapshot.repository,
+                    ref_names,
+                    cwd=workspace,
+                ),
+            )
+            return prepare_membership_repair(
+                workspace,
+                standalone_snapshot,
+                standalone_repository,
+                remote,
+                classified,
+                standalone_sources=standalone_sources,
+                standalone_base_branch=standalone_base_branch,
+            )
+        simple_append = (
+            isinstance(snapshot.membership, ServerStackMembership)
+            and tuple(
+                item.pr_identity
+                for item in classified[: len(source_ids)]
+                if isinstance(item, ExistingMembershipBoundary)
+            ) == source_ids
+            and all(
+                isinstance(item, NewMembershipBoundary)
+                for item in classified[len(source_ids) :]
+            )
+            and len(classified) > len(source_ids)
+        )
+        if (has_new and not simple_append) or not classified_existing:
+            repository = github.resolve_repository(snapshot.push_url)
+            return prepare_membership_repair(
+                workspace, snapshot, repository, remote, classified
+            )
         existing_count = 0
         for pr, commit in zip(open_prs, boundaries):
             if _one_bookmark_target(snapshot.local, None, pr.head_branch) != commit.commit_id:
@@ -8931,12 +10090,46 @@ def render_explicit(value: ExplicitPlan | ExplicitResult) -> str:
             f"  - publish {slot.commit_id} as {slot.branch} onto {slot.base_branch}"
             for slot in value.slots
         )
+    if isinstance(value, MembershipRepair):
+        slots = {slot.slot_id: slot for slot in value.slots}
+        source = {pr.identity: pr for pr in value.source_prs}
+        retained = {
+            item.pr_identity for item in value.desired
+            if isinstance(item, ExistingMembershipEntry)
+        }
+        lines = [f"membership repair at {value.phase.value}:", "  ordered goal:"]
+        for item in value.desired:
+            if isinstance(item, ExistingMembershipEntry):
+                lines.append(f"    - existing #{source[item.pr_identity].number}")
+            else:
+                slot = slots[item.slot_id]
+                lines.append(f"    - new {slot.slot_id}: {slot.commit_id} as {slot.branch} onto {slot.base_branch}")
+        detached = (
+            ()
+            if value.source_tracked is None
+            else tuple(
+                identity
+                for identity in value.source_tracked.ordered_prs
+                if identity not in retained
+            )
+        )
+        lines.append(
+            "  detached: "
+            + (
+                ", ".join(f"#{source[item].number}" for item in detached)
+                if detached
+                else "none"
+            )
+        )
+        return "\n".join(lines)
     if isinstance(value, PersistedOperation):
         if isinstance(value.operation, TopologyRepair):
             return (
                 f"resume topology repair at {value.operation.phase.value}:\n"
                 + render_topology(value.operation.plan)
             )
+        if isinstance(value.operation, MembershipRepair):
+            return "resume " + render_explicit(value.operation)
         return (
             f"resume first publication at {value.operation.phase.value}:\n"
             + render_explicit(value.operation)
@@ -8945,6 +10138,8 @@ def render_explicit(value: ExplicitPlan | ExplicitResult) -> str:
         return f"published {len(value.ordered_prs)} PR(s)"
     if isinstance(value, TopologyRepairVerified):
         return f"topology repaired for {len(value.ordered_prs)} PR(s)"
+    if isinstance(value, MembershipRepairVerified):
+        return f"membership repaired for {len(value.ordered_prs)} PR(s)"
     if isinstance(value, AdoptionVerified):
         return f"adopted {len(value.adopted_heads)} remote head(s) locally"
     if isinstance(value, Verified):
@@ -8981,6 +10176,9 @@ def apply_explicit(
     if isinstance(value, FirstPublication):
         start_first_publication(value, workspace)
         return resume_first_publication(workspace, github)
+    if isinstance(value, MembershipRepair):
+        start_membership_repair(value, workspace)
+        return resume_membership_repair(workspace, github)
     if isinstance(value, TopologyPlan):
         start_topology_repair(value, workspace)
         return resume_topology_repair(workspace, github)
