@@ -677,6 +677,96 @@ def test_github_routing_accepts_canonical_ssh_aliases_only(monkeypatch) -> None:
         sync._github_repository_locator("https://github.example.com/owner/repo.git")
 
 
+def test_github_effects_send_exact_frozen_rest_requests(monkeypatch) -> None:
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    first = sync.PullRequestId(repository, "PR_1")
+    second = sync.PullRequestId(repository, "PR_2")
+    stack = sync.ServerStackIdentity(repository, "STACK_7", 7)
+    calls = []
+
+    def request(host, method, path, *, body=None, cwd=None):
+        calls.append((host, method, path, body, cwd))
+        return sync.GitHubResponse(200, (), b"{}")
+
+    monkeypatch.setattr(sync, "github_http_request", request)
+    effects = (
+        sync.PullRequestBaseEffect(
+            repository,
+            "owner/repo",
+            second,
+            2,
+            "main",
+            "topic-1",
+            sync.GitHubEffectPhase.POSSIBLY_SENT,
+        ),
+        sync.StackEffect(
+            sync.StackEffectKind.CREATE,
+            repository,
+            "owner/repo",
+            (1, 2),
+            (),
+            (first, second),
+            phase=sync.GitHubEffectPhase.POSSIBLY_SENT,
+        ),
+        sync.StackEffect(
+            sync.StackEffectKind.ADD,
+            repository,
+            "owner/repo",
+            (2,),
+            (first,),
+            (first, second),
+            stack,
+            sync.GitHubEffectPhase.POSSIBLY_SENT,
+        ),
+        sync.StackEffect(
+            sync.StackEffectKind.UNSTACK,
+            repository,
+            "owner/repo",
+            (),
+            (first, second),
+            (),
+            stack,
+            sync.GitHubEffectPhase.POSSIBLY_SENT,
+        ),
+    )
+
+    for effect in effects:
+        sync.send_github_effect(effect, cwd="/workspace")
+
+    assert calls == [
+        (
+            "github.com",
+            "PATCH",
+            "/repos/owner/repo/pulls/2",
+            b'{"base":"topic-1"}',
+            "/workspace",
+        ),
+        (
+            "github.com",
+            "POST",
+            "/repos/owner/repo/stacks",
+            b'{"pull_requests":[1,2]}',
+            "/workspace",
+        ),
+        (
+            "github.com",
+            "POST",
+            "/repos/owner/repo/stacks/7/add",
+            b'{"pull_requests":[2]}',
+            "/workspace",
+        ),
+        (
+            "github.com",
+            "POST",
+            "/repos/owner/repo/stacks/7/unstack",
+            None,
+            "/workspace",
+        ),
+    ]
+    with pytest.raises(ValueError, match="possibly-sent"):
+        sync.send_github_effect(dataclasses.replace(effects[0], phase=sync.GitHubEffectPhase.NOT_ATTEMPTED))
+
+
 def test_github_transport_rejects_errors_partial_data_and_repository_mismatch(
     monkeypatch,
 ) -> None:

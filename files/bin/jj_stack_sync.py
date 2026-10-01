@@ -22,7 +22,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from markdown_it import MarkdownIt
 from markdown_it.rules_inline.newline import newline as _parse_newline
@@ -603,6 +603,45 @@ class FirstPublicationVerified:
     ordered_prs: tuple[PullRequestId, ...]
 
 
+class GitHubEffectPhase(StrEnum):
+    NOT_ATTEMPTED = "not-attempted"
+    POSSIBLY_SENT = "possibly-sent"
+    VERIFIED = "verified"
+
+
+@dataclass(frozen=True)
+class PullRequestBaseEffect:
+    repository: GitHubRepositoryId
+    repository_name: str
+    pr_identity: PullRequestId
+    pr_number: int
+    expected_base: str
+    desired_base: str
+    phase: GitHubEffectPhase = GitHubEffectPhase.NOT_ATTEMPTED
+
+
+class StackEffectKind(StrEnum):
+    CREATE = "create"
+    ADD = "add"
+    UNSTACK = "unstack"
+
+
+@dataclass(frozen=True)
+class StackEffect:
+    kind: StackEffectKind
+    repository: GitHubRepositoryId
+    repository_name: str
+    pull_request_numbers: tuple[int, ...]
+    expected_before: tuple[PullRequestId, ...]
+    desired_after: tuple[PullRequestId, ...]
+    stack: ServerStackIdentity | None = None
+    phase: GitHubEffectPhase = GitHubEffectPhase.NOT_ATTEMPTED
+    resulting_stack: ServerStackIdentity | None = None
+
+
+GitHubEffect = PullRequestBaseEffect | StackEffect
+
+
 @dataclass(frozen=True)
 class PlannedHeadUpdate:
     ref: RemoteBranchRef
@@ -871,6 +910,61 @@ def _github_graphql(
     if not isinstance(value, dict) or "errors" in value:
         raise MalformedSource("GitHub GraphQL response contains errors or is malformed")
     return value
+
+
+def _github_repository_path(repository_name: str) -> str:
+    owner, separator, name = repository_name.partition("/")
+    if not separator or not owner or not name or "/" in name:
+        raise ValueError("repository name must have owner/name form")
+    return f"repos/{quote(owner, safe='')}/{quote(name, safe='')}"
+
+
+def send_github_effect(
+    effect: GitHubEffect, *, cwd: str | Path | None = None
+) -> GitHubResponse:
+    """Send one already-journaled effect exactly once; callers own reconciliation."""
+    if effect.phase is not GitHubEffectPhase.POSSIBLY_SENT:
+        raise ValueError("GitHub effect must be journaled as possibly-sent before I/O")
+    if effect.repository.host != "github.com":
+        raise SourceUnavailable(f"unsupported GitHub host: {effect.repository.host}")
+    base = _github_repository_path(effect.repository_name)
+    if isinstance(effect, PullRequestBaseEffect):
+        if effect.pr_identity.repository != effect.repository:
+            raise ValueError("pull request effect belongs to another repository")
+        method = "PATCH"
+        path = f"/{base}/pulls/{effect.pr_number}"
+        payload: object | None = {"base": effect.desired_base}
+    elif effect.kind is StackEffectKind.CREATE:
+        if effect.stack is not None:
+            raise ValueError("stack creation cannot freeze an existing stack")
+        method, path = "POST", f"/{base}/stacks"
+        payload = {"pull_requests": list(effect.pull_request_numbers)}
+    else:
+        if effect.stack is None or effect.stack.repository != effect.repository:
+            raise ValueError("stack mutation requires the frozen stack identity")
+        suffix = "add" if effect.kind is StackEffectKind.ADD else "unstack"
+        method, path = "POST", f"/{base}/stacks/{effect.stack.number}/{suffix}"
+        payload = (
+            {"pull_requests": list(effect.pull_request_numbers)}
+            if effect.kind is StackEffectKind.ADD
+            else None
+        )
+    body = (
+        None
+        if payload is None
+        else json.dumps(payload, separators=(",", ":")).encode()
+    )
+    return github_http_request(
+        effect.repository.host, method, path, body=body, cwd=cwd
+    )
+
+
+def github_effect_to_record(effect: GitHubEffect) -> dict[str, object]:
+    record = asdict(effect)
+    record["effect_kind"] = (
+        "pull-request-base" if isinstance(effect, PullRequestBaseEffect) else "stack"
+    )
+    return record
 
 
 def _exact_record(value: object, fields: set[str], context: str) -> dict[str, object]:
