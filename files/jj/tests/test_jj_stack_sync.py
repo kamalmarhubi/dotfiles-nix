@@ -1571,6 +1571,63 @@ def test_explicit_merged_prefix_routes_to_preserved_prefix_repair(monkeypatch) -
     )
 
 
+def test_explicit_completed_stack_routes_new_suffix_to_append(monkeypatch) -> None:
+    observed, _selection = stacked_snapshot(count=2, merged_prefix=2)
+    new_commit_id = "9" * 40
+    new_commit = sync.ObservedCommit(
+        new_commit_id,
+        ("b" * 40,),
+        "new-change",
+        "New title\n\nNew body",
+        False,
+        False,
+    )
+    local = dataclasses.replace(
+        observed.local,
+        commits=(new_commit,),
+        local_bookmarks=(sync.LocalBookmark("new", sync.CommitTarget(new_commit_id)),),
+        workspace_targets=(("default", new_commit_id),),
+    )
+    observed = dataclasses.replace(observed, local=local)
+    repository = sync.GitHubRepository(
+        observed.repository, "owner/repo", "https://github.com/owner/repo", "main"
+    )
+    monkeypatch.setattr(sync, "observe_local", lambda *_args, **_kwargs: local)
+    monkeypatch.setattr(sync, "observe_snapshot", lambda *_args, **_kwargs: observed)
+    monkeypatch.setattr(
+        sync, "observe_revision_boundaries", lambda *_args, **_kwargs: (new_commit,)
+    )
+    monkeypatch.setattr(sync, "observe_github_repository", lambda *_args, **_kwargs: repository)
+    monkeypatch.setattr(sync, "resolve_push_url", lambda *_args: observed.push_url)
+    monkeypatch.setattr(
+        sync,
+        "resolve_first_publication_assignments",
+        lambda *_args, **_kwargs: (sync.PublicationAssignment(new_commit_id, "new"),),
+    )
+
+    def refs(_url, identity, names, *, cwd):
+        values = {"refs/heads/main": "b" * 40, "refs/heads/new": None}
+        return tuple(
+            sync.LiveRemoteRef(sync.RemoteBranchRef(identity, name), values[name])
+            for name in names
+        )
+
+    monkeypatch.setattr(sync, "observe_live_refs", refs)
+
+    result = sync.plan_explicit_existing(
+        "/repo", sync.ExistingIntent(observed.pull_requests[0].number, "selected")
+    )
+
+    assert isinstance(result, sync.FirstPublication)
+    assert result.target is sync.FirstPublicationTarget.APPEND
+    assert result.existing_stack == observed.membership.stack
+    assert tuple(item.state for item in result.existing_members) == (
+        sync.PullRequestState.MERGED,
+        sync.PullRequestState.MERGED,
+    )
+    assert result.slots[0].base_branch == "main"
+
+
 @pytest.mark.parametrize("count", (2, 3))
 def test_multi_pr_planner_aggregates_complete_unchanged_topology(count: int) -> None:
     observed, selected = stacked_snapshot(count=count)
@@ -3952,7 +4009,10 @@ def test_multi_publication_codec_and_final_state_preserve_complete_order() -> No
         resulting_stack=stack,
     )
 
-    assert sync.parse_first_publication(sync.first_publication_to_json(operation)) == operation
+    assert (
+        sync.parse_first_publication(sync.first_publication_to_json(operation))
+        == operation
+    )
     final = sync._build_first_publication_state(operation, sync.EMPTY_STATE)
     assert final.stacks[0].ordered_prs == identities
     assert tuple(item.verified_commit_id for item in final.last_published_heads) == (
@@ -4087,6 +4147,254 @@ def test_stack_mutation_uses_frozen_repository_and_only_new_append_suffix(
         assert effect.kind is sync.StackEffectKind.CREATE
         assert effect.stack is None
         assert effect.expected_before == ()
+
+
+@pytest.mark.parametrize("merged_prefix", (1, 2))
+def test_append_preserves_merged_prefix_and_uses_current_integration_anchor(
+    monkeypatch, merged_prefix: int
+) -> None:
+    observed, _selection = stacked_snapshot(count=2, merged_prefix=merged_prefix)
+    base = "b" * 40
+    predecessor = "2" * 40 if merged_prefix == 1 else base
+    new = "9" * 40
+    observed = dataclasses.replace(
+        observed,
+        local=dataclasses.replace(
+            observed.local,
+            commits=(
+                *observed.local.commits,
+                sync.ObservedCommit(new, (predecessor,), "new", "New\n\nBody", False, False),
+            ),
+        ),
+    )
+    repository = sync.GitHubRepository(
+        observed.repository,
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+
+    monkeypatch.setattr(sync, "resolve_push_url", lambda *_args: observed.push_url)
+
+    def refs(_url, identity, names, *, cwd):
+        values = {
+            "refs/heads/main": base,
+            "refs/heads/topic-2": "2" * 40,
+            "refs/heads/new": None,
+        }
+        return tuple(
+            sync.LiveRemoteRef(sync.RemoteBranchRef(identity, name), values[name])
+            for name in names
+        )
+
+    monkeypatch.setattr(sync, "observe_live_refs", refs)
+    operation = sync.prepare_multi_first_publication(
+        "/repo",
+        observed.local,
+        observed.tool_state,
+        repository,
+        observed.push_url,
+        "origin",
+        "main",
+        (sync.PublicationAssignment(new, "new"),),
+        slot_ids=("new-slot",),
+        existing_stack=sync.GitHubStackSource(
+            observed.membership.stack,
+            "main",
+            observed.pull_requests,
+        ),
+    )
+
+    assert isinstance(operation, sync.FirstPublication)
+    assert tuple(member.state for member in operation.existing_members) == tuple(
+        pr.state for pr in observed.pull_requests
+    )
+    assert operation.slots[0].base_branch == (
+        "topic-2" if merged_prefix == 1 else "main"
+    )
+    assert sync.parse_first_publication(sync.first_publication_to_json(operation)) == operation
+
+
+def test_completed_stack_append_records_only_reopened_active_members() -> None:
+    operation = multi_publication_operation(
+        slot_phases=(sync.NewPRPhase.VERIFIED, sync.NewPRPhase.VERIFIED),
+        operation_phase=sync.FirstPublicationPhase.LINKING_STACK,
+    )
+    repository = operation.repository
+    merged = tuple(
+        sync.ExistingFirstPublicationPR(
+            sync.PullRequestId(repository, f"PR_merged_{number}"),
+            number,
+            f"merged-{number}",
+            str(number) * 40,
+            "main" if number == 1 else "merged-1",
+            "0" * 40 if number == 1 else "1" * 40,
+            False,
+            f"Merged {number}",
+            "",
+            sync.PullRequestState.MERGED,
+        )
+        for number in (1, 2)
+    )
+    new_ids = tuple(
+        sync.PullRequestId(repository, f"PR_new_{number}") for number in (3, 4)
+    )
+    detached = sync.PullRequestId(repository, "PR_detached")
+    source = sync.TrackedStack(
+        repository, "main", tuple(item.identity for item in merged), (detached,)
+    )
+    operation = dataclasses.replace(
+        operation,
+        target=sync.FirstPublicationTarget.APPEND,
+        existing_members=merged,
+        existing_stack=sync.ServerStackIdentity(repository, "STACK_same", 17),
+        slots=tuple(
+            dataclasses.replace(slot, pr_identity=identity, pr_number=number)
+            for slot, identity, number in zip(
+                operation.slots, new_ids, (3, 4), strict=True
+            )
+        ),
+        stack_phase=sync.StackLinkPhase.VERIFIED,
+        resulting_stack=sync.ServerStackIdentity(repository, "STACK_same", 17),
+    )
+
+    final = sync._build_first_publication_state(
+        operation, sync.TrackedState((source,), (), ())
+    )
+
+    assert final.stacks == (
+        sync.TrackedStack(repository, "main", new_ids, (detached,)),
+    )
+    assert tuple(item.pr for item in final.last_published_heads) == new_ids
+
+    without_active_record = sync._build_first_publication_state(
+        operation, sync.EMPTY_STATE
+    )
+    assert without_active_record.stacks == (
+        sync.TrackedStack(repository, "main", new_ids),
+    )
+
+
+def test_completed_stack_append_accepts_native_link_base_rewrite_everywhere(
+    monkeypatch,
+) -> None:
+    operation = multi_publication_operation(
+        slot_phases=(sync.NewPRPhase.VERIFIED, sync.NewPRPhase.VERIFIED),
+        operation_phase=sync.FirstPublicationPhase.LINKING_STACK,
+    )
+    repository = operation.repository
+    merged = tuple(
+        sync.ExistingFirstPublicationPR(
+            sync.PullRequestId(repository, f"PR_merged_{number}"),
+            number,
+            f"merged-{number}",
+            str(number) * 40,
+            "main" if number == 1 else "merged-1",
+            "0" * 40 if number == 1 else "1" * 40,
+            False,
+            f"Merged {number}",
+            "",
+            sync.PullRequestState.MERGED,
+        )
+        for number in (1, 2)
+    )
+    slots = tuple(
+        dataclasses.replace(
+            slot,
+            pr_identity=sync.PullRequestId(repository, f"PR_new_{number}"),
+            pr_number=number,
+        )
+        for slot, number in zip(operation.slots, (3, 4), strict=True)
+    )
+    operation = dataclasses.replace(
+        operation,
+        target=sync.FirstPublicationTarget.APPEND,
+        existing_members=merged,
+        existing_stack=sync.ServerStackIdentity(repository, "STACK_same", 17),
+        slots=slots,
+    )
+    linked = tuple(
+        sync.GitHubPullRequest(
+            item.identity,
+            item.number,
+            item.state,
+            item.draft,
+            repository,
+            item.head_branch,
+            item.head_commit_id,
+            item.base_branch,
+            item.base_commit_id,
+            False,
+            False,
+            item.title,
+            item.body,
+        )
+        for item in merged
+    ) + tuple(
+        sync.GitHubPullRequest(
+            slot.pr_identity,
+            slot.pr_number,
+            sync.PullRequestState.OPEN,
+            True,
+            repository,
+            slot.branch,
+            slot.commit_id,
+            merged[-1].head_branch if index == 0 else slots[index - 1].branch,
+            merged[-1].head_commit_id if index == 0 else slots[index - 1].commit_id,
+            False,
+            False,
+            slot.title,
+            slot.body,
+        )
+        for index, slot in enumerate(slots)
+    )
+    monkeypatch.setattr(
+        sync,
+        "observe_github_stack",
+        lambda *_args, **_kwargs: sync.GitHubStackSource(
+            operation.existing_stack, "main", linked
+        ),
+    )
+
+    result = sync.observe_first_publication_stack("/repo", operation)
+
+    assert result is not None
+    assert tuple(pr.identity for pr in result.ordered_prs) == tuple(
+        item.identity for item in merged
+    ) + tuple(slot.pr_identity for slot in slots)
+
+    verified = dataclasses.replace(
+        operation,
+        stack_phase=sync.StackLinkPhase.VERIFIED,
+        resulting_stack=operation.existing_stack,
+    )
+    monkeypatch.setattr(
+        sync,
+        "observe_publication_slots",
+        lambda *_args: (
+            verified.effective_config,
+            tuple(
+                sync.PublicationSlotReadback(
+                    slot.slot_id,
+                    sync.CommitTarget(slot.commit_id),
+                    sync.CommitTarget(slot.commit_id),
+                    sync.TrackingState.TRACKED,
+                    slot.commit_id,
+                )
+                for slot in slots
+            ),
+        ),
+    )
+    by_identity = {pr.identity: pr for pr in linked}
+    monkeypatch.setattr(
+        sync,
+        "find_slot_pull_requests",
+        lambda _workspace, _operation, slot, **_kwargs: (
+            by_identity[slot.pr_identity],
+        ),
+    )
+
+    assert sync._verify_first_publication_external(verified, "/repo") is None
 
 
 def multi_head_plan(*, merged_prefix: int = 0) -> tuple[sync.Snapshot, sync.Apply]:

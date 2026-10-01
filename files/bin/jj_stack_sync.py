@@ -2743,6 +2743,14 @@ def _validate_first_publication(operation: FirstPublication) -> None:
             or not member.title
         ):
             raise ValueError("existing append member is malformed")
+    seen_open = False
+    for member in operation.existing_members:
+        if member.state is PullRequestState.OPEN:
+            seen_open = True
+        elif member.state is not PullRequestState.MERGED or seen_open:
+            raise ValueError(
+                "existing append members must be a merged prefix followed by open PRs"
+            )
     for slot in operation.slots:
         if (
             not slot.slot_id
@@ -2809,7 +2817,17 @@ def first_publication_to_json(operation: FirstPublication) -> str:
     _validate_first_publication(operation)
     payload = asdict(operation)
     payload["operation_kind"] = "first-publication"
-    return json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    return (
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=lambda value: (
+                value.value if isinstance(value, Enum) else TypeError()
+            ),
+        )
+        + "\n"
+    )
 
 
 def parse_first_publication(data: str) -> FirstPublication:
@@ -2919,6 +2937,7 @@ def parse_first_publication(data: str) -> FirstPublication:
                     "draft",
                     "title",
                     "body",
+                    "state",
                 },
                 context,
             )
@@ -2938,6 +2957,7 @@ def parse_first_publication(data: str) -> FirstPublication:
                     draft,
                     text(member["title"], f"{context}.title"),
                     body,
+                    PullRequestState(text(member["state"], f"{context}.state")),
                 )
             )
 
@@ -4341,32 +4361,57 @@ def prepare_multi_first_publication(
         return _block("push-url-changed", remote, "publication remote changed")
 
     existing_prs: tuple[GitHubPullRequest, ...] = ()
+    existing_open_prs: tuple[GitHubPullRequest, ...] = ()
     if existing_stack is not None:
         existing_prs = existing_stack.ordered_prs
+        seen_open = False
+        valid_states = True
+        for pr in existing_prs:
+            if pr.state is PullRequestState.OPEN:
+                seen_open = True
+            elif pr.state is not PullRequestState.MERGED or seen_open:
+                valid_states = False
+        existing_open_prs = tuple(
+            pr for pr in existing_prs if pr.state is PullRequestState.OPEN
+        )
         if (
             existing_stack.identity.repository != repository.identity
             or existing_stack.base_branch != base_branch
             or not existing_prs
-            or any(pr.state is not PullRequestState.OPEN for pr in existing_prs)
+            or not valid_states
             or any(pr.auto_merge_enabled or pr.in_merge_queue for pr in existing_prs)
         ):
             return _block(
                 "append-unsupported",
                 "stack",
-                "append requires one completely open repository-local stack",
+                "append requires one repository-local stack with a merged prefix and open suffix",
             )
         tracked = tuple(
             stack
             for stack in tool_state.state.stacks
             if stack.repository == repository.identity
             and stack.base_branch == base_branch
-            and stack.ordered_prs == tuple(pr.identity for pr in existing_prs)
+            and stack.ordered_prs
+            in {
+                tuple(pr.identity for pr in existing_prs),
+                tuple(pr.identity for pr in existing_open_prs),
+            }
         )
-        if len(tracked) != 1:
+        all_merged_without_active_record = not existing_open_prs and not tracked
+        existing_ids = {pr.identity for pr in existing_prs}
+        overlaps_other = any(
+            stack.repository == repository.identity
+            and existing_ids.intersection((*stack.ordered_prs, *stack.detached_prs))
+            for stack in tool_state.state.stacks
+            if stack not in tracked
+        )
+        if (
+            len(tracked) != 1 and not all_merged_without_active_record
+        ) or overlaps_other:
             return _block(
                 "untracked-membership",
                 "stack",
-                "append requires exact tracked membership",
+                "append requires one compatible tracked membership or a completed historical stack",
             )
 
     nonces = (
@@ -4382,21 +4427,23 @@ def prepare_multi_first_publication(
         dict.fromkeys(
             (
                 f"refs/heads/{base_branch}",
-                *(f"refs/heads/{pr.head_branch}" for pr in existing_prs),
+                *(f"refs/heads/{pr.head_branch}" for pr in existing_open_prs),
                 *(f"refs/heads/{name}" for name in names),
             )
         )
     )
     live = observe_live_refs(push_url, repository.identity, ref_names, cwd=workspace)
     by_name = {item.ref.full_name: item.commit_id for item in live}
-    previous_branch = existing_prs[-1].head_branch if existing_prs else base_branch
-    if existing_prs:
+    previous_branch = (
+        existing_open_prs[-1].head_branch if existing_open_prs else base_branch
+    )
+    if existing_open_prs:
         if any(
             by_name.get(f"refs/heads/{pr.head_branch}") != pr.reported_head_commit_id
-            for pr in existing_prs
+            for pr in existing_open_prs
         ):
             return _block("stack-moved", "stack", "an existing append head moved")
-        previous_commit = existing_prs[-1].reported_head_commit_id
+        previous_commit = existing_open_prs[-1].reported_head_commit_id
     else:
         previous_commit = by_name.get(f"refs/heads/{base_branch}")
     if previous_commit is None:
@@ -4482,6 +4529,7 @@ def prepare_multi_first_publication(
                 pr.draft,
                 pr.title,
                 pr.body,
+                pr.state,
             )
             for pr in existing_prs
         ),
@@ -6034,6 +6082,21 @@ def _slot_pr_matches(slot: NewPRSlot, pr: GitHubPullRequest, *, initial: bool) -
     )
 
 
+def _linked_slots(operation: FirstPublication) -> tuple[NewPRSlot, ...]:
+    """Project frozen creation slots onto native stack-link base semantics."""
+    previous = (
+        operation.existing_members[-1].head_branch
+        if operation.target is FirstPublicationTarget.APPEND
+        and operation.existing_members
+        else operation.base_branch
+    )
+    result: list[NewPRSlot] = []
+    for slot in operation.slots:
+        result.append(replace(slot, base_branch=previous))
+        previous = slot.branch
+    return tuple(result)
+
+
 @dataclass(frozen=True)
 class PublicationSlotReadback:
     slot_id: str
@@ -6396,7 +6459,7 @@ def observe_first_publication_stack(
     }
     expected_slots = {
         slot.pr_identity: slot
-        for slot in operation.slots
+        for slot in _linked_slots(operation)
         if slot.pr_identity is not None
     }
     for pr in stack.ordered_prs:
@@ -7338,12 +7401,14 @@ def _verify_first_publication_external(
                 or readback.remote_tracking is not TrackingState.TRACKED
             ):
                 return f"publication readiness changed for {slot.branch}"
-        for slot in operation.slots:
+        for slot, linked_slot in zip(
+            operation.slots, _linked_slots(operation), strict=True
+        ):
             assert slot.pr_identity is not None
             prs = find_slot_pull_requests(workspace, operation, slot, marker_only=False)
             matches = tuple(pr for pr in prs if pr.identity == slot.pr_identity)
             if len(matches) != 1 or not _slot_pr_matches(
-                slot, matches[0], initial=False
+                linked_slot, matches[0], initial=False
             ):
                 return f"pull request for slot {slot.slot_id} does not match the goal"
         if operation.target is not FirstPublicationTarget.STANDALONE:
@@ -7367,20 +7432,38 @@ def _build_first_publication_state(
     if any(identity is None for identity in identities):
         raise Error("cannot commit first publication before every slot is bound")
     new_prs = tuple(identity for identity in identities if identity is not None)
-    ordered = operation.existing_prs + new_prs
+    ordered = operation.active_existing_prs + new_prs
     if len(set(ordered)) != len(ordered):
         raise Error("first-publication final membership contains duplicate PRs")
     if operation.target is FirstPublicationTarget.APPEND:
+        source_orders = {
+            operation.existing_prs,
+            operation.active_existing_prs,
+        }
         matches = tuple(
             stack
             for stack in state.stacks
             if stack.repository == operation.repository
             and stack.base_branch == operation.base_branch
-            and stack.ordered_prs == operation.existing_prs
+            and stack.ordered_prs
+            and stack.ordered_prs in source_orders
         )
-        if len(matches) != 1:
+        completed_without_active_record = (
+            not operation.active_existing_prs and not matches
+        )
+        existing_ids = set(operation.existing_prs)
+        overlaps_other = any(
+            stack.repository == operation.repository
+            and existing_ids.intersection((*stack.ordered_prs, *stack.detached_prs))
+            for stack in state.stacks
+            if stack not in matches
+        )
+        if (
+            len(matches) != 1 and not completed_without_active_record
+        ) or overlaps_other:
             raise Error("append source no longer has one exact tracked stack")
-        stacks = tuple(stack for stack in state.stacks if stack != matches[0])
+        detached = matches[0].detached_prs if matches else ()
+        stacks = tuple(stack for stack in state.stacks if stack not in matches)
     else:
         if any(
             stack.repository == operation.repository
@@ -7389,7 +7472,10 @@ def _build_first_publication_state(
         ):
             raise Error("new PR membership overlaps an existing tracked stack")
         stacks = state.stacks
-    final_stack = TrackedStack(operation.repository, operation.base_branch, ordered)
+        detached = ()
+    final_stack = TrackedStack(
+        operation.repository, operation.base_branch, ordered, detached
+    )
     refs = tuple(
         RemoteBranchRef(operation.repository, f"refs/heads/{slot.branch}")
         for slot in operation.slots
@@ -7404,7 +7490,9 @@ def _build_first_publication_state(
     adoptions = tuple(
         item for item in state.last_adopted_heads if (item.pr, item.ref) not in keys
     )
-    return TrackedState(stacks + (final_stack,), publications, adoptions)
+    return TrackedState(
+        stacks + (final_stack,), publications, adoptions, state.boundary_aliases
+    )
 
 
 def _finish_first_publication(
@@ -7457,7 +7545,7 @@ def _finish_first_publication(
             tracking_persisted=True,
         )
     return FirstPublicationVerified(
-        operation.existing_prs
+        operation.active_existing_prs
         + tuple(slot.pr_identity for slot in operation.slots if slot.pr_identity is not None)
     )
 
@@ -8142,7 +8230,7 @@ def _build_topology_final_state(
             item for item in publications if (item.pr, item.ref) != key
         ) + (LastPublishedHead(identity, update.ref, update.new_commit_id),)
         adoptions = tuple(item for item in adoptions if (item.pr, item.ref) != key)
-    return TrackedState(stacks, publications, adoptions)
+    return TrackedState(stacks, publications, adoptions, state.boundary_aliases)
 
 
 def _delete_temporary_base_command(
@@ -10114,13 +10202,11 @@ def plan_explicit_existing(
                 break
             existing_count += 1
         if existing_count == len(open_prs) and len(boundaries) > existing_count:
-            if not isinstance(snapshot.membership, ServerStackMembership) or len(open_prs) != len(
-                snapshot.pull_requests
-            ):
+            if not isinstance(snapshot.membership, ServerStackMembership):
                 return _block(
                     "append-unsupported",
                     "stack",
-                    "append requires unchanged membership in one fully-open stack",
+                    "append requires unchanged open membership in one server stack",
                 )
             repository = observe_github_repository(snapshot.push_url, cwd=workspace)
             commits = tuple(item.commit_id for item in boundaries[existing_count:])
