@@ -184,6 +184,36 @@ def test_observation_is_pinned_and_does_not_snapshot_working_copy(
     assert len(observed.commits) == 2
 
 
+def test_commit_only_observation_uses_the_existing_operation(monkeypatch) -> None:
+    commit_id = "1" * 40
+    calls = []
+
+    def jj(workspace, operation, *arguments):
+        calls.append((workspace, operation, arguments))
+        return json.dumps(
+            {
+                "commit_id": commit_id,
+                "parent_commit_ids": ["0" * 40],
+                "change": "change",
+                "description": "Title",
+                "conflicts": False,
+                "hidden": False,
+            }
+        )
+
+    monkeypatch.setattr(sync, "_jj", jj)
+
+    observed = sync.observe_commits(
+        "/repo", "pinned-operation", "topic", ancestry_order=True
+    )
+
+    assert tuple(item.commit_id for item in observed) == (commit_id,)
+    assert len(calls) == 1
+    assert calls[0][:2] == ("/repo", "pinned-operation")
+    assert calls[0][2][:4] == ("log", "--no-graph", "--reversed", "-r")
+    assert calls[0][2][4] == "topic"
+
+
 def test_observation_and_state_work_with_non_colocated_bare_store(
     tmp_path: Path,
 ) -> None:
@@ -1328,6 +1358,175 @@ def stacked_snapshot(
         tuple(live_refs[1:] + live_refs[:1]),
     )
     return observed, sync.StackSelection("main", tuple(assignments))
+
+
+def test_bounded_commit_revision_includes_comparisons_bookmarks_and_receipts() -> None:
+    observed, _selected = stacked_snapshot(count=2)
+    repository = observed.repository
+    pr = observed.pull_requests[0].identity
+    local_target, remote_target, published, adopted = (
+        character * 40 for character in "3456"
+    )
+    local = dataclasses.replace(
+        observed.local,
+        local_bookmarks=(
+            sync.LocalBookmark("local", sync.CommitTarget(local_target)),
+            sync.LocalBookmark("absent", sync.AbsentBookmarkTarget()),
+        ),
+        remote_bookmarks=(
+            sync.JjRemoteBookmark(
+                "origin",
+                "remote",
+                sync.CommitTarget(remote_target),
+                sync.TrackingState.TRACKED,
+            ),
+        ),
+    )
+    state = sync.TrackedState(
+        (),
+        (
+            sync.LastPublishedHead(
+                pr,
+                sync.RemoteBranchRef(repository, "refs/heads/published"),
+                published,
+            ),
+        ),
+        (
+            sync.LastAdoptedHead(
+                pr,
+                sync.RemoteBranchRef(repository, "refs/heads/adopted"),
+                adopted,
+            ),
+        ),
+    )
+
+    assert sync._bounded_commit_revision(
+        "trunk()..topic", local, state, (("a" * 40, "b" * 40),)
+    ) == " | ".join(
+        (
+            "(trunk()..topic)",
+            f"{'a' * 40}::{'b' * 40}",
+            local_target,
+            remote_target,
+            published,
+            adopted,
+        )
+    )
+
+
+def test_explicit_server_stack_observes_a_bounded_commit_union(monkeypatch) -> None:
+    observed, _selected = stacked_snapshot(count=2)
+    tracked = observed.tool_state.state.stacks[0]
+    observed = dataclasses.replace(
+        observed,
+        tool_state=dataclasses.replace(
+            observed.tool_state,
+            state=dataclasses.replace(
+                observed.tool_state.state,
+                stacks=(tracked, dataclasses.replace(tracked, base_branch="other")),
+            ),
+        ),
+    )
+    local_calls = []
+    commit_revisions = []
+
+    def observe_local(_workspace, **kwargs):
+        local_calls.append(kwargs)
+        return observed.local
+
+    def observe_commits(_workspace, operation, revision, **_kwargs):
+        assert operation == observed.local.operation_id
+        commit_revisions.append(revision)
+        return observed.local.commits
+
+    monkeypatch.setattr(sync, "observe_local", observe_local)
+    monkeypatch.setattr(sync, "observe_snapshot", lambda *_args, **_kwargs: observed)
+    monkeypatch.setattr(sync, "observe_commits", observe_commits)
+    github = github_for_publication(first_publication_operation())
+
+    result = sync.plan_explicit_existing(
+        "/repo", github, sync.ExistingIntent(1, "trunk()..topic")
+    )
+
+    assert isinstance(result, sync.Blocked)
+    assert result.reasons[0].code == "tracked-overlap"
+    assert local_calls == [
+        {
+            "revision": "trunk()..topic",
+            "config_keys": ("git.push",),
+            "ancestry_order": True,
+        }
+    ]
+    expected_terms = ["(trunk()..topic)"]
+    expected_terms.extend(
+        f"{pr.base_oid}::{pr.head_oid}"
+        for pr in observed.pull_requests
+    )
+    expected_terms.extend(
+        item.target.commit_id
+        for item in observed.local.local_bookmarks
+        if isinstance(item.target, sync.CommitTarget)
+    )
+    assert commit_revisions == [" | ".join(expected_terms)]
+    assert "all()" not in commit_revisions[0]
+
+
+def test_first_publication_observes_a_bounded_commit_union(monkeypatch) -> None:
+    observed, _selected = stacked_snapshot(count=2)
+    repository = sync.GitHubRepository(
+        observed.repository,
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    local_calls = []
+    commit_revisions = []
+
+    def observe_local(_workspace, **kwargs):
+        local_calls.append(kwargs)
+        return observed.local
+
+    def observe_commits(_workspace, operation, revision, **_kwargs):
+        assert operation == observed.local.operation_id
+        commit_revisions.append(revision)
+        return observed.local.commits
+
+    blocked = sync._block("stop", "test", "assignment observation reached")
+    monkeypatch.setattr(sync, "observe_local", observe_local)
+    monkeypatch.setattr(sync, "observe_commits", observe_commits)
+    monkeypatch.setattr(sync, "resolve_push_url", lambda *_args: observed.push_url)
+    monkeypatch.setattr(sync, "observe_tool_state", lambda *_args: observed.tool_state)
+    monkeypatch.setattr(
+        sync, "resolve_first_publication_assignments", lambda *_args, **_kwargs: blocked
+    )
+
+    server = FakeGitHubServer()
+    server.seed_repository(repository, aliases=(observed.push_url,))
+    client = FakeGitHubClient(server)
+    result = sync.plan_explicit_new(
+        "/repo", client, sync.NewIntent("trunk()..topic")
+    )
+
+    assert result == blocked
+    assert local_calls == [
+        {
+            "revision": "trunk()..topic",
+            "config_keys": ("git.push",),
+            "ancestry_order": True,
+        }
+    ]
+    expected = " | ".join(
+        (
+            "(trunk()..topic)",
+            *(
+                item.target.commit_id
+                for item in observed.local.local_bookmarks
+                if isinstance(item.target, sync.CommitTarget)
+            ),
+        )
+    )
+    assert commit_revisions == [expected]
+    assert "all()" not in commit_revisions[0]
 
 
 @pytest.mark.parametrize("count", (2, 3))
@@ -2903,7 +3102,7 @@ def first_publication_operation(
         "owner/repo",
         "ssh://git@github.com/owner/repo.git",
         "origin",
-        (("stack.remote", "origin"),),
+        (),
         (("default", "2" * 40),),
         "main",
         None,
@@ -3341,7 +3540,6 @@ def test_native_first_publication_establishes_tracking_without_moving_workspace(
     run("jj", "git", "init", "--colocate" if colocated else "--no-colocate", repo)
     jj(repo, "config", "set", "--repo", "user.name", "Test User")
     jj(repo, "config", "set", "--repo", "user.email", "test@example.com")
-    jj(repo, "config", "set", "--repo", "stack.remote", "origin")
     jj(
         repo,
         "config",
@@ -3364,7 +3562,7 @@ def test_native_first_publication_establishes_tracking_without_moving_workspace(
     local = sync.observe_local(
         repo,
         revision=f"main@origin | {commit_id}",
-        config_keys=("stack.remote",),
+        config_keys=("git.push",),
     )
     repository = sync.GitHubRepository(
         sync.GitHubRepositoryId("github.com", "R_repo"),
@@ -3427,7 +3625,7 @@ def test_native_first_publication_establishes_tracking_without_moving_workspace(
     assert isinstance(stopped, sync.Stopped)
     assert stopped.stage == "create-pr"
     observed = sync.observe_local(
-        repo, revision=commit_id, config_keys=("stack.remote",)
+        repo, revision=commit_id, config_keys=("git.push",)
     )
     assert (
         sync.LocalBookmark(branch, sync.CommitTarget(commit_id))
@@ -4447,6 +4645,7 @@ def test_publication_assignment_blocks_alias_ambiguity_without_fallback() -> Non
     ("assignment", "bookmarks", "code"),
     (
         ("main", (), "protected-publication-branch"),
+        ("jj-stack/temporary-bases/manual/1", (), "protected-publication-branch"),
         ("bad..name", (), "invalid-publication-branch"),
         (
             "generated-one",
@@ -4522,6 +4721,184 @@ def test_publication_assignment_blocks_historical_base_and_same_repo_head_use() 
     fork = historical_pr(head="generated-one", base="main", fork=True)
     observed = publication_assignment_input(explicit=explicit, history=(fork,))
     assert sync.resolve_publication_assignments(observed) == explicit
+
+
+def test_historical_collision_observation_is_one_call_bounded_by_names(
+) -> None:
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    branches = ("new-one", "new-two")
+    server = FakeGitHubServer()
+    server.seed_repository(repository)
+    head = dataclasses.replace(
+        historical_pr(head="new-one", base="main"),
+        identity=sync.PullRequestId(repository.identity, 7),
+    )
+    base = dataclasses.replace(
+        historical_pr(head="old", base="new-two"),
+        identity=sync.PullRequestId(repository.identity, 8),
+    )
+    server.seed_pull_request(head)
+    server.seed_pull_request(base)
+    client = FakeGitHubClient(server)
+
+    observed = sync.observe_historical_pull_request_collisions(
+        client, repository, branches
+    )
+
+    assert tuple(item.number for item in observed) == (7, 8)
+
+
+def test_selected_boundary_bookmark_names_uses_exact_and_change_aliases() -> None:
+    observed = publication_assignment_input().local
+    selected = observed.commits
+    rewritten = dataclasses.replace(
+        selected[1], commit_id="3" * 40, parent_commit_ids=(selected[1].commit_id,)
+    )
+    local = dataclasses.replace(
+        observed,
+        local_bookmarks=(
+            sync.LocalBookmark("exact", sync.CommitTarget(selected[0].commit_id)),
+            sync.LocalBookmark("change-alias", sync.CommitTarget(rewritten.commit_id)),
+            sync.LocalBookmark("unselected", sync.CommitTarget("4" * 40)),
+            sync.LocalBookmark("absent", sync.AbsentBookmarkTarget()),
+        ),
+        commits=(*selected, rewritten),
+    )
+
+    assert sync.selected_boundary_bookmark_names(local, selected) == (
+        "exact",
+        "change-alias",
+    )
+
+
+def test_standalone_membership_resolution_orders_source_chain_and_new_boundary() -> None:
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    first_id, new_id, last_id, rewritten_id = (character * 40 for character in "1234")
+    commits = (
+        sync.ObservedCommit(first_id, (), "change-1", "One", False, False),
+        sync.ObservedCommit(new_id, (first_id,), "change-new", "New", False, False),
+        sync.ObservedCommit(last_id, (new_id,), "change-2", "Two", False, False),
+    )
+    rewritten = dataclasses.replace(
+        commits[-1], commit_id=rewritten_id, parent_commit_ids=(last_id,)
+    )
+    local = dataclasses.replace(
+        publication_assignment_input().local,
+        local_bookmarks=(
+            sync.LocalBookmark("topic-1", sync.CommitTarget(first_id)),
+            sync.LocalBookmark("topic-2", sync.CommitTarget(rewritten_id)),
+        ),
+        commits=(*commits, rewritten),
+    )
+    first_pr = sync.GitHubPullRequest(
+        sync.PullRequestId(repository, 1), "PR_1", sync.PullRequestState.OPEN,
+        False, repository, "topic-1", first_id, "dev", "0" * 40,
+        False, False, "One", "", None,
+    )
+    last_pr = sync.GitHubPullRequest(
+        sync.PullRequestId(repository, 2), "PR_2", sync.PullRequestState.OPEN,
+        False, repository, "topic-2", rewritten_id, "topic-1", first_id,
+        False, False, "Two", "", None,
+    )
+    first = first_pr
+    last = last_pr
+
+    result = sync.resolve_standalone_membership_boundaries(
+        local, repository, first_pr.identity, (last, first), commits
+    )
+
+    assert result == (
+        (
+            sync.ExistingMembershipBoundary(first_pr.identity, first_id),
+            sync.NewMembershipBoundary(new_id),
+            sync.ExistingMembershipBoundary(last_pr.identity, last_id),
+        ),
+        (first, last),
+        "dev",
+    )
+
+
+def test_open_pr_candidate_observation_is_one_call_bounded_by_selected_aliases(
+) -> None:
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    branches = ("topic-4", "topic-1", "topic-2", "topic-3")
+    server = FakeGitHubServer()
+    server.seed_repository(repository)
+    for index, branch in enumerate(branches, start=1):
+        server.seed_pull_request(
+            sync.GitHubPullRequest(
+                sync.PullRequestId(repository.identity, index),
+                f"PR_{index}", sync.PullRequestState.OPEN, False,
+                repository.identity, branch, str(index) * 40, "main", "0" * 40,
+                False, False, branch, "", None,
+            )
+        )
+
+    client = FakeGitHubClient(server)
+    observed = sync.observe_open_pull_request_candidates(client, repository, branches)
+
+    assert tuple(item.head_branch for item in observed) == branches
+
+
+def test_assignment_observer_mixes_exact_bookmark_and_template(monkeypatch) -> None:
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    commits = ("1" * 40, "2" * 40)
+    local = dataclasses.replace(
+        publication_assignment_input().local,
+        local_bookmarks=(
+            sync.LocalBookmark("intentional", sync.CommitTarget(commits[0])),
+        ),
+    )
+
+    def jj(_workspace, _operation, *arguments):
+        if arguments[:3] == ("config", "get", "templates.git_push_bookmark"):
+            return '"generated-" ++ change_id.short()\n'
+        commit = arguments[arguments.index("-r") + 1]
+        return "generated-one\n" if commit == commits[0] else "generated-two\n"
+
+    def refs(_push_url, identity, names, *, cwd):
+        assert names == ("refs/heads/intentional", "refs/heads/generated-two")
+        return tuple(
+            sync.LiveRemoteRef(sync.RemoteBranchRef(identity, name), None)
+            for name in names
+        )
+
+    monkeypatch.setattr(sync, "_jj", jj)
+    monkeypatch.setattr(sync, "observe_live_refs", refs)
+    monkeypatch.setattr(
+        sync, "observe_historical_pull_request_collisions", lambda *_args, **_kwargs: ()
+    )
+    server = FakeGitHubServer()
+    server.seed_repository(repository)
+    client = FakeGitHubClient(server)
+
+    assert sync.resolve_first_publication_assignments(
+        "/repo",
+        client,
+        local,
+        repository,
+        "git@example/repo",
+        commits,
+        ("main",),
+    ) == (
+        sync.PublicationAssignment(commits[0], "intentional"),
+        sync.PublicationAssignment(commits[1], "generated-two"),
+    )
 
 
 def test_observations_are_deeply_immutable() -> None:
