@@ -1131,6 +1131,7 @@ class ExistingIntent:
     pr_number: int | None
     revision: str | None = None
     replace_pr_numbers: tuple[int, ...] = ()
+    force_local_wins: bool = False
 
 
 @dataclass(frozen=True)
@@ -6054,6 +6055,8 @@ def plan_preserved_prefix_repair(
     desired: DesiredStack,
     repository: GitHubRepository,
     remote: str,
+    *,
+    allow_local_wins: bool = False,
 ) -> PreservedPrefixRepair | Blocked | None:
     """Plan only the stale owned boundary case; return None for ordinary sync."""
     if not isinstance(snapshot.membership, ServerStackMembership):
@@ -6111,7 +6114,13 @@ def plan_preserved_prefix_repair(
         if len(values) != 1 or values[0].commit_id != pr.head_oid:
             return _block("head-disagrees", ref.full_name, "open head observation is not exact")
         heads.append(values[0])
-        planned = _plan_head_update(snapshot.local.commits, snapshot.tool_state.state, wanted, values[0])
+        planned = _plan_head_update(
+            snapshot.local.commits,
+            snapshot.tool_state.state,
+            wanted,
+            values[0],
+            allow_local_wins=allow_local_wins,
+        )
         if isinstance(planned, Blocked): return planned
         updates.extend(planned)
         predecessor = wanted.desired_commit_id
@@ -10437,6 +10446,7 @@ def prepare_membership_repair(
     *,
     standalone_sources: Sequence[GitHubPullRequest] | None = None,
     standalone_base_branch: str | None = None,
+    force_local_wins: bool = False,
 ) -> MembershipRepair | Blocked:
     """Observe and freeze a mixed complete-membership transaction; never mutate."""
     boundaries = tuple(boundaries)
@@ -10607,7 +10617,11 @@ def prepare_membership_repair(
             wanted = DesiredExistingPR(pr.identity, boundary.commit_id, *metadata)
             head = refs[RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.head_branch}")]
             planned = _plan_head_update(
-                snapshot.local.commits, snapshot.tool_state.state, wanted, head
+                snapshot.local.commits,
+                snapshot.tool_state.state,
+                wanted,
+                head,
+                allow_local_wins=force_local_wins,
             )
             if isinstance(planned, Blocked): return planned
             updates.extend(planned); metadata_updates.extend(_metadata_updates(pr, wanted))
@@ -11030,6 +11044,17 @@ def plan_explicit_existing(
                 classified,
                 standalone_sources=standalone_sources,
                 standalone_base_branch=standalone_base_branch,
+                force_local_wins=intent.force_local_wins,
+            )
+        if intent.force_local_wins and (
+            not has_merged_prefix
+            or has_new
+            or classified_existing != source_ids
+        ):
+            return _block(
+                "local-wins-not-applicable",
+                "stack",
+                "force local-wins requires an exact existing open suffix or a multi-PR standalone repair",
             )
         simple_append = (
             isinstance(snapshot.membership, ServerStackMembership)
@@ -11113,9 +11138,21 @@ def plan_explicit_existing(
         return desired
     if any(pr.state is PullRequestState.MERGED for pr in snapshot.pull_requests):
         repository = github.resolve_repository(snapshot.push_url)
-        preserved = plan_preserved_prefix_repair(snapshot, desired, repository, remote)
+        preserved = plan_preserved_prefix_repair(
+            snapshot,
+            desired,
+            repository,
+            remote,
+            allow_local_wins=intent.force_local_wins,
+        )
         if preserved is not None:
             return preserved
+    if intent.force_local_wins:
+        return _block(
+            "local-wins-not-applicable",
+            "stack",
+            "force local-wins requires a preserved-prefix or multi-PR standalone repair",
+        )
     source_open = tuple(pr.identity for pr in open_prs)
     selected = tuple(item.pr_identity for item in desired.active)
     if selected == source_open:
@@ -11263,7 +11300,11 @@ def render_explicit(value: ExplicitPlan | ExplicitResult) -> str:
             for item in value.replacements
             if source[item.old_pr_identity].state is PullRequestState.CLOSED
         }
-        lines = [f"membership repair at {value.phase.value}:", "  ordered goal:"]
+        lines = [
+            f"membership repair at {value.phase.value}:",
+            f"  ultimate base: {value.base_branch}",
+            "  ordered goal:",
+        ]
         for item in value.desired:
             if isinstance(item, ExistingMembershipEntry):
                 lines.append(f"    - existing #{source[item.pr_identity].number}")
@@ -11312,23 +11353,46 @@ def render_explicit(value: ExplicitPlan | ExplicitResult) -> str:
                     f"#{source[item].number}" for item in closed_replacements
                 )
             )
+        local_wins_replacements = tuple(
+            update
+            for update in value.head_updates
+            if isinstance(update.authority, ExplicitLocalWins)
+        )
+        if local_wins_replacements:
+            lines.append("  one-shot forced local-wins replacements:")
+            lines.extend(
+                f"    - {item.ref.full_name}: {item.expected_old_commit_id} -> {item.new_commit_id}"
+                for item in local_wins_replacements
+            )
         if value.replacements:
             lines.extend(
                 (
                     "  source stack: dissolve and create a new stack",
                     "  cleanup: keep old local bookmarks, remote branches, and remote bookmarks",
-                    "  bootstrap replacements: none",
+                    "  forced local-wins replacements: none",
                 )
             )
         return "\n".join(lines)
     if isinstance(value, PreservedPrefixRepair):
         plan = value.plan
-        return (
+        lines = [
             f"preserved-prefix repair at {value.phase.value}:\n"
             f"  - retain {len(plan.merged_prefix)} merged PR(s) in stack #{plan.stack.identity.number}\n"
             f"  - atomically advance {plan.boundary.ref.full_name} to {plan.integration.commit_id}\n"
             f"  - relink {len(plan.carrier.desired.active)} open PR(s) to the same stack"
+        ]
+        local_wins_replacements = tuple(
+            update
+            for update in plan.carrier.head_updates
+            if isinstance(update.authority, ExplicitLocalWins)
         )
+        if local_wins_replacements:
+            lines.append("  - one-shot forced local-wins replacements:")
+            lines.extend(
+                f"    - {item.ref.full_name}: {item.expected_old_commit_id} -> {item.new_commit_id}"
+                for item in local_wins_replacements
+            )
+        return "\n".join(lines)
     if isinstance(value, PersistedOperation):
         if isinstance(value.operation, TopologyRepair):
             return (
