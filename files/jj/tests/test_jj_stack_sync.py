@@ -1667,6 +1667,121 @@ def test_topology_operation_round_trip_is_strict_and_exact() -> None:
         sync.parse_operation(json.dumps(payload))
 
 
+def membership_operation() -> sync.MembershipRepair:
+    plan = sync.plan_topology(topology_input((2, 1)))
+    assert isinstance(plan, sync.TopologyPlan)
+    assert isinstance(plan.source, sync.ServerStackMembership)
+    source = plan.source
+    slot = sync.NewPRSlot(
+        "slot-new", "new-branch", "9" * 40, sync.BookmarkSetup.CREATE,
+        "topic-1", "New", "body",
+    )
+    return sync.MembershipRepair(
+        plan.repository,
+        plan.repository_name,
+        plan.dependencies.push_url,
+        plan.remote,
+        plan.dependencies.effective_config,
+        (("default", "change-id"),),
+        "main",
+        plan.dependencies.state_blob_oid,
+        source,
+        tuple(pr for pr in plan.dependencies.prs if pr.state is sync.PullRequestState.OPEN),
+        sync.TrackedStack(plan.repository, "main", source.ordered_prs, ()),
+        (sync.ExistingMembershipEntry(source.ordered_prs[0]), sync.NewMembershipEntry(slot.slot_id)),
+        (slot,),
+        plan.head_updates,
+        plan.temporary_bases,
+    )
+
+
+def test_membership_repair_round_trip_is_exact_and_strict() -> None:
+    operation = membership_operation()
+    encoded = sync.membership_repair_to_json(operation)
+    assert sync.parse_membership_repair(encoded) == operation
+    assert sync.parse_operation(encoded) == operation
+    malformed = json.loads(encoded)
+    malformed["slots"][0]["unknown"] = True
+    with pytest.raises(sync.Error, match="unexpected fields"):
+        sync.parse_membership_repair(json.dumps(malformed))
+
+
+@pytest.mark.parametrize("duplicate", ("identity", "slot"))
+def test_membership_repair_rejects_duplicate_desired_entries(duplicate: str) -> None:
+    operation = membership_operation()
+    entry = operation.desired[0 if duplicate == "identity" else 1]
+    with pytest.raises(ValueError, match="desired membership"):
+        sync.membership_repair_to_json(dataclasses.replace(operation, desired=operation.desired + (entry,)))
+
+
+def test_membership_repair_rejects_source_goal_mismatch() -> None:
+    operation = membership_operation()
+    foreign = sync.PullRequestId(operation.repository, "PR_not_in_source")
+    with pytest.raises(ValueError, match="desired membership"):
+        sync.membership_repair_to_json(dataclasses.replace(operation, desired=(sync.ExistingMembershipEntry(foreign), *operation.desired[1:])))
+
+
+def test_membership_repair_committing_requires_frozen_final_state() -> None:
+    initial = membership_operation()
+    verified_slot = dataclasses.replace(
+        initial.slots[0],
+        phase=sync.NewPRPhase.VERIFIED,
+        pr_identity=initial.source_tracked.ordered_prs[1],
+        pr_number=2,
+    )
+    operation = dataclasses.replace(
+        initial,
+        slots=(verified_slot,),
+        phase=sync.MembershipRepairPhase.COMMITTING,
+    )
+    with pytest.raises(ValueError, match="freeze final state"):
+        sync.membership_repair_to_json(operation)
+    final_json = sync.state_to_json(sync.EMPTY_STATE)
+    committed = dataclasses.replace(operation, final_state_json=final_json, final_state_oid="f" * 40)
+    assert sync.parse_membership_repair(sync.membership_repair_to_json(committed)) == committed
+
+
+def test_membership_repair_reobserves_source_after_unstack(monkeypatch) -> None:
+    initial = membership_operation()
+    slot = dataclasses.replace(
+        initial.slots[0],
+        phase=sync.NewPRPhase.VERIFIED,
+        pr_identity=sync.PullRequestId(initial.repository, "PR_new"),
+        pr_number=9,
+    )
+    operation = dataclasses.replace(
+        initial,
+        slots=(slot,),
+        phase=sync.MembershipRepairPhase.UNSTACKING_SOURCE,
+    )
+    repository = sync.GitHubRepository(
+        operation.repository, operation.repository_name, "https://github.com/owner/repo", "main"
+    )
+    frozen = tuple(sync.GitHubPullRequestSource(pr, operation.source_membership.server_stack_id, "main")
+                   for pr in operation.source_prs)
+    standalone = tuple(sync.GitHubPullRequestSource(pr, None, None) for pr in operation.source_prs)
+    observations = iter(((frozen, sync.GitHubStackSource(operation.source_membership.stack, "main", operation.source_prs)),
+                         (standalone, None)))
+    calls: list[str] = []
+
+    monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
+    monkeypatch.setattr(sync, "read_operation", lambda _workspace: ("operation-oid", operation))
+    monkeypatch.setattr(sync, "_frozen_repository", lambda *_args, **_kwargs: repository)
+    monkeypatch.setattr(sync, "read_ref_oid", lambda *_args: operation.expected_state_oid)
+    monkeypatch.setattr(sync, "_membership_source_refs_error", lambda *_args: None)
+    monkeypatch.setattr(sync, "_observe_source_association", lambda *_args, **_kwargs: next(observations))
+    monkeypatch.setattr(sync, "run_stack_unstack", lambda *_args: calls.append("unstack"))
+    monkeypatch.setattr(sync, "prove_stack_dissolved", lambda *_args, **_kwargs: sync.StackDissolution.ABSENT)
+    monkeypatch.setattr(sync, "cas_write_membership_repair", lambda *_args: "operation-oid")
+    monkeypatch.setattr(sync, "_membership_projection", lambda *_args: (_ for _ in ()).throw(sync.Error("stop after unstack")))
+
+    result = sync.resume_membership_repair("/repo")
+
+    assert calls == ["unstack"]
+    assert isinstance(result, sync.Stopped)
+    assert result.stage == sync.MembershipRepairPhase.TRANSITIONING_BASES
+
+
 @pytest.mark.parametrize("initial", ("absent", "exact"))
 def test_topology_creation_reconciles_complete_readback(
     monkeypatch, initial: str
@@ -1808,7 +1923,7 @@ def test_detached_association_list_and_forget_are_local_only(monkeypatch) -> Non
         lambda _workspace, expected, value: written.append((expected, value)) or "new",
     )
     monkeypatch.setattr(
-        sync, "_command_json", lambda *_args, **_kwargs: pytest.fail("remote call")
+        sync, "_github_graphql", lambda *_args, **_kwargs: pytest.fail("remote call")
     )
 
     assert sync.list_detached_associations("/work") == (selected,)
@@ -4242,9 +4357,8 @@ def test_historical_collision_observation_is_one_call_bounded_by_names(
     branches = ("new-one", "new-two")
     requests = []
 
-    def response(_args, *, cwd, stdin):
-        request = json.loads(stdin)
-        requests.append(request)
+    def response(host, query, variables, *, cwd):
+        requests.append((host, query, variables))
         return {
             "data": {
                 "repository": {
@@ -4271,12 +4385,13 @@ def test_historical_collision_observation_is_one_call_bounded_by_names(
             }
         }
 
-    monkeypatch.setattr(sync, "_command_json", response)
+    monkeypatch.setattr(sync, "_github_graphql", response)
 
     observed = sync.observe_historical_pull_request_collisions(repository, branches)
 
     assert len(requests) == 1
-    assert requests[0]["variables"] == {
+    assert requests[0][0] == "github.com"
+    assert requests[0][2] == {
         "owner": "owner",
         "name": "repo",
         "branch0": "new-one",
@@ -4367,9 +4482,8 @@ def test_open_pr_candidate_observation_is_one_call_bounded_by_selected_aliases(
     branches = ("topic-4", "topic-1", "topic-2", "topic-3")
     requests = []
 
-    def response(_args, *, cwd, stdin):
-        request = json.loads(stdin)
-        requests.append(request)
+    def response(host, query, variables, *, cwd):
+        requests.append((host, query, variables))
         return {
             "data": {
                 "repository": {
@@ -4391,12 +4505,13 @@ def test_open_pr_candidate_observation_is_one_call_bounded_by_selected_aliases(
             }
         }
 
-    monkeypatch.setattr(sync, "_command_json", response)
+    monkeypatch.setattr(sync, "_github_graphql", response)
 
     observed = sync.observe_open_pull_request_candidates(repository, branches)
 
     assert len(requests) == 1
-    assert requests[0]["variables"] == {
+    assert requests[0][0] == "github.com"
+    assert requests[0][2] == {
         "owner": "owner",
         "name": "repo",
         **{f"head{index}": branch for index, branch in enumerate(branches)},
