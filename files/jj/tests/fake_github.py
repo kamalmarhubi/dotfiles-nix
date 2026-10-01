@@ -273,8 +273,26 @@ class FakeGitHubServer:
             raise ValueError("stack identity belongs to another repository")
         if identity not in self._stacks:
             raise sync.IncompleteSource("pull request stack is unavailable")
-        del self._stacks[identity]
-        return None
+        stack = self._stacks[identity]
+        merged_prefix = tuple(
+            pull_request
+            for pull_request in stack.pull_requests
+            if self._pull_requests[pull_request].state is sync.PullRequestState.MERGED
+        )
+        if merged_prefix:
+            self._stacks[identity] = dataclasses.replace(
+                stack, pull_requests=merged_prefix
+            )
+        else:
+            del self._stacks[identity]
+        retained = self._stacks.get(identity)
+        return (
+            None
+            if retained is None
+            else sync.GitHubStackSummary(
+                retained.identity, retained.node_id, retained.base_branch
+            )
+        )
 
     def _validate_stack_members(
         self,

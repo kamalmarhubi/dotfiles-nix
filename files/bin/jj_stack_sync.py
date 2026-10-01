@@ -457,6 +457,22 @@ class LastAdoptedHead:
 
 
 @dataclass(frozen=True)
+class BoundaryAliasOwnership:
+    """Narrow authority for a merged/open boundary alias owned by this tool.
+
+    This is deliberately not a PR-head publication receipt.  ``created``
+    distinguishes aliases created by this operation from aliases explicitly
+    adopted after an absence/equality proof; an equal live ref alone never
+    manufactures ownership.
+    """
+
+    stack: GitHubStackId
+    ref: RemoteBranchRef
+    created: bool
+    last_owned_commit_id: str
+
+
+@dataclass(frozen=True)
 class TrackedStack:
     repository: GitHubRepositoryId
     base_branch: str
@@ -480,6 +496,7 @@ class TrackedState:
     stacks: tuple[TrackedStack, ...]
     last_published_heads: tuple[LastPublishedHead, ...]
     last_adopted_heads: tuple[LastAdoptedHead, ...] = ()
+    boundary_aliases: tuple[BoundaryAliasOwnership, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1003,6 +1020,44 @@ class MembershipRepairVerified:
     ordered_prs: tuple[PullRequestId, ...]
 
 
+class PreservedPrefixRepairPhase(StrEnum):
+    PUBLISHING = "publishing"
+    UNSTACKING = "unstacking"
+    RELINKING = "relinking"
+    VERIFYING = "verifying"
+    COMMITTING = "committing"
+
+
+@dataclass(frozen=True)
+class PreservedPrefixPlan:
+    """Frozen stale-boundary recovery for an immutable merged prefix."""
+
+    carrier: TopologyPlan
+    workspace_targets: tuple[tuple[str, str], ...]
+    stack: GitHubStackSummary
+    merged_prefix: tuple[GitHubPullRequest, ...]
+    integration: LiveRemoteRef
+    boundary: LiveRemoteRef
+    ownership: BoundaryAliasOwnership
+    metadata_updates: tuple[PRMetadataUpdate, ...] = ()
+
+
+@dataclass(frozen=True)
+class PreservedPrefixRepair:
+    plan: PreservedPrefixPlan
+    phase: PreservedPrefixRepairPhase = PreservedPrefixRepairPhase.PUBLISHING
+    publication_possibly_sent: bool = False
+    unstack_possibly_sent: bool = False
+    relink_possibly_sent: bool = False
+    final_state_json: str | None = None
+    final_state_oid: str | None = None
+
+
+@dataclass(frozen=True)
+class PreservedPrefixRepairVerified:
+    ordered_prs: tuple[PullRequestId, ...]
+
+
 class StackDissolution(StrEnum):
     ABSENT = "absent"
     PRESENT = "present"
@@ -1059,7 +1114,8 @@ AdoptionResult = AdoptionVerified | Stopped
 FirstPublicationResult = FirstPublicationVerified | Stopped
 TopologyRepairResult = TopologyRepairVerified | Stopped
 MembershipRepairResult = MembershipRepairVerified | Stopped
-Operation = FirstPublication | TopologyRepair | MembershipRepair
+PreservedPrefixRepairResult = PreservedPrefixRepairVerified | Stopped
+Operation = FirstPublication | TopologyRepair | MembershipRepair | PreservedPrefixRepair
 
 
 @dataclass(frozen=True)
@@ -1122,6 +1178,7 @@ ExplicitPlan = (
     | FirstPublication
     | TopologyPlan
     | MembershipRepair
+    | PreservedPrefixRepair
     | PersistedOperation
 )
 ExplicitResult = (
@@ -1130,6 +1187,7 @@ ExplicitResult = (
     | FirstPublicationResult
     | TopologyRepairResult
     | MembershipRepairResult
+    | PreservedPrefixRepairResult
     | Blocked
 )
 
@@ -2658,10 +2716,44 @@ def parse_state(data: str) -> TrackedState:
             text(raw.get("verified_commit_id"), f"{context}.verified_commit_id"),
         )
 
+    def boundary_alias(value: object, index: int) -> BoundaryAliasOwnership:
+        context = f"boundary_aliases[{index}]"
+        raw = fields(
+            record(value, context),
+            {"stack", "ref", "created", "last_owned_commit_id"},
+            context,
+        )
+        stack_raw = fields(
+            record(raw.get("stack"), f"{context}.stack"),
+            {"repository", "number"},
+            f"{context}.stack",
+        )
+        number = stack_raw.get("number")
+        created = raw.get("created")
+        if type(number) is not int or type(created) is not bool:
+            raise ValueError(f"{context} scalar fields are malformed")
+        ref_raw = fields(
+            record(raw.get("ref"), f"{context}.ref"),
+            {"repository", "full_name"},
+            f"{context}.ref",
+        )
+        return BoundaryAliasOwnership(
+            GitHubStackId(
+                repository(stack_raw.get("repository"), f"{context}.stack.repository"),
+                number,
+            ),
+            RemoteBranchRef(
+                repository(ref_raw.get("repository"), f"{context}.ref.repository"),
+                text(ref_raw.get("full_name"), f"{context}.ref.full_name"),
+            ),
+            created,
+            text(raw.get("last_owned_commit_id"), f"{context}.last_owned_commit_id"),
+        )
+
     try:
         raw = fields(
             record(json.loads(data), "root"),
-            {"stacks", "last_published_heads", "last_adopted_heads"},
+            {"stacks", "last_published_heads", "last_adopted_heads", "boundary_aliases"},
             "root",
         )
         stacks = tuple(
@@ -2680,7 +2772,13 @@ def parse_state(data: str) -> TrackedState:
                 array(raw.get("last_adopted_heads"), "last_adopted_heads")
             )
         )
-        state = TrackedState(stacks, publications, adoptions)
+        aliases = tuple(
+            boundary_alias(value, index)
+            for index, value in enumerate(
+                array(raw.get("boundary_aliases"), "boundary_aliases")
+            )
+        )
+        state = TrackedState(stacks, publications, adoptions, aliases)
         _validate_state(state)
         return state
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -2730,6 +2828,28 @@ def _validate_state(state: TrackedState) -> None:
         if key in authority_keys:
             raise ValueError("ambiguous head authority")
         authority_keys.add(key)
+    alias_keys: set[tuple[GitHubRepositoryId, str]] = set()
+    stack_keys = {
+        ownership.stack
+        for ownership in state.boundary_aliases
+    }
+    if len(stack_keys) != len(state.boundary_aliases):
+        raise ValueError("ambiguous boundary alias ownership for stack")
+    for ownership in state.boundary_aliases:
+        require_text(
+            ownership.stack.repository.host,
+            ownership.stack.repository.node_id,
+            ownership.ref.repository.host,
+            ownership.ref.repository.node_id,
+            ownership.ref.full_name,
+            ownership.last_owned_commit_id,
+        )
+        if ownership.stack.repository != ownership.ref.repository:
+            raise ValueError("boundary alias belongs to another repository")
+        key = (ownership.ref.repository, ownership.ref.full_name)
+        if key in alias_keys:
+            raise ValueError("boundary alias has multiple owners")
+        alias_keys.add(key)
 
 
 def read_state(workspace: str | Path) -> tuple[str | None, TrackedState]:
@@ -3131,6 +3251,7 @@ def parse_first_publication(data: str) -> FirstPublication:
                     "draft",
                     "title",
                     "body",
+                    "state",
                 },
                 context,
             )
@@ -3148,6 +3269,7 @@ def parse_first_publication(data: str) -> FirstPublication:
                     draft,
                     text(member["title"], f"{context}.title"),
                     body,
+                    PullRequestState(text(member["state"], f"{context}.state")),
                 )
             )
 
@@ -3255,6 +3377,130 @@ def topology_repair_to_json(operation: TopologyRepair) -> str:
         )
         + "\n"
     )
+
+
+def preserved_prefix_repair_to_json(operation: PreservedPrefixRepair) -> str:
+    """Strict durable codec; the carrier reuses only topology's value codec."""
+    _validate_preserved_prefix_repair(operation)
+    carrier = json.loads(topology_repair_to_json(TopologyRepair(operation.plan.carrier)))
+    payload = {
+        "operation_kind": "preserved-prefix-repair",
+        "carrier": carrier,
+        "workspace_targets": operation.plan.workspace_targets,
+        "stack": asdict(operation.plan.stack),
+        "merged_prefix": [item.number for item in operation.plan.merged_prefix],
+        "integration": asdict(operation.plan.integration),
+        "boundary": asdict(operation.plan.boundary),
+        "ownership": asdict(operation.plan.ownership),
+        "metadata_updates": [asdict(item) for item in operation.plan.metadata_updates],
+        "phase": operation.phase.value,
+        "publication_possibly_sent": operation.publication_possibly_sent,
+        "unstack_possibly_sent": operation.unstack_possibly_sent,
+        "relink_possibly_sent": operation.relink_possibly_sent,
+        "final_state_json": operation.final_state_json,
+        "final_state_oid": operation.final_state_oid,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def _validate_preserved_prefix_repair(operation: PreservedPrefixRepair) -> None:
+    plan = operation.plan
+    source = plan.carrier.source
+    if not isinstance(source, ServerStackMembership) or source.stack != plan.stack:
+        raise ValueError("preserved-prefix repair requires its exact server stack")
+    if not plan.workspace_targets or len({name for name, _target in plan.workspace_targets}) != len(plan.workspace_targets):
+        raise ValueError("preserved-prefix repair requires complete workspace targets")
+    if not plan.merged_prefix or not plan.carrier.desired.active:
+        raise ValueError("preserved-prefix repair requires merged and open members")
+    if tuple(plan.carrier.dependencies.prs[: len(plan.merged_prefix)]) != plan.merged_prefix:
+        raise ValueError("merged prefix is not the frozen membership prefix")
+    if any(item.state is not PullRequestState.MERGED for item in plan.merged_prefix):
+        raise ValueError("preserved prefix contains a non-merged PR")
+    if plan.integration.commit_id is None or plan.integration.ref.full_name != f"refs/heads/{plan.carrier.desired.base_branch}":
+        raise ValueError("integration observation is incomplete")
+    if plan.boundary.ref != plan.ownership.ref or plan.ownership.stack != plan.stack.identity:
+        raise ValueError("boundary ownership does not match the frozen alias")
+    active = {item.pr_identity for item in plan.carrier.desired.active}
+    metadata_ids = tuple(item.pr_identity for item in plan.metadata_updates)
+    if len(set(metadata_ids)) != len(metadata_ids) or any(
+        identity not in active for identity in metadata_ids
+    ):
+        raise ValueError("preserved-prefix metadata updates are not desired open PRs")
+    committing = operation.phase is PreservedPrefixRepairPhase.COMMITTING
+    if committing != (operation.final_state_json is not None and operation.final_state_oid is not None):
+        raise ValueError("committing preserved-prefix repair must freeze final state")
+    if operation.final_state_json is not None:
+        parse_state(operation.final_state_json)
+
+
+def parse_preserved_prefix_repair(data: str) -> PreservedPrefixRepair:
+    try:
+        raw = json.loads(data)
+        names = {"operation_kind", "carrier", "workspace_targets", "stack", "merged_prefix", "integration", "boundary", "ownership", "metadata_updates", "phase", "publication_possibly_sent", "unstack_possibly_sent", "relink_possibly_sent", "final_state_json", "final_state_oid"}
+        if not isinstance(raw, dict) or set(raw) != names or raw["operation_kind"] != "preserved-prefix-repair":
+            raise ValueError("operation has unexpected fields or kind")
+        carrier_raw = raw["carrier"]
+        if not isinstance(carrier_raw, dict):
+            raise ValueError("carrier must be an object")
+        carrier = parse_topology_repair(json.dumps(carrier_raw)).plan
+        repository = carrier.repository
+        def exact(value: object, fields: set[str], where: str) -> dict[str, object]:
+            if not isinstance(value, dict) or set(value) != fields:
+                raise ValueError(f"{where} has unexpected fields")
+            return value
+        def repo(value: object) -> GitHubRepositoryId:
+            item = exact(value, {"host", "node_id"}, "repository")
+            if not all(isinstance(item[key], str) and item[key] for key in item):
+                raise ValueError("repository identity is malformed")
+            return GitHubRepositoryId(item["host"], item["node_id"])  # type: ignore[arg-type]
+        def ref(value: object) -> RemoteBranchRef:
+            item = exact(value, {"repository", "full_name"}, "ref")
+            if not isinstance(item["full_name"], str): raise ValueError("ref name is malformed")
+            return RemoteBranchRef(repo(item["repository"]), item["full_name"])
+        def live(value: object) -> LiveRemoteRef:
+            item = exact(value, {"ref", "commit_id"}, "live ref")
+            if item["commit_id"] is not None and not isinstance(item["commit_id"], str): raise ValueError("live OID is malformed")
+            return LiveRemoteRef(ref(item["ref"]), item["commit_id"])  # type: ignore[arg-type]
+        stack_raw = exact(raw["stack"], {"identity", "node_id", "base_branch"}, "stack")
+        stack_identity_raw = exact(stack_raw["identity"], {"repository", "number"}, "stack identity")
+        if type(stack_identity_raw["number"]) is not int or not isinstance(stack_raw["node_id"], str) or not isinstance(stack_raw["base_branch"], str): raise ValueError("stack is malformed")
+        stack_identity = GitHubStackId(repo(stack_identity_raw["repository"]), stack_identity_raw["number"])  # type: ignore[arg-type]
+        stack = GitHubStackSummary(stack_identity, stack_raw["node_id"], stack_raw["base_branch"])  # type: ignore[arg-type]
+        own = exact(raw["ownership"], {"stack", "ref", "created", "last_owned_commit_id"}, "ownership")
+        own_stack_raw = exact(own["stack"], {"repository", "number"}, "ownership stack")
+        own_stack = GitHubStackId(repo(own_stack_raw["repository"]), own_stack_raw["number"])  # type: ignore[arg-type]
+        if type(own["created"]) is not bool or not isinstance(own["last_owned_commit_id"], str): raise ValueError("ownership is malformed")
+        ownership = BoundaryAliasOwnership(own_stack, ref(own["ref"]), own["created"], own["last_owned_commit_id"])  # type: ignore[arg-type]
+        ids = raw["merged_prefix"]
+        if not isinstance(ids, list) or any(type(item) is not int or item <= 0 for item in ids): raise ValueError("merged prefix is malformed")
+        by_id = {item.number: item for item in carrier.dependencies.prs}
+        merged = tuple(by_id[item] for item in ids)
+        metadata_raw = raw["metadata_updates"]
+        if not isinstance(metadata_raw, list):
+            raise ValueError("metadata updates must be an array")
+        metadata: list[PRMetadataUpdate] = []
+        by_identity = {item.identity.number: item.identity for item in carrier.dependencies.prs}
+        for value in metadata_raw:
+            item = exact(value, {"pr_identity", "title", "body"}, "metadata update")
+            identity_raw = exact(item["pr_identity"], {"repository", "number"}, "metadata identity")
+            number = identity_raw["number"]
+            if type(number) is not int or number not in by_identity or identity_raw != asdict(by_identity[number]):
+                raise ValueError("metadata identity is not a frozen pull request")
+            if not isinstance(item["title"], str) or not isinstance(item["body"], str):
+                raise ValueError("metadata title and body must be text")
+            metadata.append(PRMetadataUpdate(by_identity[number], item["title"], item["body"]))  # type: ignore[arg-type]
+        booleans = (raw["publication_possibly_sent"], raw["unstack_possibly_sent"], raw["relink_possibly_sent"])
+        if any(type(item) is not bool for item in booleans): raise ValueError("progress markers must be boolean")
+        if raw["final_state_json"] is not None and not isinstance(raw["final_state_json"], str): raise ValueError("final state must be text or null")
+        if raw["final_state_oid"] is not None and not isinstance(raw["final_state_oid"], str): raise ValueError("final OID must be text or null")
+        workspaces = raw["workspace_targets"]
+        if not isinstance(workspaces, list) or any(not isinstance(item, list) or len(item) != 2 or not all(isinstance(value, str) and value for value in item) for item in workspaces): raise ValueError("workspace targets are malformed")
+        operation = PreservedPrefixRepair(PreservedPrefixPlan(carrier, tuple(tuple(item) for item in workspaces), stack, merged, live(raw["integration"]), live(raw["boundary"]), ownership, tuple(metadata)), PreservedPrefixRepairPhase(raw["phase"]), *booleans, raw["final_state_json"], raw["final_state_oid"])
+        if repository != stack.identity.repository: raise ValueError("stack repository differs")
+        _validate_preserved_prefix_repair(operation)
+        return operation
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise Error(f"invalid refs/jj-stack/operation payload: {exc}") from exc
 
 
 def _validate_topology_repair(operation: TopologyRepair) -> None:
@@ -3974,6 +4220,8 @@ def parse_operation(data: str) -> Operation:
         return parse_topology_repair(data)
     if kind == "membership-repair":
         return parse_membership_repair(data)
+    if kind == "preserved-prefix-repair":
+        return parse_preserved_prefix_repair(data)
     raise Error("invalid refs/jj-stack/operation payload: unknown operation_kind")
 
 
@@ -4081,6 +4329,28 @@ def cas_write_membership_repair(
             raise ConcurrentUpdate("operation ref changed during compare-and-swap")
         detail = result.stderr.strip() or result.stdout.strip()
         raise Error("could not update operation ref" + (f": {detail}" if detail else ""))
+    return new_oid
+
+
+def cas_write_preserved_prefix_repair(
+    workspace: str | Path,
+    expected_oid: str | None,
+    operation: PreservedPrefixRepair,
+) -> str:
+    common = git_common_dir(workspace)
+    new_oid = _run(
+        ["git", f"--git-dir={common}", "hash-object", "-w", "--stdin"],
+        stdin=preserved_prefix_repair_to_json(operation),
+    ).strip()
+    expected = expected_oid or ("0" * len(new_oid))
+    result = subprocess.run(
+        ["git", f"--git-dir={common}", "update-ref", OPERATION_REF, new_oid, expected],
+        text=True, capture_output=True, check=False,
+    )
+    if result.returncode:
+        if read_ref_oid(workspace, OPERATION_REF) != expected_oid:
+            raise ConcurrentUpdate("operation ref changed during compare-and-swap")
+        raise Error("could not update preserved-prefix operation ref")
     return new_oid
 
 
@@ -4635,6 +4905,7 @@ def prepare_multi_first_publication(
                 pr.draft,
                 pr.title,
                 pr.body,
+                pr.state,
             )
             for pr in existing_prs
         ),
@@ -4983,6 +5254,13 @@ def _validate_pr_dependencies(
         pr for pr in snapshot.pull_requests if pr.state is PullRequestState.MERGED
     )
     comparison_base = merged[-1].head_oid if merged else bases[0].commit_id
+    if merged:
+        boundary_ref = RemoteBranchRef(snapshot.repository, f"refs/heads/{merged[-1].head_branch}")
+        boundary = next((item for item in snapshot.live_refs if item.ref == boundary_ref), None)
+        if boundary is not None and boundary.commit_id == bases[0].commit_id:
+            # A current boundary needs no structural repair.  Native jj roots
+            # the surviving suffix at the current integration OID.
+            comparison_base = bases[0].commit_id
     active_heads: list[LiveRemoteRef] = []
     for pr, wanted in zip(prs, desired.active, strict=True):
         commits = tuple(
@@ -5689,6 +5967,81 @@ def plan_sync(
     )
 
 
+def plan_preserved_prefix_repair(
+    snapshot: Snapshot,
+    desired: DesiredStack,
+    repository: GitHubRepository,
+    remote: str,
+) -> PreservedPrefixRepair | Blocked | None:
+    """Plan only the stale owned boundary case; return None for ordinary sync."""
+    if not isinstance(snapshot.membership, ServerStackMembership):
+        return None
+    merged = tuple(pr for pr in snapshot.pull_requests if pr.state is PullRequestState.MERGED)
+    opened = tuple(pr for pr in snapshot.pull_requests if pr.state is PullRequestState.OPEN)
+    if not merged or not opened:
+        return None
+    integration_ref = RemoteBranchRef(snapshot.repository, f"refs/heads/{desired.base_branch}")
+    boundary_ref = RemoteBranchRef(snapshot.repository, f"refs/heads/{merged[-1].head_branch}")
+    integration_values = tuple(item for item in snapshot.live_refs if item.ref == integration_ref)
+    boundary_values = tuple(item for item in snapshot.live_refs if item.ref == boundary_ref)
+    if len(integration_values) != 1 or integration_values[0].commit_id is None or len(boundary_values) != 1:
+        return _block("boundary-observation-incomplete", boundary_ref.full_name, "integration and boundary refs require exact authoritative observations")
+    integration, boundary = integration_values[0], boundary_values[0]
+    if tuple(item.pr_identity for item in desired.active) != tuple(pr.identity for pr in opened):
+        return _block("merged-identity-selected", "stack", "the active goal must contain exactly the open suffix")
+    # A suffix still rooted at the historical merged head is ordinary
+    # unchanged-topology sync, including an exact NoOp.  Structural recovery is
+    # selected only after native jj has rooted the first open segment at I.
+    if not _comparison_is_nonempty_linear_and_conflict_free(
+        snapshot.local.commits, integration.commit_id, desired.active[0].desired_commit_id
+    ):
+        return None
+    tracked = tuple(stack for stack in snapshot.tool_state.state.stacks if stack.repository == snapshot.repository and stack.base_branch == desired.base_branch and stack.ordered_prs in (snapshot.membership.ordered_prs, tuple(pr.identity for pr in opened)))
+    if len(tracked) != 1:
+        return _block("tracked-source-mismatch", "stack", "repair requires one exact compatible active/history record")
+    ownerships = tuple(item for item in snapshot.tool_state.state.boundary_aliases if item.stack == snapshot.membership.stack.identity)
+    if boundary.commit_id is None:
+        if ownerships:
+            return _block("boundary-moved", boundary_ref.full_name, "an owned boundary unexpectedly disappeared")
+        ownership = BoundaryAliasOwnership(snapshot.membership.stack.identity, boundary_ref, True, integration.commit_id)
+    else:
+        if len(ownerships) != 1 or ownerships[0].ref != boundary_ref:
+            return _block("foreign-boundary", boundary_ref.full_name, "an existing boundary alias is not owned by this stack")
+        ownership = ownerships[0]
+        if ownership.last_owned_commit_id != boundary.commit_id:
+            return _block("boundary-moved", boundary_ref.full_name, "the owned boundary alias moved externally")
+        if boundary.commit_id == integration.commit_id:
+            return None
+        ownership = replace(ownership, last_owned_commit_id=integration.commit_id)
+    if any(pr.auto_merge_enabled or pr.in_merge_queue for pr in snapshot.pull_requests):
+        return _block("active-automation", "stack", "automation blocks preserved-prefix repair")
+    by_commit = {item.commit_id: item for item in snapshot.local.commits}
+    predecessor = integration.commit_id
+    updates: list[PlannedHeadUpdate] = []
+    metadata: list[PRMetadataUpdate] = []
+    heads: list[LiveRemoteRef] = []
+    for pr, wanted in zip(opened, desired.active, strict=True):
+        metadata.extend(_metadata_updates(pr, wanted))
+        if wanted.desired_commit_id not in by_commit or not _comparison_is_nonempty_linear_and_conflict_free(snapshot.local.commits, predecessor, wanted.desired_commit_id):
+            return _block("suffix-not-rebased", wanted.desired_commit_id, "native jj must produce a linear conflict-free suffix rooted at current integration")
+        ref = RemoteBranchRef(snapshot.repository, f"refs/heads/{pr.head_branch}")
+        values = tuple(item for item in snapshot.live_refs if item.ref == ref)
+        if len(values) != 1 or values[0].commit_id != pr.head_oid:
+            return _block("head-disagrees", ref.full_name, "open head observation is not exact")
+        heads.append(values[0])
+        planned = _plan_head_update(snapshot.local.commits, snapshot.tool_state.state, wanted, values[0])
+        if isinstance(planned, Blocked): return planned
+        updates.extend(planned)
+        predecessor = wanted.desired_commit_id
+    dependencies = TopologyDependencies(snapshot.local.effective_config, snapshot.push_url, snapshot.tool_state.state_blob_oid, snapshot.tool_state.operation_blob_oid, snapshot.pull_requests, snapshot.membership, tuple(heads), (integration, boundary))
+    final_tracking = TrackedStack(snapshot.repository, desired.base_branch, tuple(pr.identity for pr in opened), tracked[0].detached_prs)
+    carrier = TopologyPlan(snapshot.repository, repository.name_with_owner, remote, desired, (), tuple(updates), (), final_tracking, dependencies)
+    operation = PreservedPrefixRepair(PreservedPrefixPlan(carrier, snapshot.local.workspace_targets, snapshot.membership.stack, merged, integration, boundary, ownership, tuple(metadata)))
+    try: _validate_preserved_prefix_repair(operation)
+    except ValueError as exc: return _block("invalid-preserved-prefix-repair", "stack", str(exc))
+    return operation
+
+
 def render(plan: SyncPlan) -> str:
     if isinstance(plan, Blocked):
         return "\n".join(
@@ -6263,7 +6616,7 @@ def _existing_member_matches(
 ) -> bool:
     return (
         pr.identity == member.identity
-        and pr.state is PullRequestState.OPEN
+        and pr.state is member.state
         and pr.head_branch == member.head_branch
         and pr.head_oid == member.head_commit_id
         and pr.base_branch == member.base_branch
@@ -6335,8 +6688,12 @@ def observe_first_publication_stack(
     ):
         return None
     prs = github.pull_requests(stack.pull_requests)
-    if any(pr.state is not PullRequestState.OPEN for pr in prs):
-        return None
+    seen_open = False
+    for pr in prs:
+        if pr.state is PullRequestState.OPEN:
+            seen_open = True
+        elif pr.state is not PullRequestState.MERGED or seen_open:
+            return None
     expected_existing = {
         member.identity: member for member in operation.existing_members
     }
@@ -6447,6 +6804,7 @@ def record_verified_state(
             stacks,
             retained + tuple(publications),
             state.last_adopted_heads,
+            state.boundary_aliases,
         ),
     )
 
@@ -6615,11 +6973,22 @@ def inspect_remote_restack(
             remote,
             "fetch and authoritative push transports identify different repositories",
         )
+    active = tuple(
+        pr for pr in snapshot.pull_requests if pr.state is PullRequestState.OPEN
+    )
+    complete_membership = tuple(pr.identity for pr in snapshot.pull_requests)
+    active_membership = tuple(pr.identity for pr in active)
+    base_branch = (
+        snapshot.pull_requests[0].base_branch
+        if isinstance(snapshot.membership, StandalonePullRequest)
+        else snapshot.membership.base_branch
+    )
     tracked_stacks = tuple(
         stack
         for stack in snapshot.tool_state.state.stacks
         if stack.repository == snapshot.repository
-        and stack.ordered_prs == tuple(pr.identity for pr in snapshot.pull_requests)
+        and stack.base_branch == base_branch
+        and stack.ordered_prs in {complete_membership, active_membership}
     )
     if len(tracked_stacks) != 1:
         return _block(
@@ -6627,9 +6996,6 @@ def inspect_remote_restack(
             "stack",
             "adoption requires exact tracked membership",
         )
-    active = tuple(
-        pr for pr in snapshot.pull_requests if pr.state is PullRequestState.OPEN
-    )
     if not active:
         return _block("empty-suffix", "stack", "there is no open suffix to adopt")
     live_by_name = {item.ref.full_name: item.commit_id for item in snapshot.live_refs}
@@ -6703,7 +7069,12 @@ def inspect_remote_restack(
                 raise SourceMismatch(
                     "jj did not ignore the private inspection ref namespace"
                 )
-            old_base = base
+            merged = tuple(
+                pr
+                for pr in snapshot.pull_requests
+                if pr.state is PullRequestState.MERGED
+            )
+            old_base = merged[-1].head_oid if merged else base
             new_base = base
             boundaries: list[RemoteRestackBoundary] = []
             for pr, local, tracked, live in raw_boundaries:
@@ -6911,7 +7282,12 @@ def record_verified_adoptions(
     return cas_write_state(
         workspace,
         expected_state_oid,
-        TrackedState(state.stacks, publications, retained + tuple(adoptions)),
+        TrackedState(
+            state.stacks,
+            publications,
+            retained + tuple(adoptions),
+            state.boundary_aliases,
+        ),
     )
 
 
@@ -8522,6 +8898,132 @@ def start_membership_repair(operation: MembershipRepair, workspace: str | Path) 
         return cas_write_membership_repair(workspace, None, operation)
 
 
+def start_preserved_prefix_repair(operation: PreservedPrefixRepair, workspace: str | Path) -> str:
+    """Install the CAS fence before any stale-boundary effect."""
+    _validate_preserved_prefix_repair(operation)
+    if operation.phase is not PreservedPrefixRepairPhase.PUBLISHING:
+        raise ValueError("a new preserved-prefix repair must start before effects")
+    with repository_lock(workspace):
+        plan = operation.plan.carrier
+        if read_ref_oid(workspace, STATE_REF) != plan.dependencies.state_blob_oid:
+            raise ConcurrentUpdate("private state changed before operation start")
+        if read_ref_oid(workspace, OPERATION_REF) is not None:
+            raise ConcurrentUpdate("another operation is already active")
+        refs = tuple(item.ref for item in plan.head_updates) + (operation.plan.integration.ref, operation.plan.boundary.ref)
+        values = _topology_refs(plan, workspace, refs)
+        expected = tuple(LiveRemoteRef(item.ref, item.expected_old_commit_id) for item in plan.head_updates) + (operation.plan.integration, operation.plan.boundary)
+        if values != expected:
+            raise ConcurrentUpdate("frozen integration, open heads, or boundary alias changed")
+        return cas_write_preserved_prefix_repair(workspace, None, operation)
+
+
+def push_preserved_prefix_updates(workspace: str | Path, operation: PreservedPrefixRepair) -> subprocess.CompletedProcess[str]:
+    plan = operation.plan.carrier
+    updates = plan.head_updates
+    boundary = operation.plan.boundary
+    integration = operation.plan.integration
+    assert integration.commit_id is not None
+    common = git_common_dir(workspace)
+    leases = [f"--force-with-lease={item.ref.full_name}:{item.expected_old_commit_id}" for item in updates]
+    leases.append(f"--force-with-lease={boundary.ref.full_name}:{boundary.commit_id or ''}")
+    specs = [f"{item.new_commit_id}:{item.ref.full_name}" for item in updates]
+    specs.append(f"{integration.commit_id}:{boundary.ref.full_name}")
+    return subprocess.run(["git", f"--git-dir={common}", "push", "--atomic", "--no-follow-tags", "--recurse-submodules=no", *leases, plan.dependencies.push_url, *specs], text=True, capture_output=True, check=False)
+
+
+def run_preserved_prefix_stack_link(
+    github: GitHubClient,
+    repository: GitHubRepository,
+    operation: PreservedPrefixRepair,
+) -> GitHubStackSummary:
+    plan = operation.plan.carrier
+    added = tuple(item.pr_identity for item in plan.desired.active)
+    return github.add_stack_members(
+        repository,
+        operation.plan.stack.identity,
+        pull_requests=added,
+    )
+
+
+def _preserved_projection(
+    github: GitHubClient,
+    repository: GitHubRepository,
+    operation: PreservedPrefixRepair,
+) -> tuple[tuple[GitHubPullRequest, ...], GitHubStack | None]:
+    plan = operation.plan.carrier
+    sources = github.pull_requests(tuple(item.identity for item in plan.dependencies.prs))
+    ids = {item.stack.identity for item in sources if item.stack is not None}
+    stack = github.stack(repository, operation.plan.stack.identity) if ids else None
+    return sources, stack
+
+
+def _preserved_error(
+    github: GitHubClient,
+    repository: GitHubRepository,
+    operation: PreservedPrefixRepair,
+    workspace: str | Path,
+    expected: str,
+) -> str | None:
+    plan = operation.plan.carrier
+    try:
+        local = observe_local(
+            workspace,
+            revision="none()",
+            config_keys=tuple(key for key, _value in plan.dependencies.effective_config),
+        )
+        if local.effective_config != plan.dependencies.effective_config or local.workspace_targets != operation.plan.workspace_targets:
+            return "frozen config or workspace targets changed"
+        if resolve_push_url(local, plan.remote) != plan.dependencies.push_url:
+            return "frozen publication routing changed"
+        sources, stack = _preserved_projection(github, repository, operation)
+    except Error as exc:
+        return str(exc)
+    frozen = plan.dependencies.prs
+    if len(sources) != len(frozen): return "complete PR observation changed"
+    desired = {item.pr_identity: item for item in plan.desired.active}
+    metadata = {item.pr_identity: item for item in operation.plan.metadata_updates}
+    previous_branch = operation.plan.boundary.ref.full_name.removeprefix("refs/heads/")
+    previous_oid = operation.plan.integration.commit_id
+    for old, pr in zip(frozen, sources, strict=True):
+        if (pr.identity, pr.number, pr.state, pr.draft, pr.head_branch) != (old.identity, old.number, old.state, old.draft, old.head_branch): return f"pull request #{old.number} frozen identity changed"
+        wanted_metadata = metadata.get(old.identity)
+        allowed_metadata = {(old.title, old.body)}
+        if wanted_metadata is not None:
+            allowed_metadata.add((wanted_metadata.title, wanted_metadata.body))
+        if (pr.title, pr.body) not in allowed_metadata or (
+            expected == "final"
+            and old.identity in desired
+            and (pr.title, pr.body) != (desired[old.identity].title, desired[old.identity].body)
+        ):
+            return f"pull request #{old.number} metadata is not frozen or desired"
+        if pr.auto_merge_enabled or pr.in_merge_queue: return f"pull request #{old.number} has active automation"
+        if old.identity in desired and expected in {"prefix", "final"} and pr.head_oid != desired[old.identity].desired_commit_id: return f"pull request #{old.number} head is not final"
+        if old.identity in desired:
+            if expected == "final" and (pr.base_branch, pr.base_oid) != (previous_branch, previous_oid): return f"pull request #{old.number} final base is not exact"
+            previous_branch = old.head_branch
+            previous_oid = desired[old.identity].desired_commit_id
+    wanted_members = tuple(item.identity for item in operation.plan.merged_prefix) if expected == "prefix" else tuple(item.identity for item in frozen)
+    if stack is None or stack.identity != operation.plan.stack.identity or stack.pull_requests != wanted_members: return "stack identity or exact membership changed"
+    return None
+
+
+def _build_preserved_prefix_state(operation: PreservedPrefixRepair, state: TrackedState) -> TrackedState:
+    plan = operation.plan.carrier
+    source_ids = tuple(item.identity for item in plan.dependencies.prs)
+    matches = tuple(item for item in state.stacks if item.repository == plan.repository and item.base_branch == plan.desired.base_branch and item.ordered_prs in (source_ids, tuple(w.pr_identity for w in plan.desired.active)))
+    if len(matches) != 1: raise Error("private state no longer contains exact compatible source")
+    stacks = tuple(item for item in state.stacks if item != matches[0]) + (plan.tracking_update,)
+    publications = state.last_published_heads
+    adoptions = state.last_adopted_heads
+    by_ref = {f"refs/heads/{item.head_branch}": item.identity for item in plan.dependencies.prs}
+    for update in plan.head_updates:
+        key = (by_ref[update.ref.full_name], update.ref)
+        publications = tuple(item for item in publications if (item.pr, item.ref) != key) + (LastPublishedHead(key[0], key[1], update.new_commit_id),)
+        adoptions = tuple(item for item in adoptions if (item.pr, item.ref) != key)
+    aliases = tuple(item for item in state.boundary_aliases if item.stack != operation.plan.stack.identity) + (operation.plan.ownership,)
+    return TrackedState(stacks, publications, adoptions, aliases)  # type: ignore[arg-type]
+
+
 def _membership_plan(operation: MembershipRepair) -> TopologyPlan:
     """Make an in-memory adapter for topology leaf commands; never persist it."""
     slots = {slot.slot_id: slot for slot in operation.slots}
@@ -8709,7 +9211,7 @@ def _build_membership_final_state(operation: MembershipRepair, state: TrackedSta
         for item in adoptions
         if item.pr not in closed_replacements and (item.pr, item.ref) not in keys
     )
-    return TrackedState(stacks, publications, adoptions)
+    return TrackedState(stacks, publications, adoptions, state.boundary_aliases)
 
 
 def resume_membership_repair(
@@ -8984,9 +9486,118 @@ def resume_membership_repair(
         return Stopped("operation", "membership operation reached no terminal state")
 
 
+def resume_preserved_prefix_repair(
+    workspace: str | Path, github: GitHubClient
+) -> PreservedPrefixRepairResult:
+    with repository_lock(workspace):
+        try:
+            operation_oid, raw = read_operation(workspace)
+            if not isinstance(raw, PreservedPrefixRepair):
+                return Stopped("operation", "active operation is not a preserved-prefix repair")
+            operation = raw
+            plan = operation.plan.carrier
+            repository = _frozen_repository(
+                github, plan.repository, plan.repository_name
+            )
+            def save(**changes) -> None:
+                nonlocal operation, operation_oid
+                operation = replace(operation, **changes)
+                operation_oid = cas_write_preserved_prefix_repair(workspace, operation_oid, operation)
+            def refs() -> tuple[str | None, ...]:
+                targets = tuple(item.ref for item in plan.head_updates) + (operation.plan.boundary.ref, operation.plan.integration.ref)
+                return tuple(item.commit_id for item in _topology_refs(plan, workspace, targets))
+            old = tuple(item.expected_old_commit_id for item in plan.head_updates) + (operation.plan.boundary.commit_id, operation.plan.integration.commit_id)
+            final = tuple(item.new_commit_id for item in plan.head_updates) + (operation.plan.integration.commit_id, operation.plan.integration.commit_id)
+            if operation.phase is not PreservedPrefixRepairPhase.COMMITTING and read_ref_oid(workspace, STATE_REF) != plan.dependencies.state_blob_oid:
+                return Stopped("state", "private state changed while operation is active")
+            if operation.phase is PreservedPrefixRepairPhase.PUBLISHING:
+                error = _preserved_error(github, repository, operation, workspace, "full")
+                if error is not None: return Stopped("publish", error)
+                values = refs()
+                if values == old:
+                    save(publication_possibly_sent=True)
+                    push_preserved_prefix_updates(workspace, operation)
+                    values = refs()
+                if values != final:
+                    classification = "old" if values == old else "mixed-or-foreign"
+                    return Stopped("publish", f"atomic publication readback is {classification}")
+                save(phase=PreservedPrefixRepairPhase.UNSTACKING)
+            if operation.phase is PreservedPrefixRepairPhase.UNSTACKING:
+                # Every mutation gets a fresh automation/identity read before it.
+                error = _preserved_error(github, repository, operation, workspace, "full")
+                if refs() != final: return Stopped("unstack", "refs changed before unstack")
+                if error is None:
+                    if operation.unstack_possibly_sent:
+                        return Stopped("unstack", "possibly sent unstack still reads as its old membership")
+                    save(unstack_possibly_sent=True)
+                    try:
+                        github.unstack(repository, operation.plan.stack.identity)
+                    except Error:
+                        pass
+                error = _preserved_error(github, repository, operation, workspace, "prefix")
+                if error is not None: return Stopped("unstack", f"partial or unsafe unstack: {error}")
+                save(phase=PreservedPrefixRepairPhase.RELINKING)
+            if operation.phase is PreservedPrefixRepairPhase.RELINKING:
+                error = _preserved_error(github, repository, operation, workspace, "prefix")
+                if refs() != final: return Stopped("relink", "refs changed before relink")
+                final_error = _preserved_error(github, repository, operation, workspace, "final")
+                if error is None:
+                    sources, _stack = _preserved_projection(github, repository, operation)
+                    source_by_identity = {item.identity: item for item in sources}
+                    for update in operation.plan.metadata_updates:
+                        source = source_by_identity[update.pr_identity]
+                        if (source.title, source.body) != (update.title, update.body):
+                            try:
+                                github.update_pull_request(
+                                    repository,
+                                    update.pr_identity,
+                                    title=update.title,
+                                    body=update.body,
+                                )
+                            except Error:
+                                pass
+                    if operation.relink_possibly_sent:
+                        return Stopped("relink", "possibly sent stack add still reads as its old membership")
+                    save(relink_possibly_sent=True)
+                    try:
+                        run_preserved_prefix_stack_link(github, repository, operation)
+                    except Error:
+                        pass
+                    final_error = _preserved_error(github, repository, operation, workspace, "final")
+                elif final_error is not None:
+                    return Stopped("relink", error)
+                error = final_error
+                if error is not None: return Stopped("relink", f"same-ID link readback failed: {error}")
+                save(phase=PreservedPrefixRepairPhase.VERIFYING)
+            if operation.phase is PreservedPrefixRepairPhase.VERIFYING:
+                for _ in range(2):
+                    error = _preserved_error(github, repository, operation, workspace, "final")
+                    if error is not None: return Stopped("verify", error)
+                    if refs() != final: return Stopped("verify", "heads, boundary, or integration changed")
+                state_oid, state = read_state(workspace)
+                if state_oid != plan.dependencies.state_blob_oid: return Stopped("state", "private state changed before commit")
+                final_json = state_to_json(_build_preserved_prefix_state(operation, state))
+                final_oid = _run(["git", f"--git-dir={git_common_dir(workspace)}", "hash-object", "-w", "--stdin"], stdin=final_json).strip()
+                save(phase=PreservedPrefixRepairPhase.COMMITTING, final_state_json=final_json, final_state_oid=final_oid)
+            if operation.phase is PreservedPrefixRepairPhase.COMMITTING:
+                current = read_ref_oid(workspace, STATE_REF)
+                if current == plan.dependencies.state_blob_oid:
+                    error = _preserved_error(github, repository, operation, workspace, "final")
+                    if error is not None or refs() != final: return Stopped("verify", error or "final refs changed")
+                    assert operation.final_state_json is not None
+                    if cas_write_state(workspace, current, parse_state(operation.final_state_json)) != operation.final_state_oid: return Stopped("state", "committed state differs from frozen OID")
+                elif current != operation.final_state_oid:
+                    return Stopped("state", "private state is neither expected nor final")
+                cas_delete_operation(workspace, operation_oid)
+                return PreservedPrefixRepairVerified(tuple(item.pr_identity for item in plan.desired.active))
+        except Error as exc:
+            return Stopped(operation.phase.value if "operation" in locals() else "operation", str(exc))
+    return Stopped("operation", "preserved-prefix operation reached no terminal state")
+
+
 def resume_operation(
     workspace: str | Path, github: GitHubClient
-) -> FirstPublicationResult | TopologyRepairResult | MembershipRepairResult:
+) -> FirstPublicationResult | TopologyRepairResult | MembershipRepairResult | PreservedPrefixRepairResult:
     try:
         _oid, operation = read_operation(workspace)
     except Error as exc:
@@ -8995,6 +9606,8 @@ def resume_operation(
         return resume_topology_repair(workspace, github)
     if isinstance(operation, MembershipRepair):
         return resume_membership_repair(workspace, github)
+    if isinstance(operation, PreservedPrefixRepair):
+        return resume_preserved_prefix_repair(workspace, github)
     return resume_first_publication(workspace, github)
 
 
@@ -10142,8 +10755,16 @@ def plan_explicit_existing(
             f"PR #{selected_identity.number}",
             "selected PR belongs to multiple tracked active stacks",
         )
-    if tracked_candidates and not replacement_ids and not _snapshot_matches_tracked_topology(
-        snapshot, tracked_candidates[0]
+    has_merged_prefix = (
+        isinstance(snapshot.membership, ServerStackMembership)
+        and any(pr.state is PullRequestState.MERGED for pr in snapshot.pull_requests)
+        and any(pr.state is PullRequestState.OPEN for pr in snapshot.pull_requests)
+    )
+    if (
+        tracked_candidates
+        and not replacement_ids
+        and not has_merged_prefix
+        and not _snapshot_matches_tracked_topology(snapshot, tracked_candidates[0])
     ):
         return plan_explicit_tracked_restore(
             workspace,
@@ -10233,7 +10854,7 @@ def plan_explicit_existing(
         else:
             classified = classify_complete_membership_boundaries(
                 snapshot.local,
-                snapshot.pull_requests,
+                open_prs if has_merged_prefix else snapshot.pull_requests,
                 boundaries,
                 replacement_ids,
                 state=snapshot.tool_state.state,
@@ -10297,7 +10918,9 @@ def plan_explicit_existing(
             )
             and len(classified) > len(source_ids)
         )
-        if replacement_ids or (has_new and not simple_append) or not classified_existing:
+        if replacement_ids or (
+            not simple_append and (has_new or not classified_existing)
+        ):
             repository = github.resolve_repository(snapshot.push_url)
             return prepare_membership_repair(
                 workspace, snapshot, repository, remote, classified
@@ -10364,6 +10987,11 @@ def plan_explicit_existing(
     desired = derive_desired(snapshot, selection)
     if isinstance(desired, Blocked):
         return desired
+    if any(pr.state is PullRequestState.MERGED for pr in snapshot.pull_requests):
+        repository = github.resolve_repository(snapshot.push_url)
+        preserved = plan_preserved_prefix_repair(snapshot, desired, repository, remote)
+        if preserved is not None:
+            return preserved
     source_open = tuple(pr.identity for pr in open_prs)
     selected = tuple(item.pr_identity for item in desired.active)
     if selected == source_open:
@@ -10376,7 +11004,7 @@ def plan_explicit_existing(
             and snapshot.tool_state.operation_blob_oid is None
             and all(not pr.auto_merge_enabled and not pr.in_merge_queue for pr in open_prs)
         ):
-            adoption = inspect_remote_restack(snapshot, remote)
+            adoption = inspect_remote_restack(snapshot, github, remote)
             if isinstance(adoption, RemoteRestackAdoption):
                 return adoption
         return plan_sync(snapshot, desired)
@@ -10569,6 +11197,14 @@ def render_explicit(value: ExplicitPlan | ExplicitResult) -> str:
                 )
             )
         return "\n".join(lines)
+    if isinstance(value, PreservedPrefixRepair):
+        plan = value.plan
+        return (
+            f"preserved-prefix repair at {value.phase.value}:\n"
+            f"  - retain {len(plan.merged_prefix)} merged PR(s) in stack #{plan.stack.identity.number}\n"
+            f"  - atomically advance {plan.boundary.ref.full_name} to {plan.integration.commit_id}\n"
+            f"  - relink {len(plan.carrier.desired.active)} open PR(s) to the same stack"
+        )
     if isinstance(value, PersistedOperation):
         if isinstance(value.operation, TopologyRepair):
             return (
@@ -10576,6 +11212,8 @@ def render_explicit(value: ExplicitPlan | ExplicitResult) -> str:
                 + render_topology(value.operation.plan)
             )
         if isinstance(value.operation, MembershipRepair):
+            return "resume " + render_explicit(value.operation)
+        if isinstance(value.operation, PreservedPrefixRepair):
             return "resume " + render_explicit(value.operation)
         return (
             f"resume first publication at {value.operation.phase.value}:\n"
@@ -10587,6 +11225,8 @@ def render_explicit(value: ExplicitPlan | ExplicitResult) -> str:
         return f"topology repaired for {len(value.ordered_prs)} PR(s)"
     if isinstance(value, MembershipRepairVerified):
         return f"membership repaired for {len(value.ordered_prs)} PR(s)"
+    if isinstance(value, PreservedPrefixRepairVerified):
+        return f"preserved-prefix repaired for {len(value.ordered_prs)} open PR(s)"
     if isinstance(value, AdoptionVerified):
         return f"adopted {len(value.adopted_heads)} remote head(s) locally"
     if isinstance(value, Verified):
@@ -10626,6 +11266,9 @@ def apply_explicit(
     if isinstance(value, MembershipRepair):
         start_membership_repair(value, workspace)
         return resume_membership_repair(workspace, github)
+    if isinstance(value, PreservedPrefixRepair):
+        start_preserved_prefix_repair(value, workspace)
+        return resume_preserved_prefix_repair(workspace, github)
     if isinstance(value, TopologyPlan):
         start_topology_repair(value, workspace)
         return resume_topology_repair(workspace, github)

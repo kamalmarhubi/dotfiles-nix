@@ -476,11 +476,26 @@ def test_repository_lock_is_shared_by_workspaces(jj_repo: Path, tmp_path: Path) 
 def test_state_round_trip_uses_unversioned_shape() -> None:
     payload = sync.state_to_json(sync.EMPTY_STATE)
     assert json.loads(payload) == {
+        "boundary_aliases": [],
         "last_adopted_heads": [],
         "last_published_heads": [],
         "stacks": [],
     }
     assert sync.parse_state(payload) == sync.EMPTY_STATE
+
+
+def test_boundary_alias_ownership_round_trip_is_distinct_from_head_authority() -> None:
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    ownership = sync.BoundaryAliasOwnership(
+        sync.GitHubStackId(repository, 17),
+        sync.RemoteBranchRef(repository, "refs/heads/jj-stack/boundary/17"),
+        True,
+        "a" * 40,
+    )
+    state = sync.TrackedState((), (), (), (ownership,))
+
+    assert sync.parse_state(sync.state_to_json(state)) == state
+    assert state.last_published_heads == ()
 
 
 @pytest.mark.parametrize(
@@ -1360,57 +1375,541 @@ def stacked_snapshot(
     return observed, sync.StackSelection("main", tuple(assignments))
 
 
-def test_bounded_commit_revision_includes_comparisons_bookmarks_and_receipts() -> None:
-    observed, _selected = stacked_snapshot(count=2)
-    repository = observed.repository
-    pr = observed.pull_requests[0].identity
-    local_target, remote_target, published, adopted = (
-        character * 40 for character in "3456"
+def preserved_prefix_case(
+    *, boundary: str | None = "1" * 40, owned: bool = True
+) -> tuple[sync.Snapshot, sync.DesiredStack, sync.GitHubRepository]:
+    observed, _selection = stacked_snapshot(count=3, merged_prefix=1)
+    repository = sync.GitHubRepository(
+        observed.repository, "owner/repo", "https://github.com/owner/repo", "main"
+    )
+    integration = "b" * 40
+    desired_ids = ("4" * 40, "5" * 40)
+    commits = tuple(
+        sync.ObservedCommit(
+            oid,
+            (integration if index == 0 else desired_ids[index - 1],),
+            f"new-{index}",
+            f"Title {index + 2}\n\nBody {index + 2}",
+            False,
+            False,
+        )
+        for index, oid in enumerate(desired_ids)
     )
     local = dataclasses.replace(
         observed.local,
-        local_bookmarks=(
-            sync.LocalBookmark("local", sync.CommitTarget(local_target)),
-            sync.LocalBookmark("absent", sync.AbsentBookmarkTarget()),
-        ),
-        remote_bookmarks=(
-            sync.JjRemoteBookmark(
-                "origin",
-                "remote",
-                sync.CommitTarget(remote_target),
-                sync.TrackingState.TRACKED,
-            ),
+        commits=commits,
+        workspace_targets=(("default", desired_ids[-1]),),
+    )
+    stack = observed.membership.stack  # type: ignore[union-attr]
+    alias_ref = sync.RemoteBranchRef(observed.repository, "refs/heads/topic-1")
+    aliases = (
+        (sync.BoundaryAliasOwnership(stack.identity, alias_ref, True, boundary),)
+        if owned and boundary is not None
+        else ()
+    )
+    receipts = tuple(
+        sync.LastPublishedHead(
+            pr.identity,
+            sync.RemoteBranchRef(observed.repository, f"refs/heads/{pr.head_branch}"),
+            pr.head_oid,
+        )
+        for pr in observed.pull_requests[1:]
+    )
+    state = dataclasses.replace(
+        observed.tool_state.state,
+        last_published_heads=receipts,
+        boundary_aliases=aliases,
+    )
+    refs = tuple(
+        dataclasses.replace(item, commit_id=boundary)
+        if item.ref == alias_ref
+        else item
+        for item in observed.live_refs
+    )
+    observed = dataclasses.replace(
+        observed,
+        local=local,
+        tool_state=sync.ToolStateRead("state-oid", state, None),
+        live_refs=refs,
+    )
+    desired = sync.DesiredStack(
+        observed.repository,
+        "main",
+        tuple(
+            sync.DesiredExistingPR(pr.identity, oid, pr.title, pr.body)
+            for pr, oid in zip(observed.pull_requests[1:], desired_ids, strict=True)
         ),
     )
-    state = sync.TrackedState(
-        (),
-        (
-            sync.LastPublishedHead(
-                pr,
-                sync.RemoteBranchRef(repository, "refs/heads/published"),
-                published,
-            ),
-        ),
-        (
-            sync.LastAdoptedHead(
-                pr,
-                sync.RemoteBranchRef(repository, "refs/heads/adopted"),
-                adopted,
-            ),
+    return observed, desired, repository
+
+
+def preserved_prefix_operation(**kwargs: object) -> sync.PreservedPrefixRepair:
+    observed, desired, repository = preserved_prefix_case(**kwargs)
+    result = sync.plan_preserved_prefix_repair(observed, desired, repository, "origin")
+    assert isinstance(result, sync.PreservedPrefixRepair)
+    return result
+
+
+def test_preserved_prefix_revalidation_does_not_observe_commits(monkeypatch) -> None:
+    observed, _desired, repository = preserved_prefix_case()
+    operation = preserved_prefix_operation()
+    _server, client = github_for_topology(operation.plan.carrier)
+    revisions = []
+
+    def observe_local(*_args, **kwargs):
+        revisions.append(kwargs["revision"])
+        return dataclasses.replace(
+            observed.local,
+            workspace_targets=(("default", "changed"),),
+        )
+
+    monkeypatch.setattr(sync, "observe_local", observe_local)
+
+    assert (
+        sync._preserved_error(client, repository, operation, "/repo", "full")
+        == "frozen config or workspace targets changed"
+    )
+    assert revisions == ["none()"]
+
+
+def test_preserved_prefix_codec_is_strict_and_round_trips() -> None:
+    operation = preserved_prefix_operation()
+    payload = sync.preserved_prefix_repair_to_json(operation)
+    assert sync.parse_preserved_prefix_repair(payload) == operation
+    raw = json.loads(payload)
+    raw["unknown"] = True
+    with pytest.raises(sync.Error, match="unexpected fields"):
+        sync.parse_preserved_prefix_repair(json.dumps(raw))
+    raw = json.loads(payload)
+    raw["ownership"]["unknown"] = True
+    with pytest.raises(sync.Error, match="unexpected fields"):
+        sync.parse_preserved_prefix_repair(json.dumps(raw))
+
+
+def test_preserved_prefix_plans_and_round_trips_metadata_updates() -> None:
+    observed, desired, repository = preserved_prefix_case()
+    changed = dataclasses.replace(
+        desired,
+        active=(
+            dataclasses.replace(desired.active[0], title="Changed", body="New body"),
+            desired.active[1],
         ),
     )
 
-    assert sync._bounded_commit_revision(
-        "trunk()..topic", local, state, (("a" * 40, "b" * 40),)
-    ) == " | ".join(
-        (
-            "(trunk()..topic)",
-            f"{'a' * 40}::{'b' * 40}",
-            local_target,
-            remote_target,
-            published,
-            adopted,
+    operation = sync.plan_preserved_prefix_repair(
+        observed, changed, repository, "origin"
+    )
+
+    assert isinstance(operation, sync.PreservedPrefixRepair)
+    assert operation.plan.metadata_updates == (
+        sync.PRMetadataUpdate(changed.active[0].pr_identity, "Changed", "New body"),
+    )
+    assert sync.parse_preserved_prefix_repair(
+        sync.preserved_prefix_repair_to_json(operation)
+    ) == operation
+
+
+def test_preserved_prefix_planner_alias_ownership_cases() -> None:
+    observed, desired, repository = preserved_prefix_case()
+    assert isinstance(
+        sync.plan_preserved_prefix_repair(observed, desired, repository, "origin"),
+        sync.PreservedPrefixRepair,
+    )
+
+    correct = dataclasses.replace(
+        observed,
+        live_refs=tuple(
+            dataclasses.replace(item, commit_id="b" * 40)
+            if item.ref.full_name == "refs/heads/topic-1"
+            else item
+            for item in observed.live_refs
+        ),
+        tool_state=dataclasses.replace(
+            observed.tool_state,
+            state=dataclasses.replace(
+                observed.tool_state.state,
+                boundary_aliases=(
+                    dataclasses.replace(
+                        observed.tool_state.state.boundary_aliases[0],
+                        last_owned_commit_id="b" * 40,
+                    ),
+                ),
+            ),
+        ),
+    )
+    assert sync.plan_preserved_prefix_repair(correct, desired, repository, "origin") is None
+
+    absent, absent_desired, _ = preserved_prefix_case(boundary=None, owned=False)
+    created = sync.plan_preserved_prefix_repair(absent, absent_desired, repository, "origin")
+    assert isinstance(created, sync.PreservedPrefixRepair)
+    assert created.plan.ownership.created
+
+    unowned = dataclasses.replace(
+        correct,
+        tool_state=dataclasses.replace(
+            correct.tool_state,
+            state=dataclasses.replace(correct.tool_state.state, boundary_aliases=()),
+        ),
+    )
+    blocked = sync.plan_preserved_prefix_repair(unowned, desired, repository, "origin")
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "foreign-boundary"
+
+    moved = dataclasses.replace(
+        observed,
+        live_refs=tuple(
+            dataclasses.replace(item, commit_id="9" * 40)
+            if item.ref.full_name == "refs/heads/topic-1"
+            else item
+            for item in observed.live_refs
+        ),
+    )
+    blocked = sync.plan_preserved_prefix_repair(moved, desired, repository, "origin")
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "boundary-moved"
+
+
+@pytest.mark.parametrize(("boundary", "lease"), (("1" * 40, "1" * 40), (None, "")))
+def test_preserved_prefix_atomic_push_contains_all_updates_and_exact_lease(
+    monkeypatch, boundary: str | None, lease: str
+) -> None:
+    operation = preserved_prefix_operation(boundary=boundary, owned=boundary is not None)
+    seen: list[str] = []
+    monkeypatch.setattr(sync, "git_common_dir", lambda _workspace: Path("/git"))
+    monkeypatch.setattr(
+        sync.subprocess,
+        "run",
+        lambda argv, **_kwargs: seen.extend(argv)
+        or subprocess.CompletedProcess(argv, 0, "", ""),
+    )
+    sync.push_preserved_prefix_updates("/repo", operation)
+    assert "--atomic" in seen
+    assert f"--force-with-lease=refs/heads/topic-1:{lease}" in seen
+    for update in operation.plan.carrier.head_updates:
+        assert f"{update.new_commit_id}:{update.ref.full_name}" in seen
+        assert f"--force-with-lease={update.ref.full_name}:{update.expected_old_commit_id}" in seen
+    assert f"{'b' * 40}:refs/heads/topic-1" in seen
+
+
+def test_preserved_prefix_exact_same_stack_relink_effect() -> None:
+    operation = preserved_prefix_operation()
+    server, client = github_for_topology(operation.plan.carrier)
+    repository = client.resolve_repository(operation.plan.carrier.repository)
+    client.unstack(repository, operation.plan.stack.identity)
+
+    sync.run_preserved_prefix_stack_link(client, repository, operation)
+
+    stack = server.read_stack(repository, operation.plan.stack.identity)
+    assert stack is not None
+    assert stack.pull_requests == tuple(
+        item.identity for item in operation.plan.carrier.dependencies.prs
+    )
+
+
+def test_preserved_prefix_final_state_separates_receipts_and_alias_ownership() -> None:
+    operation = preserved_prefix_operation()
+    initial = preserved_prefix_case()[0].tool_state.state
+    final = sync._build_preserved_prefix_state(operation, initial)
+    assert {item.pr for item in final.last_published_heads} == {
+        item.pr_identity for item in operation.plan.carrier.desired.active
+    }
+    assert final.boundary_aliases == (operation.plan.ownership,)
+    assert all(item.ref != operation.plan.boundary.ref for item in final.last_published_heads)
+
+
+def test_preserved_prefix_render_apply_and_resume_dispatch(monkeypatch) -> None:
+    operation = preserved_prefix_operation()
+    _server, client = github_for_topology(operation.plan.carrier)
+    assert "preserved-prefix repair" in sync.render_explicit(operation)
+    monkeypatch.setattr(sync, "start_preserved_prefix_repair", lambda value, workspace: "fence")
+    monkeypatch.setattr(sync, "resume_preserved_prefix_repair", lambda workspace, client: "resumed")
+    assert sync.apply_explicit(operation, "/repo", client) == "resumed"
+    monkeypatch.setattr(sync, "read_operation", lambda workspace: ("oid", operation))
+    assert sync.resume_operation("/repo", client) == "resumed"
+
+
+@pytest.mark.parametrize("readback", ("old", "final", "mixed"))
+def test_preserved_prefix_push_classifies_old_final_and_mixed_readback(
+    monkeypatch, readback: str
+) -> None:
+    operation = preserved_prefix_operation()
+    _server, client = github_for_topology(operation.plan.carrier)
+    plan = operation.plan.carrier
+    old = tuple(item.expected_old_commit_id for item in plan.head_updates) + (
+        operation.plan.boundary.commit_id,
+        operation.plan.integration.commit_id,
+    )
+    final = tuple(item.new_commit_id for item in plan.head_updates) + (
+        operation.plan.integration.commit_id,
+        operation.plan.integration.commit_id,
+    )
+    values = list(old if readback in {"old", "mixed"} else final)
+    if readback == "mixed":
+        values[0] = final[0]
+    pushed = []
+    monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
+    monkeypatch.setattr(sync, "read_operation", lambda _workspace: ("op-oid", operation))
+    monkeypatch.setattr(sync, "read_ref_oid", lambda _workspace, _ref: "state-oid")
+    monkeypatch.setattr(sync, "_preserved_error", lambda *_args: None)
+    monkeypatch.setattr(
+        sync, "_topology_refs", lambda _plan, _workspace, _refs: tuple(
+            sync.LiveRemoteRef(ref, oid) for ref, oid in zip(_refs, values, strict=True)
         )
+    )
+    monkeypatch.setattr(
+        sync,
+        "cas_write_preserved_prefix_repair",
+        lambda _workspace, _oid, saved: (
+            (_ for _ in ()).throw(sync.Error("stop after publication"))
+            if saved.phase is sync.PreservedPrefixRepairPhase.UNSTACKING
+            else "next-op"
+        ),
+    )
+
+    def push(_workspace, _operation):
+        pushed.append(True)
+        values[:] = final
+        return subprocess.CompletedProcess([], 0)
+
+    monkeypatch.setattr(sync, "push_preserved_prefix_updates", push)
+    # Stop after publication so this test isolates its readback classifier.
+    result = sync.resume_preserved_prefix_repair("/repo", client)
+    assert bool(pushed) is (readback == "old")
+    if readback == "mixed":
+        assert isinstance(result, sync.Stopped)
+        assert "mixed-or-foreign" in result.detail
+
+
+def test_preserved_prefix_partial_unstack_blocks_without_replaying(monkeypatch) -> None:
+    operation = dataclasses.replace(
+        preserved_prefix_operation(),
+        phase=sync.PreservedPrefixRepairPhase.UNSTACKING,
+        publication_possibly_sent=True,
+    )
+    plan = operation.plan.carrier
+    _server, client = github_for_topology(plan)
+    final = tuple(item.new_commit_id for item in plan.head_updates) + (
+        operation.plan.integration.commit_id,
+        operation.plan.integration.commit_id,
+    )
+    calls = []
+    monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
+    monkeypatch.setattr(sync, "read_operation", lambda _workspace: ("oid", operation))
+    monkeypatch.setattr(sync, "read_ref_oid", lambda *_args: "state-oid")
+    monkeypatch.setattr(sync, "cas_write_preserved_prefix_repair", lambda *_args: "oid2")
+    monkeypatch.setattr(
+        sync, "_topology_refs", lambda _plan, _workspace, refs: tuple(
+            sync.LiveRemoteRef(ref, oid) for ref, oid in zip(refs, final, strict=True)
+        )
+    )
+    monkeypatch.setattr(sync, "_preserved_error", lambda *_args: "partial membership")
+    result = sync.resume_preserved_prefix_repair("/repo", client)
+    assert isinstance(result, sync.Stopped)
+    assert result.stage == "unstack" and "partial" in result.detail
+    assert calls == []
+
+
+def test_preserved_prefix_final_relink_readback_does_not_replay(monkeypatch) -> None:
+    operation = dataclasses.replace(
+        preserved_prefix_operation(),
+        phase=sync.PreservedPrefixRepairPhase.RELINKING,
+        publication_possibly_sent=True,
+        unstack_possibly_sent=True,
+        relink_possibly_sent=True,
+    )
+    plan = operation.plan.carrier
+    _server, client = github_for_topology(plan)
+    final = tuple(item.new_commit_id for item in plan.head_updates) + (
+        operation.plan.integration.commit_id,
+        operation.plan.integration.commit_id,
+    )
+    links = []
+    monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
+    monkeypatch.setattr(sync, "read_operation", lambda _workspace: ("oid", operation))
+    monkeypatch.setattr(sync, "read_ref_oid", lambda *_args: "state-oid")
+    monkeypatch.setattr(
+        sync, "_topology_refs", lambda _plan, _workspace, refs: tuple(
+            sync.LiveRemoteRef(ref, oid) for ref, oid in zip(refs, final, strict=True)
+        )
+    )
+    monkeypatch.setattr(
+        sync,
+        "_preserved_error",
+        lambda *_args: "not prefix" if _args[-1] == "prefix" else None,
+    )
+    monkeypatch.setattr(sync, "run_preserved_prefix_stack_link", lambda *_args: links.append(True))
+    monkeypatch.setattr(
+        sync,
+        "cas_write_preserved_prefix_repair",
+        lambda _workspace, _oid, saved: (
+            (_ for _ in ()).throw(sync.Error("stop after classification"))
+            if saved.phase is sync.PreservedPrefixRepairPhase.VERIFYING
+            else "oid2"
+        ),
+    )
+    result = sync.resume_preserved_prefix_repair("/repo", client)
+    assert isinstance(result, sync.Stopped)
+    assert links == []
+
+
+def test_preserved_prefix_relink_applies_metadata_before_linking(monkeypatch) -> None:
+    observed, desired, repository = preserved_prefix_case()
+    changed = dataclasses.replace(
+        desired,
+        active=(
+            dataclasses.replace(desired.active[0], title="Changed", body="New body"),
+            desired.active[1],
+        ),
+    )
+    planned = sync.plan_preserved_prefix_repair(observed, changed, repository, "origin")
+    assert isinstance(planned, sync.PreservedPrefixRepair)
+    operation = dataclasses.replace(
+        planned,
+        phase=sync.PreservedPrefixRepairPhase.RELINKING,
+        publication_possibly_sent=True,
+        unstack_possibly_sent=True,
+    )
+    plan = operation.plan.carrier
+    _server, client = github_for_topology(plan)
+    final = tuple(item.new_commit_id for item in plan.head_updates) + (
+        operation.plan.integration.commit_id,
+        operation.plan.integration.commit_id,
+    )
+    metadata_updated = [False]
+    events: list[str] = []
+    sources = tuple(dataclasses.replace(pr, stack=None) for pr in plan.dependencies.prs)
+    monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
+    monkeypatch.setattr(sync, "read_operation", lambda _workspace: ("oid", operation))
+    monkeypatch.setattr(sync, "read_ref_oid", lambda *_args: "state-oid")
+    monkeypatch.setattr(sync, "cas_write_preserved_prefix_repair", lambda *_args: "oid2")
+    monkeypatch.setattr(
+        sync, "_topology_refs", lambda _plan, _workspace, refs: tuple(
+            sync.LiveRemoteRef(ref, oid) for ref, oid in zip(refs, final, strict=True)
+        )
+    )
+    monkeypatch.setattr(sync, "_preserved_projection", lambda *_args: (sources, None))
+
+    def preserved_error(*args):
+        expected = args[-1]
+        if expected == "final" and not metadata_updated[0]:
+            return "metadata is not desired"
+        return None
+
+    monkeypatch.setattr(sync, "_preserved_error", preserved_error)
+    original_update = client.update_pull_request
+
+    def update(*args, **kwargs):
+        original_update(*args, **kwargs)
+        metadata_updated[0] = True
+        events.append("metadata")
+
+    monkeypatch.setattr(client, "update_pull_request", update)
+    monkeypatch.setattr(
+        sync,
+        "run_preserved_prefix_stack_link",
+        lambda *_args: events.append("link"),
+    )
+    monkeypatch.setattr(
+        sync,
+        "cas_write_preserved_prefix_repair",
+        lambda _workspace, _oid, saved: (
+            (_ for _ in ()).throw(sync.Error("stop after relink"))
+            if saved.phase is sync.PreservedPrefixRepairPhase.VERIFYING
+            else "oid2"
+        ),
+    )
+
+    result = sync.resume_preserved_prefix_repair("/repo", client)
+
+    assert isinstance(result, sync.Stopped)
+    assert events == ["metadata", "link"]
+
+
+def test_preserved_prefix_repeated_verification_commits_state_before_fence(monkeypatch) -> None:
+    operation = dataclasses.replace(
+        preserved_prefix_operation(), phase=sync.PreservedPrefixRepairPhase.VERIFYING
+    )
+    plan = operation.plan.carrier
+    _server, client = github_for_topology(plan)
+    final = tuple(item.new_commit_id for item in plan.head_updates) + (
+        operation.plan.integration.commit_id,
+        operation.plan.integration.commit_id,
+    )
+    state = preserved_prefix_case()[0].tool_state.state
+    current = ["state-oid"]
+    events: list[str] = []
+    projections: list[str] = []
+    monkeypatch.setattr(sync, "repository_lock", lambda _workspace: nullcontext())
+    monkeypatch.setattr(sync, "read_operation", lambda _workspace: ("operation-oid", operation))
+    monkeypatch.setattr(sync, "read_ref_oid", lambda _workspace, _ref: current[0])
+    monkeypatch.setattr(sync, "read_state", lambda _workspace: (current[0], state))
+    monkeypatch.setattr(
+        sync, "_topology_refs", lambda _plan, _workspace, refs: tuple(
+            sync.LiveRemoteRef(ref, oid) for ref, oid in zip(refs, final, strict=True)
+        )
+    )
+    monkeypatch.setattr(
+        sync,
+        "_preserved_error",
+        lambda *_args: projections.append(_args[-1]) or None,
+    )
+    monkeypatch.setattr(sync, "_run", lambda *_args, **_kwargs: "final-oid\n")
+    monkeypatch.setattr(sync, "cas_write_preserved_prefix_repair", lambda *_args: "operation-oid-2")
+
+    def write_state(_workspace, _expected, _state):
+        events.append("state")
+        current[0] = "final-oid"
+        return "final-oid"
+
+    monkeypatch.setattr(sync, "cas_write_state", write_state)
+    monkeypatch.setattr(sync, "cas_delete_operation", lambda *_args: events.append("fence"))
+    result = sync.resume_preserved_prefix_repair("/repo", client)
+    assert isinstance(result, sync.PreservedPrefixRepairVerified)
+    assert projections.count("final") >= 3
+    assert events == ["state", "fence"]
+
+
+def test_explicit_merged_prefix_routes_to_preserved_prefix_repair(monkeypatch) -> None:
+    observed, desired, repository = preserved_prefix_case(boundary=None, owned=False)
+    desired_ids = tuple(item.desired_commit_id for item in desired.active)
+    open_prs = tuple(
+        pr for pr in observed.pull_requests if pr.state is sync.PullRequestState.OPEN
+    )
+    pull_requests = (
+        observed.pull_requests[0],
+        dataclasses.replace(
+            open_prs[0],
+            base_branch="main",
+            base_oid="b" * 40,
+        ),
+        open_prs[1],
+    )
+    local = dataclasses.replace(
+        observed.local,
+        local_bookmarks=tuple(
+            sync.LocalBookmark(pr.head_branch, sync.CommitTarget(commit_id))
+            for pr, commit_id in zip(open_prs, desired_ids, strict=True)
+        ),
+    )
+    observed = dataclasses.replace(observed, local=local, pull_requests=pull_requests)
+    monkeypatch.setattr(sync, "observe_local", lambda *_args, **_kwargs: local)
+    monkeypatch.setattr(sync, "observe_snapshot", lambda *_args, **_kwargs: observed)
+    monkeypatch.setattr(
+        sync, "observe_commits", lambda *_args, **_kwargs: local.commits
+    )
+    server = FakeGitHubServer()
+    server.seed_repository(repository, aliases=(observed.push_url,))
+    client = FakeGitHubClient(server)
+
+    result = sync.plan_explicit_existing(
+        "/repo",
+        client,
+        sync.ExistingIntent(open_prs[0].number, "selected"),
+    )
+
+    assert isinstance(result, sync.PreservedPrefixRepair)
+    assert tuple(item.pr_identity for item in result.plan.carrier.desired.active) == tuple(
+        pr.identity for pr in open_prs
     )
 
 
@@ -1442,26 +1941,21 @@ def test_explicit_server_stack_observes_a_bounded_commit_union(monkeypatch) -> N
     monkeypatch.setattr(sync, "observe_local", observe_local)
     monkeypatch.setattr(sync, "observe_snapshot", lambda *_args, **_kwargs: observed)
     monkeypatch.setattr(sync, "observe_commits", observe_commits)
-    github = github_for_publication(first_publication_operation())
+    _server, client = github_for_publication(first_publication_operation())
 
     result = sync.plan_explicit_existing(
-        "/repo", github, sync.ExistingIntent(1, "trunk()..topic")
+        "/repo", client, sync.ExistingIntent(1, "trunk()..topic")
     )
 
     assert isinstance(result, sync.Blocked)
     assert result.reasons[0].code == "tracked-overlap"
-    assert local_calls == [
-        {
-            "revision": "trunk()..topic",
-            "config_keys": ("git.push",),
-            "ancestry_order": True,
-        }
-    ]
+    assert local_calls == [{
+        "revision": "trunk()..topic",
+        "config_keys": ("git.push",),
+        "ancestry_order": True,
+    }]
     expected_terms = ["(trunk()..topic)"]
-    expected_terms.extend(
-        f"{pr.base_oid}::{pr.head_oid}"
-        for pr in observed.pull_requests
-    )
+    expected_terms.extend(f"{pr.base_oid}::{pr.head_oid}" for pr in observed.pull_requests)
     expected_terms.extend(
         item.target.commit_id
         for item in observed.local.local_bookmarks
@@ -1474,10 +1968,7 @@ def test_explicit_server_stack_observes_a_bounded_commit_union(monkeypatch) -> N
 def test_first_publication_observes_a_bounded_commit_union(monkeypatch) -> None:
     observed, _selected = stacked_snapshot(count=2)
     repository = sync.GitHubRepository(
-        observed.repository,
-        "owner/repo",
-        "https://github.com/owner/repo",
-        "main",
+        observed.repository, "owner/repo", "https://github.com/owner/repo", "main"
     )
     local_calls = []
     commit_revisions = []
@@ -1499,7 +1990,6 @@ def test_first_publication_observes_a_bounded_commit_union(monkeypatch) -> None:
     monkeypatch.setattr(
         sync, "resolve_first_publication_assignments", lambda *_args, **_kwargs: blocked
     )
-
     server = FakeGitHubServer()
     server.seed_repository(repository, aliases=(observed.push_url,))
     client = FakeGitHubClient(server)
@@ -1508,23 +1998,19 @@ def test_first_publication_observes_a_bounded_commit_union(monkeypatch) -> None:
     )
 
     assert result == blocked
-    assert local_calls == [
-        {
-            "revision": "trunk()..topic",
-            "config_keys": ("git.push",),
-            "ancestry_order": True,
-        }
-    ]
-    expected = " | ".join(
-        (
-            "(trunk()..topic)",
-            *(
-                item.target.commit_id
-                for item in observed.local.local_bookmarks
-                if isinstance(item.target, sync.CommitTarget)
-            ),
-        )
-    )
+    assert local_calls == [{
+        "revision": "trunk()..topic",
+        "config_keys": ("git.push",),
+        "ancestry_order": True,
+    }]
+    expected = " | ".join((
+        "(trunk()..topic)",
+        *(
+            item.target.commit_id
+            for item in observed.local.local_bookmarks
+            if isinstance(item.target, sync.CommitTarget)
+        ),
+    ))
     assert commit_revisions == [expected]
     assert "all()" not in commit_revisions[0]
 
@@ -3374,6 +3860,122 @@ def test_remote_restack_adoption_fetches_only_frozen_branches_and_records_author
         ["jj", "git", "fetch", "--remote", "origin", "--branch", "topic"]
     ]
     assert recorded == [(expected,)]
+
+
+def test_remote_restack_adoption_uses_merged_head_as_old_suffix_base(
+    monkeypatch,
+) -> None:
+    observed, _selection = stacked_snapshot(count=3, merged_prefix=1)
+    old_heads = ("2" * 40, "3" * 40)
+    new_heads = ("4" * 40, "5" * 40)
+    base = "b" * 40
+    open_prs = tuple(
+        pr for pr in observed.pull_requests if pr.state is sync.PullRequestState.OPEN
+    )
+    pull_requests = (
+        observed.pull_requests[0],
+        dataclasses.replace(
+            open_prs[0],
+            head_oid=new_heads[0],
+            base_branch="main",
+            base_oid=base,
+        ),
+        dataclasses.replace(
+            open_prs[1],
+            head_oid=new_heads[1],
+            base_oid=new_heads[0],
+        ),
+    )
+    live_refs = tuple(
+        dataclasses.replace(
+            item,
+            commit_id={
+                "refs/heads/topic-2": new_heads[0],
+                "refs/heads/topic-3": new_heads[1],
+            }.get(item.ref.full_name, item.commit_id),
+        )
+        for item in observed.live_refs
+    )
+    local = dataclasses.replace(
+        observed.local,
+        remote_bookmarks=tuple(
+            sync.JjRemoteBookmark(
+                "origin",
+                pr.head_branch,
+                sync.CommitTarget(old),
+                sync.TrackingState.TRACKED,
+            )
+            for pr, old in zip(open_prs, old_heads, strict=True)
+        ),
+    )
+    observed = dataclasses.replace(
+        observed,
+        fetch_url="ssh://git@github.com/o/r.git",
+        local=local,
+        tool_state=dataclasses.replace(
+            observed.tool_state,
+            state=dataclasses.replace(
+                observed.tool_state.state,
+                stacks=(
+                    sync.TrackedStack(
+                        observed.repository,
+                        "main",
+                        tuple(pr.identity for pr in open_prs),
+                    ),
+                ),
+            ),
+        ),
+        pull_requests=pull_requests,
+        live_refs=live_refs,
+    )
+    repository = sync.GitHubRepository(
+        observed.repository, "owner/repo", "https://github.com/owner/repo", "main"
+    )
+    segments: list[tuple[str, str]] = []
+    server = FakeGitHubServer()
+    server.seed_repository(repository, aliases=(observed.fetch_url,))
+    client = FakeGitHubClient(server)
+    monkeypatch.setattr(
+        sync,
+        "_git_refs",
+        lambda _git_dir, *names: "ordinary" if names == ("refs/heads", "refs/remotes") else "",
+    )
+    monkeypatch.setattr(sync, "_fetch_inspection_refs", lambda *_args: None)
+    monkeypatch.setattr(sync, "pin_operation", lambda *_args: local.operation_id)
+    monkeypatch.setattr(sync, "_cleanup_inspection_refs", lambda *_args: None)
+
+    def run(command, **_kwargs):
+        name = command[-1].rsplit("/", 1)[-1]
+        return {
+            "main": base,
+            "topic-2": new_heads[0],
+            "topic-3": new_heads[1],
+        }[name]
+
+    def segment(_git_dir, start, end):
+        segments.append((start, end))
+        return (end,)
+
+    monkeypatch.setattr(sync, "_run", run)
+    monkeypatch.setattr(sync, "_linear_segment", segment)
+    monkeypatch.setattr(
+        sync,
+        "_commit_fingerprint",
+        lambda _git_dir, commit: (
+            "change-b" if commit in {old_heads[0], new_heads[0]} else "change-c",
+            "patch-b" if commit in {old_heads[0], new_heads[0]} else "patch-c",
+        ),
+    )
+
+    result = sync.inspect_remote_restack(observed, client, "origin")
+
+    assert isinstance(result, sync.RemoteRestackAdoption)
+    assert segments == [
+        ("1" * 40, old_heads[0]),
+        (base, new_heads[0]),
+        (old_heads[0], old_heads[1]),
+        (new_heads[0], new_heads[1]),
+    ]
 
 
 @pytest.mark.parametrize(
