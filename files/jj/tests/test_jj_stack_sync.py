@@ -2123,6 +2123,259 @@ def membership_operation() -> sync.MembershipRepair:
     )
 
 
+def test_membership_classification_uses_exact_receipt_when_bookmark_is_absent() -> None:
+    observed, _selection = stacked_snapshot(count=2)
+    first = observed.pull_requests[0]
+    receipt = sync.LastPublishedHead(
+        first.identity,
+        sync.RemoteBranchRef(
+            observed.repository, f"refs/heads/{first.head_branch}"
+        ),
+        first.head_oid,
+    )
+    local = dataclasses.replace(
+        observed.local,
+        local_bookmarks=tuple(
+            item
+            for item in observed.local.local_bookmarks
+            if item.name != first.head_branch
+        ),
+    )
+
+    result = sync.classify_complete_membership_boundaries(
+        local,
+        observed.pull_requests,
+        observed.local.commits,
+        state=dataclasses.replace(
+            observed.tool_state.state, last_published_heads=(receipt,)
+        ),
+        live_refs=observed.live_refs,
+    )
+
+    assert isinstance(result, tuple)
+    assert result[0] == sync.ExistingMembershipBoundary(
+        first.identity, first.head_oid
+    )
+
+
+def test_closed_membership_requires_explicit_replacement_disposition() -> None:
+    observed, _selection = stacked_snapshot(count=2)
+    closed = dataclasses.replace(
+        observed.pull_requests[0], state=sync.PullRequestState.CLOSED
+    )
+    prs = (closed, observed.pull_requests[1])
+
+    blocked = sync.classify_complete_membership_boundaries(
+        observed.local, prs, observed.local.commits
+    )
+    replaced = sync.classify_complete_membership_boundaries(
+        observed.local,
+        prs,
+        observed.local.commits,
+        (closed.identity,),
+    )
+
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "closed-pr-decision-required"
+    assert isinstance(replaced, tuple)
+    assert replaced[0] == sync.ReplacedMembershipBoundary(
+        closed.identity, closed.head_oid
+    )
+
+
+def test_replacement_allows_moved_external_root_but_not_invalid_internal_edge(
+    monkeypatch,
+) -> None:
+    observed, _selection = stacked_snapshot(count=2)
+    moved_base = "c" * 40
+    first = dataclasses.replace(
+        observed.pull_requests[0],
+        state=sync.PullRequestState.CLOSED,
+    )
+    snapshot = dataclasses.replace(
+        observed,
+        pull_requests=(first, observed.pull_requests[1]),
+        live_refs=tuple(
+            dataclasses.replace(item, commit_id=moved_base)
+            if item.ref.full_name == "refs/heads/main"
+            else item
+            for item in observed.live_refs
+        ),
+    )
+    repository = sync.GitHubRepository(
+        observed.repository,
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    boundaries = (
+        sync.ReplacedMembershipBoundary(first.identity, "1" * 40),
+        sync.ExistingMembershipBoundary(observed.pull_requests[1].identity, "2" * 40),
+    )
+    monkeypatch.setattr(
+        sync,
+        "resolve_replacement_publication_assignment",
+        lambda *_args, **_kwargs: sync.PublicationAssignment(
+            "1" * 40, "topic-1-replace-1"
+        ),
+    )
+    monkeypatch.setattr(
+        sync,
+        "observe_live_refs",
+        lambda _url, identity, names, *, cwd: tuple(
+            sync.LiveRemoteRef(sync.RemoteBranchRef(identity, name), None)
+            for name in names
+        ),
+    )
+
+    result = sync.prepare_membership_repair(
+        "/repo", snapshot, repository, "origin", boundaries
+    )
+
+    assert isinstance(result, sync.MembershipRepair)
+    broken = dataclasses.replace(
+        snapshot,
+        local=dataclasses.replace(
+            snapshot.local,
+            commits=(
+                snapshot.local.commits[0],
+                dataclasses.replace(
+                    snapshot.local.commits[1], parent_commit_ids=("d" * 40,)
+                ),
+            ),
+        ),
+    )
+    blocked = sync.prepare_membership_repair(
+        "/repo", broken, repository, "origin", boundaries
+    )
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "invalid-old-comparison"
+    assert blocked.reasons[0].subject == f"PR #{observed.pull_requests[1].number}"
+
+
+@pytest.mark.parametrize(
+    ("local_names", "random_chars", "expected"),
+    (
+        ((), "abcd", "topic-abcd"),
+        (("topic-abcd",), "abcdefgh", "topic-efgh"),
+    ),
+)
+def test_replacement_name_allocator_uses_short_nonce_without_remote_queries(
+    local_names: tuple[str, ...], random_chars: str, expected: str, monkeypatch
+) -> None:
+    observed, _selection = stacked_snapshot(count=2)
+    commit_id = observed.pull_requests[0].head_oid
+    repository = sync.GitHubRepository(
+        observed.repository,
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    local = dataclasses.replace(
+        observed.local,
+        local_bookmarks=tuple(
+            sync.LocalBookmark(name, sync.CommitTarget(commit_id))
+            for name in local_names
+        ),
+    )
+    monkeypatch.setattr(
+        sync,
+        "_jj",
+        lambda _workspace, _operation, *args: (
+            "template" if args[:2] == ("config", "get") else "topic"
+        ),
+    )
+    chars = iter(random_chars)
+    monkeypatch.setattr(sync.secrets, "choice", lambda _alphabet: next(chars))
+    monkeypatch.setattr(
+        sync,
+        "observe_live_refs",
+        lambda *_args, **_kwargs: pytest.fail("nonce allocation queried remote refs"),
+    )
+    monkeypatch.setattr(
+        sync,
+        "observe_historical_pull_request_collisions",
+        lambda *_args, **_kwargs: pytest.fail("nonce allocation queried PR history"),
+    )
+
+    result = sync.resolve_replacement_publication_assignment(
+        "/repo",
+        local,
+        repository,
+        "ssh://git@github.com/owner/repo.git",
+        commit_id,
+        ("main",),
+    )
+
+    assert result == sync.PublicationAssignment(commit_id, expected)
+
+
+def test_replacement_mapping_round_trips_and_detaches_original_lifecycle() -> None:
+    initial = membership_operation()
+    old = initial.source_prs[1]
+    closed = dataclasses.replace(old, state=sync.PullRequestState.CLOSED)
+    operation = dataclasses.replace(
+        initial,
+        source_prs=(initial.source_prs[0], closed),
+        replacements=(sync.PullRequestReplacement(closed.identity, "slot-new"),),
+    )
+
+    decoded = sync.parse_membership_repair(
+        sync.membership_repair_to_json(operation)
+    )
+    bound = dataclasses.replace(
+        decoded,
+        slots=(
+            dataclasses.replace(
+                decoded.slots[0],
+                phase=sync.NewPRPhase.VERIFIED,
+                pr_identity=sync.PullRequestId(operation.repository, 99),
+            ),
+        ),
+    )
+    final = sync._build_membership_final_state(
+        bound,
+        sync.TrackedState(
+            (operation.source_tracked,),
+            (
+                sync.LastPublishedHead(
+                    closed.identity,
+                    sync.RemoteBranchRef(
+                        operation.repository, f"refs/heads/{closed.head_branch}"
+                    ),
+                    closed.head_oid,
+                ),
+            ),
+            (
+                sync.LastAdoptedHead(
+                    closed.identity,
+                    sync.RemoteBranchRef(
+                        operation.repository, f"refs/heads/{closed.head_branch}"
+                    ),
+                    closed.head_oid,
+                ),
+            ),
+        ),
+    )
+    open_final = sync._build_membership_final_state(
+        dataclasses.replace(bound, source_prs=initial.source_prs),
+        sync.TrackedState((operation.source_tracked,), (), ()),
+    )
+
+    assert decoded == operation
+    assert final.stacks[0].detached_prs == ()
+    assert all(item.pr != closed.identity for item in final.last_published_heads)
+    assert final.last_adopted_heads == ()
+    assert open_final.stacks[0].detached_prs == (old.identity,)
+    rendered = sync.render_explicit(operation)
+    assert "existing #1" in rendered
+    assert "replace #2 (CLOSED)" in rendered
+    assert "detached: none" in rendered
+    assert "forget closed replacements: #2" in rendered
+    assert f"unchanged {operation.slots[0].commit_id}" in rendered
+    assert "bootstrap replacements: none" in rendered
+
+
 def test_membership_repair_round_trip_is_exact_and_strict() -> None:
     operation = membership_operation()
     encoded = sync.membership_repair_to_json(operation)
@@ -3498,6 +3751,51 @@ def test_native_publication_command_freezes_remote_names_and_disables_signing(
             "--bookmark",
             operation.slots[0].branch,
         ]
+    ]
+
+
+def test_membership_publication_requires_every_destination_to_be_absent(
+    monkeypatch,
+) -> None:
+    operation = membership_operation()
+    slot = operation.slots[0]
+    calls: list[list[str]] = []
+    fetches: list[tuple[str, ...]] = []
+    monkeypatch.setattr(sync, "git_common_dir", lambda _workspace: Path("/git"))
+    monkeypatch.setattr(
+        sync.subprocess,
+        "run",
+        lambda command, **_kwargs: (
+            calls.append(command) or subprocess.CompletedProcess(command, 0, "", "")
+        ),
+    )
+    monkeypatch.setattr(
+        sync,
+        "_run_jj_publication",
+        lambda _workspace, *arguments: (
+            fetches.append(arguments)
+            or subprocess.CompletedProcess(arguments, 0, "", "")
+        ),
+    )
+
+    sync.push_membership_new_slot_refs("/repo", operation, operation.slots)
+
+    ref = f"refs/heads/{slot.branch}"
+    assert calls == [
+        [
+            "git",
+            "--git-dir=/git",
+            "push",
+            "--atomic",
+            "--no-follow-tags",
+            "--recurse-submodules=no",
+            f"--force-with-lease={ref}:",
+            operation.push_url,
+            f"{slot.commit_id}:{ref}",
+        ]
+    ]
+    assert fetches == [
+        ("git", "fetch", "--remote", operation.remote, "--branch", slot.branch)
     ]
 
 
