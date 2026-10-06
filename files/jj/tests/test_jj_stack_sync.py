@@ -20,6 +20,7 @@ import jj_stack_sync as sync  # noqa: E402
 from fake_github import (  # noqa: E402
     FakeGitHubClient,
     FakeGitHubServer,
+    FakeGitTransport,
     RefUpdatePolicy,
 )
 
@@ -410,6 +411,23 @@ def test_state_round_trip_uses_unversioned_shape() -> None:
 @pytest.mark.parametrize(
     "payload",
     (
+        "{}",
+        '{"entries":[]}',
+        '{"entries":[{"kind":"unknown"}]}',
+        '{"entries":[{"kind":"metadata","identity":"x",'
+        '"possibly_live":false,"repository":{"host":"github.com",'
+        '"node_id":"R"},"pr":7,"title":"t","body":"b",'
+        '"expected_title":"old","expected_body":"b","extra":true}]}',
+    ),
+)
+def test_recovery_journal_rejects_ambiguous_shapes(payload: str) -> None:
+    with pytest.raises(sync.Error, match="invalid refs/jj-stack/recovery payload"):
+        sync.parse_recovery(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    (
         "[]",
         '{"schema_version":true,"stacks":[],"last_published_heads":[]}',
         '{"schema_version":1.0,"stacks":[],"last_published_heads":[]}',
@@ -735,6 +753,199 @@ def test_fake_github_derives_stack_associations_and_preserves_requested_order() 
     assert client.resolve_repository("ssh://github/owner/repo") == repository
 
 
+def test_fake_git_transport_applies_atomic_git_lease_semantics() -> None:
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    push_url = "/nonexistent/fake-remote.git"
+    server = FakeGitHubServer()
+    server.seed_repository(repository, aliases=(push_url,))
+    server.seed_branch(repository.identity, "one", "1" * 40)
+    server.seed_branch(repository.identity, "two", "2" * 40)
+    transport = FakeGitTransport(server)
+    one = sync.RemoteBranchRef(repository.identity, "refs/heads/one")
+    two = sync.RemoteBranchRef(repository.identity, "refs/heads/two")
+
+    # The stale lease on the already-up-to-date ref is ignored, while the
+    # changing member is applied atomically.
+    transport.push_exact_head_updates(
+        push_url,
+        (
+            sync.PlannedHeadUpdate(one, "9" * 40, "1" * 40, sync.FastForward()),
+            sync.PlannedHeadUpdate(two, "2" * 40, "3" * 40, sync.FastForward()),
+        ),
+    )
+    assert transport.observe_live_refs(
+        push_url, repository.identity, (one.full_name, two.full_name)
+    ) == (
+        sync.LiveRemoteRef(one, "1" * 40),
+        sync.LiveRemoteRef(two, "3" * 40),
+    )
+
+    with pytest.raises(sync.GitPushError, match="stale lease"):
+        transport.push_exact_head_updates(
+            push_url,
+            (
+                sync.PlannedHeadUpdate(one, "0" * 40, "4" * 40, sync.FastForward()),
+                sync.PlannedHeadUpdate(two, "3" * 40, "5" * 40, sync.FastForward()),
+            ),
+        )
+    assert tuple(
+        item.commit_id
+        for item in transport.observe_live_refs(
+            push_url, repository.identity, (one.full_name, two.full_name)
+        )
+    ) == ("1" * 40, "3" * 40)
+
+
+def test_fake_ref_transactions_refresh_only_live_open_pr_observations() -> None:
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    push_url = "/nonexistent/fake-remote.git"
+    server = FakeGitHubServer()
+    server.seed_repository(repository, aliases=(push_url,))
+    server.seed_branch(repository.identity, "main", "0" * 40)
+    server.seed_branch(repository.identity, "topic", "1" * 40)
+    client = FakeGitHubClient(server)
+    transport = FakeGitTransport(server)
+    identity = client.create_pull_request(
+        repository,
+        head_branch="topic",
+        base_branch="main",
+        title="Topic",
+        body="",
+        draft=False,
+    )
+    topic = sync.RemoteBranchRef(repository.identity, "refs/heads/topic")
+
+    transport.push_exact_head_updates(
+        push_url,
+        (
+            sync.PlannedHeadUpdate(
+                topic, "1" * 40, "2" * 40, sync.FastForward()
+            ),
+        ),
+    )
+    assert client.pull_requests((identity,))[0].head_oid == "2" * 40
+
+    server.delete_branch(repository.identity, "topic")
+    assert transport.observe_live_refs(
+        push_url, repository.identity, (topic.full_name,)
+    )[0].commit_id is None
+    assert client.pull_requests((identity,))[0].head_oid == "2" * 40
+
+    transport.push_absent_heads(
+        push_url,
+        repository.identity,
+        (sync.NewPullRequestGoal("3" * 40, "topic", "main", "Topic", ""),),
+    )
+    assert client.pull_requests((identity,))[0].head_oid == "3" * 40
+
+    server.close_pull_request(identity)
+    server.move_branch(repository.identity, "topic", "4" * 40)
+    assert client.pull_requests((identity,))[0].head_oid == "3" * 40
+
+
+def test_fake_ref_transactions_respect_fork_identity_and_retarget_base_oid() -> None:
+    base_id = sync.GitHubRepositoryId("github.com", "R_base")
+    fork_id = sync.GitHubRepositoryId("github.com", "R_fork")
+    base = sync.GitHubRepository(
+        base_id, "owner/base", "https://github.com/owner/base", "main"
+    )
+    fork = sync.GitHubRepository(
+        fork_id, "contributor/fork", "https://github.com/contributor/fork", "main"
+    )
+    server = FakeGitHubServer()
+    server.seed_repository(base, aliases=("/base.git",))
+    server.seed_repository(fork, aliases=("/fork.git",))
+    server.seed_branch(base_id, "main", "0" * 40)
+    server.seed_branch(base_id, "next", "1" * 40)
+    server.seed_branch(base_id, "topic", "2" * 40)
+    server.seed_branch(fork_id, "topic", "3" * 40)
+    identity = sync.PullRequestId(base_id, 1)
+    server.seed_pull_request(sync.GitHubPullRequest(
+        identity,
+        "PR_1",
+        sync.PullRequestState.OPEN,
+        False,
+        fork_id,
+        "topic",
+        "3" * 40,
+        "main",
+        "0" * 40,
+        False,
+        False,
+        "Topic",
+        "",
+        None,
+    ))
+    client = FakeGitHubClient(server)
+
+    server.move_branch(base_id, "topic", "4" * 40)
+    assert client.pull_requests((identity,))[0].head_oid == "3" * 40
+    server.move_branch(fork_id, "topic", "5" * 40)
+    assert client.pull_requests((identity,))[0].head_oid == "5" * 40
+
+    client.update_pull_request(base, identity, base_branch="next")
+    retargeted = client.pull_requests((identity,))[0]
+    assert (retargeted.base_branch, retargeted.base_oid) == ("next", "1" * 40)
+
+
+def test_fake_git_transport_faults_and_explicit_rejection_are_coherent() -> None:
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    push_url = "/nonexistent/fake-remote.git"
+    server = FakeGitHubServer()
+    server.seed_repository(repository, aliases=(push_url,))
+    server.seed_branch(repository.identity, "topic", "1" * 40)
+    transport = FakeGitTransport(server)
+    ref = sync.RemoteBranchRef(repository.identity, "refs/heads/topic")
+
+    with transport.lose_response(sync.GitTransport.push_exact_head_updates):
+        with pytest.raises(sync.GitPushError, match="lost response"):
+            transport.push_exact_head_updates(
+                push_url,
+                (sync.PlannedHeadUpdate(
+                    ref, "1" * 40, "2" * 40, sync.FastForward()
+                ),),
+            )
+    assert transport.observe_live_refs(
+        push_url, repository.identity, (ref.full_name,)
+    )[0].commit_id == "2" * 40
+
+    with transport.hold_next(sync.GitTransport.push_exact_head_updates) as pending:
+        with pytest.raises(sync.GitPushError, match="held request"):
+            transport.push_exact_head_updates(
+                push_url,
+                (sync.PlannedHeadUpdate(
+                    ref, "2" * 40, "3" * 40, sync.FastForward()
+                ),),
+            )
+    server.move_branch(repository.identity, "topic", "4" * 40)
+    with pytest.raises(sync.GitPushError, match="stale lease"):
+        pending.release()
+
+    server.set_ref_update_policy(ref, RefUpdatePolicy.REJECT)
+    with pytest.raises(sync.GitPushError, match="ref rejection"):
+        transport.push_exact_head_updates(
+            push_url,
+            (sync.PlannedHeadUpdate(
+                ref, "4" * 40, "5" * 40, sync.FastForward()
+            ),),
+        )
+
+
 def test_complete_stack_source_validates_order_membership_and_base() -> None:
     repository = sync.GitHubRepository(
         sync.GitHubRepositoryId("github.com", "R_repo"),
@@ -808,6 +1019,89 @@ def test_live_ref_observation_uses_destination_and_preserves_confirmed_absence(
             sync.RemoteBranchRef(repository, "refs/heads/missing"), None
         ),
     )
+
+
+def test_real_git_transport_matches_atomic_up_to_date_lease_semantics(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    source = tmp_path / "source"
+    run("git", "init", "--bare", remote)
+    run("git", "init", source)
+    run("jj", "git", "init", "--colocate", source)
+    run("git", "-C", source, "config", "user.name", "Test")
+    run("git", "-C", source, "config", "user.email", "test@example.com")
+    oids: list[str] = []
+    for index in range(5):
+        (source / "file").write_text(f"{index}\n")
+        run("git", "-C", source, "add", "file")
+        run("git", "-C", source, "commit", "-m", f"commit {index}")
+        oids.append(run("git", "-C", source, "rev-parse", "HEAD"))
+    run(
+        "git",
+        "-C",
+        source,
+        "push",
+        remote,
+        f"{oids[0]}:refs/heads/one",
+        f"{oids[1]}:refs/heads/two",
+    )
+
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    one = sync.RemoteBranchRef(repository, "refs/heads/one")
+    two = sync.RemoteBranchRef(repository, "refs/heads/two")
+    transport = sync.SubprocessGitTransport(source)
+
+    transport.push_exact_head_updates(
+        os.fspath(remote),
+        (
+            sync.PlannedHeadUpdate(one, oids[4], oids[0], sync.FastForward()),
+            sync.PlannedHeadUpdate(two, oids[1], oids[2], sync.FastForward()),
+        ),
+    )
+    assert tuple(item.commit_id for item in transport.observe_live_refs(
+        os.fspath(remote), repository, (one.full_name, two.full_name)
+    )) == (oids[0], oids[2])
+
+    with pytest.raises(sync.GitPushError):
+        transport.push_exact_head_updates(
+            os.fspath(remote),
+            (
+                sync.PlannedHeadUpdate(one, oids[4], oids[1], sync.FastForward()),
+                sync.PlannedHeadUpdate(two, oids[2], oids[3], sync.FastForward()),
+            ),
+        )
+    assert tuple(item.commit_id for item in transport.observe_live_refs(
+        os.fspath(remote), repository, (one.full_name, two.full_name)
+    )) == (oids[0], oids[2])
+
+    transport.push_absent_heads(
+        os.fspath(remote),
+        repository,
+        (
+            sync.NewPullRequestGoal(oids[0], "one", "main", "One", ""),
+            sync.NewPullRequestGoal(oids[3], "three", "main", "Three", ""),
+        ),
+    )
+    observed = transport.observe_live_refs(
+        os.fspath(remote),
+        repository,
+        ("refs/heads/one", "refs/heads/three"),
+    )
+    assert tuple(item.commit_id for item in observed) == (oids[0], oids[3])
+
+    with pytest.raises(sync.GitPushError):
+        transport.push_absent_heads(
+            os.fspath(remote),
+            repository,
+            (
+                sync.NewPullRequestGoal(oids[4], "one", "main", "One", ""),
+                sync.NewPullRequestGoal(oids[4], "four", "main", "Four", ""),
+            ),
+        )
+    assert transport.observe_live_refs(
+        os.fspath(remote), repository, ("refs/heads/four",)
+    )[0].commit_id is None
 
 
 def test_observation_record_parsers_reject_wrong_types_and_contradictions() -> None:
@@ -898,6 +1192,36 @@ def snapshot(*, desired: str, live: str, parent: str, recovery_oid: str | None =
         ),
     )
     return observed, pr_key
+
+
+def fake_github(observed: sync.Snapshot) -> tuple[FakeGitHubServer, FakeGitHubClient]:
+    repository = sync.GitHubRepository(
+        observed.repository,
+        "o/r",
+        "https://github.com/o/r",
+        None,
+    )
+    server = FakeGitHubServer()
+    server.seed_repository(repository, aliases=(observed.push_url,))
+    for live_ref in observed.live_refs:
+        if live_ref.commit_id is not None:
+            server.seed_branch(
+                live_ref.ref.repository,
+                live_ref.ref.full_name.removeprefix("refs/heads/"),
+                live_ref.commit_id,
+            )
+    for pr in observed.pull_requests:
+        server.seed_pull_request(dataclasses.replace(pr, stack=None))
+    if isinstance(observed.membership, sync.ServerStackMembership):
+        server.seed_stack(
+            sync.GitHubStack(
+                observed.membership.stack.identity,
+                observed.membership.stack.node_id,
+                observed.membership.stack.base_branch,
+                observed.membership.ordered_prs,
+            )
+        )
+    return server, FakeGitHubClient(server)
 
 
 def selection(observed: sync.Snapshot, *prs: sync.PullRequestId) -> sync.StackSelection:
@@ -1623,6 +1947,355 @@ def test_observations_are_deeply_immutable() -> None:
     with pytest.raises(dataclasses.FrozenInstanceError):
         observed.local.operation_id = "other"  # type: ignore[misc]
     assert isinstance(observed.live_refs, tuple)
+
+
+def test_noop_records_membership_without_manufacturing_publication_authority(
+    jj_repo: Path,
+) -> None:
+    observed, pr = snapshot(desired="1" * 40, live="1" * 40, parent="0" * 40)
+    plan = sync.plan_sync(observed, sync.derive_desired(observed, selection(observed, pr)))
+    _server, github = fake_github(observed)
+
+    result = sync.apply(plan, jj_repo, github)
+
+    assert result == sync.Verified(state_recorded=True)
+    _oid, state = sync.read_state(jj_repo)
+    assert state.stacks == (sync.TrackedStack(observed.repository, "main", (pr,)),)
+    assert state.last_published_heads == ()
+
+
+def head_plan() -> tuple[sync.Snapshot, sync.Apply]:
+    observed, pr = snapshot(desired="2" * 40, live="1" * 40, parent="1" * 40)
+    plan = sync.plan_sync(observed, sync.derive_desired(observed, selection(observed, pr)))
+    assert isinstance(plan, sync.Apply)
+    return observed, plan
+
+
+def head_journal(plan: sync.Apply, *, possibly_live: bool) -> sync.RecoveryJournal:
+    return sync.RecoveryJournal(
+        (
+            sync.RecoveryEntry(
+                "head-effect",
+                sync.HeadMutationAttempt(
+                    plan.desired.repository,
+                    plan.dependencies.push_url,
+                    plan.head_updates,
+                    sync._plan_tracking(plan),
+                    sync._plan_publications(plan),
+                ),
+                possibly_live,
+            ),
+        ),
+    )
+
+
+def test_recovery_distinguishes_prepared_from_possibly_live_head_attempt(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, plan = head_plan()
+    _server, github = fake_github(observed)
+    monkeypatch.setattr(
+        sync.SubprocessGitTransport,
+        "observe_live_refs",
+        lambda *_args, **_kwargs: plan.dependencies.live_heads,
+    )
+
+    sync.cas_write_recovery(jj_repo, None, head_journal(plan, possibly_live=False))
+    assert sync.settle_recovery(jj_repo, github) == ()
+    assert sync.read_recovery(jj_repo) == (None, None)
+    assert sync.read_state(jj_repo) == (None, sync.EMPTY_STATE)
+
+    sync.cas_write_recovery(jj_repo, None, head_journal(plan, possibly_live=True))
+    assert sync.settle_recovery(jj_repo, github) == head_journal(
+        plan, possibly_live=True
+    ).entries
+    assert sync.read_recovery(jj_repo)[1] is not None
+
+
+def test_applied_head_recovery_records_receipt_before_retiring_journal(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, plan = head_plan()
+    _server, github = fake_github(observed)
+    final_refs = tuple(
+        dataclasses.replace(item, commit_id=plan.head_updates[0].new_commit_id)
+        for item in plan.dependencies.live_heads
+    )
+    monkeypatch.setattr(
+        sync.SubprocessGitTransport,
+        "observe_live_refs",
+        lambda *_args, **_kwargs: final_refs,
+    )
+    sync.cas_write_recovery(jj_repo, None, head_journal(plan, possibly_live=True))
+
+    assert sync.settle_recovery(jj_repo, github) == ()
+
+    assert sync.read_recovery(jj_repo) == (None, None)
+    _oid, state = sync.read_state(jj_repo)
+    assert state.stacks == (sync._plan_tracking(plan),)
+    assert state.last_published_heads == sync._plan_publications(plan)
+
+
+def test_apply_publishes_once_with_exact_lease_and_records_authority(
+    jj_repo: Path,
+) -> None:
+    observed, plan = head_plan()
+    server, github = fake_github(observed)
+    git = FakeGitTransport(server)
+
+    result = sync.apply(plan, jj_repo, github, git_transport=git)
+
+    assert result == sync.Verified(head_published=True, state_recorded=True)
+    assert plan.head_updates[0].expected_old_commit_id == "1" * 40
+    assert git.observe_live_refs(
+        observed.push_url,
+        observed.repository,
+        (plan.head_updates[0].ref.full_name,),
+    )[0].commit_id == plan.head_updates[0].new_commit_id
+    assert github.pull_requests((observed.pull_requests[0].identity,))[0].head_oid == (
+        plan.head_updates[0].new_commit_id
+    )
+    assert sync.read_state(jj_repo)[1].last_published_heads == sync._plan_publications(
+        plan
+    )
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_apply_resolves_lost_git_push_response_by_authoritative_readback(
+    jj_repo: Path,
+) -> None:
+    observed, plan = head_plan()
+    server, github = fake_github(observed)
+    git = FakeGitTransport(server)
+
+    with git.lose_response(sync.GitTransport.push_exact_head_updates):
+        result = sync.apply(plan, jj_repo, github, git_transport=git)
+
+    assert result == sync.Verified(head_published=True, state_recorded=True)
+    assert git.observe_live_refs(
+        observed.push_url,
+        observed.repository,
+        (plan.head_updates[0].ref.full_name,),
+    )[0].commit_id == plan.head_updates[0].new_commit_id
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_atomic_head_push_uses_every_exact_observed_lease(monkeypatch) -> None:
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    updates = tuple(
+        sync.PlannedHeadUpdate(
+            sync.RemoteBranchRef(repository, f"refs/heads/topic-{index}"),
+            str(index) * 40,
+            str(index + 2) * 40,
+            sync.FastForward(),
+        )
+        for index in (1, 2)
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(sync, "git_common_dir", lambda _workspace: Path("/git"))
+    monkeypatch.setattr(
+        sync.subprocess,
+        "run",
+        lambda command, **_kwargs: (
+            commands.append(command) or subprocess.CompletedProcess(command, 0, "", "")
+        ),
+    )
+
+    sync.push_exact_head_updates("/workspace", updates, "ssh://example/repo")
+
+    assert commands == [
+        [
+            "git",
+            "--git-dir=/git",
+            "push",
+            "--atomic",
+            "--no-follow-tags",
+            "--recurse-submodules=no",
+            f"--force-with-lease=refs/heads/topic-1:{'1' * 40}",
+            f"--force-with-lease=refs/heads/topic-2:{'2' * 40}",
+            "ssh://example/repo",
+            f"{'3' * 40}:refs/heads/topic-1",
+            f"{'4' * 40}:refs/heads/topic-2",
+        ]
+    ]
+
+
+def test_state_cas_before_journal_retirement_is_idempotently_recoverable(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, plan = head_plan()
+    _server, github = fake_github(observed)
+    final_refs = tuple(
+        dataclasses.replace(item, commit_id=plan.head_updates[0].new_commit_id)
+        for item in plan.dependencies.live_heads
+    )
+    monkeypatch.setattr(
+        sync.SubprocessGitTransport,
+        "observe_live_refs",
+        lambda *_args, **_kwargs: final_refs,
+    )
+    sync.cas_write_recovery(jj_repo, None, head_journal(plan, possibly_live=True))
+    original = sync.cas_write_recovery
+
+    def fail_retirement(workspace, expected_oid, journal):
+        if journal is None:
+            raise sync.ConcurrentUpdate("injected retirement crash")
+        return original(workspace, expected_oid, journal)
+
+    monkeypatch.setattr(sync, "cas_write_recovery", fail_retirement)
+    with pytest.raises(sync.ConcurrentUpdate, match="retirement crash"):
+        sync.settle_recovery(jj_repo, github)
+    assert sync.read_state(jj_repo)[1].last_published_heads == sync._plan_publications(
+        plan
+    )
+    assert sync.read_recovery(jj_repo)[1] is not None
+
+    monkeypatch.setattr(sync, "cas_write_recovery", original)
+    assert sync.settle_recovery(jj_repo, github) == ()
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_lost_metadata_response_is_verified_and_retired(jj_repo: Path) -> None:
+    observed, pr = snapshot(desired="1" * 40, live="1" * 40, parent="0" * 40)
+    stale = dataclasses.replace(
+        observed,
+        pull_requests=(dataclasses.replace(observed.pull_requests[0], title="Stale"),),
+    )
+    plan = sync.plan_sync(stale, sync.derive_desired(stale, selection(stale, pr)))
+    assert isinstance(plan, sync.Apply)
+    server, github = fake_github(stale)
+
+    with github.lose_response(sync.GitHubClient.update_pull_request, pr=pr):
+        result = sync.apply(plan, jj_repo, github)
+
+    assert result == sync.Verified(metadata_updated=True, state_recorded=True)
+    assert server.read_pull_requests((pr,))[0].title == "Desired title"
+    assert sync.read_recovery(jj_repo) == (None, None)
+    assert sync.read_state(jj_repo)[1].last_published_heads == ()
+
+
+def test_dry_run_interprets_plan_without_any_writes(jj_repo: Path) -> None:
+    observed, pr = snapshot(desired="1" * 40, live="1" * 40, parent="0" * 40)
+    stale = dataclasses.replace(
+        observed,
+        pull_requests=(dataclasses.replace(observed.pull_requests[0], title="Stale"),),
+    )
+    plan = sync.plan_sync(stale, sync.derive_desired(stale, selection(stale, pr)))
+    assert isinstance(plan, sync.Apply)
+    server, github = fake_github(stale)
+
+    assert sync.apply(plan, jj_repo, github, dry_run=True) == sync.Verified()
+
+    assert server.read_pull_requests((pr,))[0].title == "Stale"
+    assert sync.read_state(jj_repo) == (None, sync.EMPTY_STATE)
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_held_metadata_request_remains_journaled_until_explicit_release(
+    jj_repo: Path,
+) -> None:
+    observed, pr = snapshot(desired="1" * 40, live="1" * 40, parent="0" * 40)
+    stale = dataclasses.replace(
+        observed,
+        pull_requests=(dataclasses.replace(observed.pull_requests[0], title="Stale"),),
+    )
+    plan = sync.plan_sync(stale, sync.derive_desired(stale, selection(stale, pr)))
+    assert isinstance(plan, sync.Apply)
+    _server, github = fake_github(stale)
+
+    with github.hold_next(sync.GitHubClient.update_pull_request, pr=pr) as pending:
+        result = sync.apply(plan, jj_repo, github)
+
+    assert isinstance(result, sync.Stopped)
+    assert result.stage == "metadata"
+    assert sync.settle_recovery(jj_repo, github)
+
+    pending.release()
+    assert sync.settle_recovery(jj_repo, github) == ()
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_fail_before_metadata_remains_conservatively_unresolved(jj_repo: Path) -> None:
+    observed, pr = snapshot(desired="1" * 40, live="1" * 40, parent="0" * 40)
+    stale = dataclasses.replace(
+        observed,
+        pull_requests=(dataclasses.replace(observed.pull_requests[0], title="Stale"),),
+    )
+    plan = sync.plan_sync(stale, sync.derive_desired(stale, selection(stale, pr)))
+    assert isinstance(plan, sync.Apply)
+    _server, github = fake_github(stale)
+
+    with github.fail_before(sync.GitHubClient.update_pull_request, pr=pr):
+        result = sync.apply(plan, jj_repo, github)
+
+    assert isinstance(result, sync.Stopped)
+    assert result.stage == "metadata"
+    unresolved = sync.settle_recovery(jj_repo, github)
+    assert len(unresolved) == 1
+    assert unresolved[0].possibly_live
+
+
+def test_unavailable_recovery_read_and_dry_run_preserve_journal(
+    jj_repo: Path,
+) -> None:
+    observed, pr = snapshot(desired="1" * 40, live="1" * 40, parent="0" * 40)
+    attempt = sync.MetadataMutationAttempt(
+        observed.repository,
+        sync.PRMetadataUpdate(pr, "Desired title", "Desired body"),
+        "Stale",
+        "Desired body",
+    )
+    journal = sync.RecoveryJournal(
+        (sync.RecoveryEntry("metadata-effect", attempt, possibly_live=True),)
+    )
+    oid = sync.cas_write_recovery(jj_repo, None, journal)
+    _server, github = fake_github(
+        dataclasses.replace(
+            observed,
+            pull_requests=(dataclasses.replace(observed.pull_requests[0], title="Stale"),),
+        )
+    )
+
+    with github.unavailable_reads():
+        assert sync.settle_recovery(jj_repo, github) == journal.entries
+    assert sync.settle_recovery(jj_repo, github, dry_run=True) == journal.entries
+    assert sync.read_recovery(jj_repo) == (oid, journal)
+
+
+def test_unresolved_effect_blocks_only_the_stack_it_can_change(jj_repo: Path) -> None:
+    observed, pr = snapshot(desired="1" * 40, live="1" * 40, parent="0" * 40)
+    plan = sync.plan_sync(observed, sync.derive_desired(observed, selection(observed, pr)))
+    assert isinstance(plan, sync.NoOp)
+    unrelated_pr = sync.PullRequestId(observed.repository, 99)
+    attempt = sync.MetadataMutationAttempt(
+        observed.repository,
+        sync.PRMetadataUpdate(unrelated_pr, "New", "Body"),
+        "Old",
+        "Body",
+    )
+    journal = sync.RecoveryJournal(
+        (sync.RecoveryEntry("unrelated", attempt, possibly_live=True),)
+    )
+    sync.cas_write_recovery(jj_repo, None, journal)
+    _server, github = fake_github(observed)
+
+    result = sync.apply(plan, jj_repo, github)
+
+    assert result == sync.Verified(state_recorded=True)
+    assert sync.read_recovery(jj_repo)[1] == journal
+
+    conflicting = dataclasses.replace(
+        attempt,
+        update=dataclasses.replace(attempt.update, pr_identity=pr),
+    )
+    old_oid, _old = sync.read_recovery(jj_repo)
+    conflicting_journal = sync.RecoveryJournal(
+        (sync.RecoveryEntry("conflicting", conflicting, possibly_live=True),)
+    )
+    sync.cas_write_recovery(jj_repo, old_oid, conflicting_journal)
+    stopped = sync.apply(plan, jj_repo, github)
+    assert isinstance(stopped, sync.Stopped)
+    assert stopped.stage == "recovery"
 
 
 if __name__ == "__main__":

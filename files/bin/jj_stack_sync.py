@@ -692,6 +692,97 @@ class Apply:
 SyncPlan = Blocked | NoOp | Apply
 
 
+@dataclass(frozen=True)
+class Verified:
+    head_published: bool = False
+    metadata_updated: bool = False
+    state_recorded: bool = False
+
+
+@dataclass(frozen=True)
+class Stopped:
+    stage: str
+    detail: str
+
+
+ApplyResult = Verified | Stopped
+
+
+@dataclass(frozen=True)
+class HeadMutationAttempt:
+    repository: GitHubRepositoryId
+    push_url: str
+    updates: tuple[PlannedHeadUpdate, ...]
+    tracking: TrackedStack
+    publications: tuple[LastPublishedHead, ...]
+    boundaries: tuple[LastPublishedBoundary, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.push_url or not self.updates:
+            raise ValueError("head mutation requires a push URL and updates")
+        if self.tracking.repository != self.repository or any(
+            update.ref.repository != self.repository for update in self.updates
+        ):
+            raise ValueError("head mutation values must belong to its repository")
+        expected = {(update.ref, update.new_commit_id) for update in self.updates}
+        recorded = {
+            (publication.ref, publication.verified_commit_id)
+            for publication in self.publications
+        } | {
+            (boundary.ref, boundary.verified_commit_id)
+            for boundary in self.boundaries
+        }
+        members = set(self.tracking.ordered_prs)
+        if (
+            recorded != expected
+            or len(self.publications) + len(self.boundaries) != len(self.updates)
+            or any(publication.pr not in members for publication in self.publications)
+            or any(boundary.merged_pr not in members for boundary in self.boundaries)
+        ):
+            raise ValueError("head mutation receipts must exactly match its updates")
+
+
+@dataclass(frozen=True)
+class MetadataMutationAttempt:
+    repository: GitHubRepositoryId
+    update: PRMetadataUpdate
+    expected_title: str
+    expected_body: str
+
+    def __post_init__(self) -> None:
+        if self.update.pr_identity.repository != self.repository:
+            raise ValueError("metadata mutation belongs to another repository")
+
+
+MutationAttempt = (
+    HeadMutationAttempt
+    | MetadataMutationAttempt
+)
+
+
+@dataclass(frozen=True)
+class RecoveryEntry:
+    """One exact write sent (or about to be sent), with stable causal identity."""
+
+    identity: str
+    attempt: MutationAttempt
+    possibly_live: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.identity:
+            raise ValueError("recovery entry identity must be nonempty")
+
+
+@dataclass(frozen=True)
+class RecoveryJournal:
+    entries: tuple[RecoveryEntry, ...]
+
+    def __post_init__(self) -> None:
+        identities = tuple(entry.identity for entry in self.entries)
+        if not identities or len(set(identities)) != len(identities):
+            raise ValueError("recovery journal must be nonempty with unique entries")
+
+
 def _run(
     args: Sequence[str], *, cwd: str | Path | None = None, stdin: str | None = None
 ) -> str:
@@ -2420,6 +2511,267 @@ def cas_write_state(
     return new_oid
 
 
+def recovery_to_json(journal: RecoveryJournal) -> str:
+    return json.dumps(
+        {"entries": [_recovery_entry_to_dict(entry) for entry in journal.entries]},
+        sort_keys=True, separators=(",", ":"),
+    ) + "\n"
+
+
+def _recovery_entry_to_dict(entry: RecoveryEntry) -> dict[str, object]:
+    attempt = entry.attempt
+    if isinstance(attempt, HeadMutationAttempt):
+        payload: dict[str, object] = {
+            "kind": "heads",
+            "identity": entry.identity,
+            "possibly_live": entry.possibly_live,
+            "repository": asdict(attempt.repository),
+            "push_url": attempt.push_url,
+            "updates": [
+                {'ref': update.ref.full_name, 'old': update.expected_old_commit_id, 'new': update.new_commit_id, **{}}
+                for update in attempt.updates
+            ],
+            "tracking": {
+                "base_branch": attempt.tracking.base_branch,
+                "ordered_prs": [pr.number for pr in attempt.tracking.ordered_prs],
+            },
+            "publications": [
+                {
+                    "pr": publication.pr.number,
+                    "ref": publication.ref.full_name,
+                    "commit": publication.verified_commit_id,
+                }
+                for publication in attempt.publications
+            ],
+            "boundaries": [
+                {"merged_pr": boundary.merged_pr.number,
+                 "ref": boundary.ref.full_name,
+                 "commit": boundary.verified_commit_id}
+                for boundary in attempt.boundaries
+            ],
+        }
+    elif isinstance(attempt, MetadataMutationAttempt):
+        payload = {
+            "kind": "metadata",
+            "identity": entry.identity,
+            "possibly_live": entry.possibly_live,
+            "repository": asdict(attempt.repository),
+            "pr": attempt.update.pr_identity.number,
+            "title": attempt.update.title,
+            "body": attempt.update.body,
+            "expected_title": attempt.expected_title,
+            "expected_body": attempt.expected_body,
+        }
+    else:
+        raise ValueError("unknown recovery attempt")
+    return payload
+
+
+def parse_recovery(data: str) -> RecoveryJournal:
+    try:
+        raw = json.loads(data)
+        if not isinstance(raw, dict) or set(raw) != {"entries"}:
+            raise ValueError("root fields are invalid")
+        if not isinstance(raw["entries"], list):
+            raise ValueError("entries must be an array")
+        return RecoveryJournal(tuple(_parse_recovery_entry(item) for item in raw["entries"]))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise Error(f"invalid {RECOVERY_REF} payload: {exc}") from exc
+
+
+def _parse_recovery_entry(raw: object) -> RecoveryEntry:
+    if not isinstance(raw, dict):
+        raise ValueError("entry must be an object")
+    kind = raw.get("kind")
+    common_fields = {"kind", "identity", "possibly_live", "repository"}
+    expected_fields = (
+        common_fields | {"push_url", "updates", "tracking", "publications", "boundaries"}
+        if kind == "heads"
+        else common_fields
+        | {"pr", "title", "body", "expected_title", "expected_body"}
+        if kind == "metadata"
+        else None
+    )
+    if expected_fields is None or set(raw) != expected_fields:
+        raise ValueError("entry kind or fields are invalid")
+    identity = raw["identity"]
+    if not isinstance(identity, str):
+        raise ValueError("entry identity must be a string")
+    repository_raw = raw["repository"]
+    if not isinstance(repository_raw, dict) or set(repository_raw) != {
+        "host",
+        "node_id",
+    }:
+        raise ValueError("repository must be an object")
+    repository = GitHubRepositoryId(
+        repository_raw["host"], repository_raw["node_id"]
+    )
+    possibly_live = raw["possibly_live"]
+    if not isinstance(possibly_live, bool):
+        raise ValueError("possibly_live must be a boolean")
+    if kind == "heads":
+        updates_raw = raw["updates"]
+        if not isinstance(updates_raw, list):
+            raise ValueError("head updates must be an array")
+        updates = tuple(
+            PlannedHeadUpdate(
+                RemoteBranchRef(repository, item["ref"]),
+                item["old"],
+                item["new"],
+                FastForward(),
+            )
+            for item in updates_raw
+            if isinstance(item, dict)
+            and (
+                set(item) == {"ref", "old", "new"}
+                or set(item) == {"ref", "old", "new", "explicit_local_wins"}
+                and item["explicit_local_wins"] is True
+            )
+        )
+        if not updates or len(updates) != len(updates_raw):
+            raise ValueError("head updates are malformed")
+        tracking_raw = raw["tracking"]
+        if not isinstance(tracking_raw, dict) or set(tracking_raw) != {
+            "base_branch",
+            "ordered_prs",
+        }:
+            raise ValueError("tracking receipt is malformed")
+        ordered_prs = tracking_raw["ordered_prs"]
+        if not isinstance(ordered_prs, list):
+            raise ValueError("tracked pull requests must be an array")
+        tracking = TrackedStack(
+            repository,
+            tracking_raw["base_branch"],
+            tuple(
+                PullRequestId(repository, number)
+                for number in ordered_prs
+            ),
+        )
+        publications_raw = raw["publications"]
+        if not isinstance(publications_raw, list):
+            raise ValueError("publication receipts must be an array")
+        publications = tuple(
+            LastPublishedHead(
+                PullRequestId(repository, item["pr"]),
+                RemoteBranchRef(repository, item["ref"]),
+                item["commit"],
+            )
+            for item in publications_raw
+            if isinstance(item, dict) and set(item) == {"pr", "ref", "commit"}
+        )
+        if len(publications) != len(publications_raw):
+            raise ValueError("publication receipts are malformed")
+        boundaries_raw = raw["boundaries"]
+        if not isinstance(boundaries_raw, list):
+            raise ValueError("boundary receipts must be an array")
+        boundaries = tuple(
+            LastPublishedBoundary(PullRequestId(repository, item["merged_pr"]),
+                RemoteBranchRef(repository, item["ref"]), item["commit"])
+            for item in boundaries_raw
+            if isinstance(item, dict) and set(item) == {"merged_pr", "ref", "commit"}
+        )
+        if len(boundaries) != len(boundaries_raw):
+            raise ValueError("boundary receipts are malformed")
+        attempt: MutationAttempt = HeadMutationAttempt(
+            repository, raw["push_url"], updates, tracking, publications, boundaries
+        )
+    elif kind == "metadata":
+        attempt = MetadataMutationAttempt(
+            repository,
+            PRMetadataUpdate(
+                PullRequestId(repository, raw["pr"]), raw["title"], raw["body"]
+            ),
+            raw["expected_title"],
+            raw["expected_body"],
+        )
+    else:
+        raise ValueError("unknown recovery attempt")
+    return RecoveryEntry(identity, attempt, possibly_live)
+
+
+def read_recovery(workspace: str | Path) -> tuple[str | None, RecoveryJournal | None]:
+    oid = read_ref_oid(workspace, RECOVERY_REF)
+    if oid is None:
+        return None, None
+    payload = _run(
+        ["git", f"--git-dir={git_common_dir(workspace)}", "cat-file", "blob", oid]
+    )
+    return oid, parse_recovery(payload)
+
+
+def cas_write_recovery(
+    workspace: str | Path,
+    expected_oid: str | None,
+    journal: RecoveryJournal | None,
+) -> str | None:
+    common = git_common_dir(workspace)
+    current = read_ref_oid(workspace, RECOVERY_REF)
+    if current != expected_oid:
+        raise ConcurrentUpdate("recovery journal changed during compare-and-swap")
+    expected = expected_oid or ("0" * 40)
+    if journal is None:
+        if expected_oid is None:
+            return None
+        command = ["git", f"--git-dir={common}", "update-ref", "-d", RECOVERY_REF, expected]
+        new_oid = None
+    else:
+        new_oid = _run(
+            ["git", f"--git-dir={common}", "hash-object", "-w", "--stdin"],
+            stdin=recovery_to_json(journal),
+        ).strip()
+        command = ["git", f"--git-dir={common}", "update-ref", RECOVERY_REF, new_oid, expected]
+    result = subprocess.run(command, text=True, capture_output=True, check=False)
+    if result.returncode:
+        raise ConcurrentUpdate("recovery journal changed during compare-and-swap")
+    return new_oid
+
+
+def _append_recovery(
+    workspace: str | Path, attempt: MutationAttempt
+) -> tuple[str, RecoveryEntry]:
+    oid, journal = read_recovery(workspace)
+    entry = RecoveryEntry(os.urandom(16).hex(), attempt)
+    updated = RecoveryJournal((journal.entries if journal is not None else ()) + (entry,))
+    new_oid = cas_write_recovery(workspace, oid, updated)
+    assert new_oid is not None
+    return new_oid, entry
+
+
+def _replace_recovery_entry(
+    workspace: str | Path,
+    expected_oid: str,
+    replacement: RecoveryEntry,
+) -> str:
+    oid, journal = read_recovery(workspace)
+    if oid != expected_oid or journal is None:
+        raise ConcurrentUpdate("recovery journal changed during compare-and-swap")
+    if sum(entry.identity == replacement.identity for entry in journal.entries) != 1:
+        raise ConcurrentUpdate("recovery entry changed during compare-and-swap")
+    entries = tuple(
+        replacement if entry.identity == replacement.identity else entry
+        for entry in journal.entries
+    )
+    new_oid = cas_write_recovery(workspace, oid, RecoveryJournal(entries))
+    assert new_oid is not None
+    return new_oid
+
+
+def _remove_recovery_entry(
+    workspace: str | Path, expected_oid: str, identity: str
+) -> str | None:
+    oid, journal = read_recovery(workspace)
+    if oid != expected_oid or journal is None:
+        raise ConcurrentUpdate("recovery journal changed during compare-and-swap")
+    if sum(entry.identity == identity for entry in journal.entries) != 1:
+        raise ConcurrentUpdate("recovery entry changed during compare-and-swap")
+    entries = tuple(entry for entry in journal.entries if entry.identity != identity)
+    return cas_write_recovery(
+        workspace, oid,
+        RecoveryJournal(entries)
+        if entries else None
+    )
+
+
 @contextmanager
 def repository_lock(workspace: str | Path) -> Iterator[None]:
     path = git_common_dir(workspace) / "jj-stack.lock"
@@ -2968,3 +3320,454 @@ def render(plan: SyncPlan) -> str:
         ),
     ]
     return "apply:\n" + "\n".join(f"  - {item}" for item in consequences)
+
+
+def push_exact_head_updates(
+    workspace: str | Path,
+    updates: Sequence[PlannedHeadUpdate],
+    push_url: str,
+) -> None:
+    """Compatibility entry point for direct adapter conformance tests."""
+    SubprocessGitTransport(workspace).push_exact_head_updates(push_url, updates)
+
+
+def _classify_attempt(
+    workspace: str | Path,
+    github: GitHubClient,
+    attempt: MutationAttempt,
+    git_transport: GitTransport | None = None,
+) -> str:
+    """Return applied/not-applied/foreign; read failures remain unresolved."""
+    git = git_transport or SubprocessGitTransport(workspace)
+    if isinstance(attempt, HeadMutationAttempt):
+        observed = git.observe_live_refs(
+            attempt.push_url,
+            attempt.repository,
+            tuple(update.ref.full_name for update in attempt.updates),
+        )
+        actual = tuple(item.commit_id for item in observed)
+        wanted = tuple(item.new_commit_id for item in attempt.updates)
+        old = tuple(item.expected_old_commit_id for item in attempt.updates)
+        if actual == wanted:
+            return "applied"
+        if actual == old:
+            return "not-applied"
+        return "foreign"
+    assert isinstance(attempt, MetadataMutationAttempt)
+    prs = github.pull_requests((attempt.update.pr_identity,))
+    if len(prs) != 1:
+        return "foreign"
+    metadata = (prs[0].title, prs[0].body)
+    if metadata == (attempt.update.title, attempt.update.body):
+        return "applied"
+    if metadata == (attempt.expected_title, attempt.expected_body):
+        return "not-applied"
+    return "foreign"
+
+
+def settle_recovery(
+    workspace: str | Path,
+    github: GitHubClient,
+    *,
+    dry_run: bool = False,
+    git_transport: GitTransport | None = None,
+) -> tuple[RecoveryEntry, ...]:
+    """Retire resolved facts and return only effects that can still conflict."""
+    oid, journal = read_recovery(workspace)
+    if journal is None:
+        return ()
+    remaining: list[RecoveryEntry] = []
+    applied_heads: list[HeadMutationAttempt] = []
+    for entry in journal.entries:
+        # Obligation effects are durable facts until the core receipt handoff.
+        # The generic driver, not legacy settlement, reconciles or retires them.
+        if not entry.possibly_live:
+            continue
+        try:
+            classification = _classify_attempt(
+                workspace, github, entry.attempt, git_transport
+            )
+        except Error:
+            remaining.append(entry)
+            continue
+        if classification != "applied":
+            remaining.append(entry)
+            continue
+        if isinstance(entry.attempt, HeadMutationAttempt):
+            applied_heads.append(entry.attempt)
+    if not dry_run:
+        for attempt in applied_heads:
+            _state_oid, current = read_state(workspace)
+            if (set(attempt.publications).issubset(current.last_published_heads)
+                    and set(attempt.boundaries).issubset(
+                        current.last_published_boundaries
+                    )):
+                # A later core handoff may have absorbed this exact head
+                # authority into newer membership before journal retirement.
+                # Never restore the attempt's deliberately provisional
+                # tracking over that committed result.
+                continue
+            _record_verified_state(
+                workspace,
+                attempt.tracking,
+                attempt.publications,
+                attempt.boundaries,
+            )
+        updated = tuple(remaining)
+        if updated != journal.entries:
+            cas_write_recovery(
+                workspace,
+                oid,
+                RecoveryJournal(updated)
+                if updated else None,
+            )
+    return tuple(remaining)
+
+
+def _attempt_conflicts_plan(entry: RecoveryEntry, plan: NoOp | Apply) -> bool:
+    attempt = entry.attempt
+    # Scope recovery to complete logical membership and all observed refs;
+    # omitted and merged members can still carry unresolved writes.
+    active_prs = {pr.identity for pr in plan.dependencies.prs}
+    if isinstance(attempt, MetadataMutationAttempt):
+        return attempt.update.pr_identity in active_prs
+    active_refs = {
+        item.ref
+        for item in plan.dependencies.live_heads + plan.dependencies.live_bases
+    } | {
+        RemoteBranchRef(plan.desired.repository, f"refs/heads/{pr.head_branch}")
+        for pr in plan.dependencies.prs
+    }
+    if isinstance(attempt, HeadMutationAttempt):
+        return bool(active_refs.intersection(update.ref for update in attempt.updates))
+    raise AssertionError(f"unhandled recovery attempt: {type(attempt).__name__}")
+
+
+def _plan_tracking(plan: NoOp | Apply) -> TrackedStack:
+    membership = plan.dependencies.membership
+    ordered = (
+        (membership.pr,)
+        if isinstance(membership, StandalonePullRequest)
+        else membership.ordered_prs
+    )
+    return TrackedStack(plan.desired.repository, plan.desired.base_branch, ordered)
+
+
+def _plan_publications(plan: Apply) -> tuple[LastPublishedHead, ...]:
+    prs_by_ref = {
+        RemoteBranchRef(plan.desired.repository, f"refs/heads/{pr.head_branch}"): pr
+        for pr in plan.dependencies.prs
+    }
+    return tuple(
+        LastPublishedHead(
+            prs_by_ref[update.ref].identity,
+            update.ref,
+            update.new_commit_id,
+        )
+        for update in plan.head_updates
+        if update.ref in prs_by_ref
+        and not any(boundary.ref == update.ref for boundary in plan.boundary_receipts)
+    )
+
+
+_UNSPECIFIED_OID = object()
+
+
+def _record_verified_state(
+    workspace: str | Path,
+    tracking: TrackedStack,
+    publications: tuple[LastPublishedHead, ...],
+    boundaries: tuple[LastPublishedBoundary, ...] = (),
+    *,
+    expected_oid: str | None | object = _UNSPECIFIED_OID,
+) -> bool:
+    state_oid, state = read_state(workspace)
+    if expected_oid is not _UNSPECIFIED_OID and state_oid != expected_oid:
+        raise ConcurrentUpdate("tracked state changed before receipt handoff")
+    members = set(tracking.ordered_prs)
+    stacks = tuple(
+        stack
+        for stack in state.stacks
+        if stack.repository != tracking.repository
+        or not members.intersection(stack.ordered_prs)
+    ) + (tracking,)
+    keys = {(item.pr, item.ref) for item in publications}
+    recorded_publications = tuple(
+        item
+        for item in state.last_published_heads
+        if (item.pr, item.ref) not in keys
+        and not any(
+            boundary.merged_pr == item.pr and boundary.ref == item.ref
+            for boundary in boundaries
+        )
+    ) + publications
+    recorded_adoptions = tuple(
+        item
+        for item in state.last_adopted_heads
+        if (item.pr, item.ref) not in keys
+    )
+    updated = TrackedState(
+        stacks,
+        recorded_publications,
+        recorded_adoptions,
+        state.detached_associations,
+        tuple(item for item in state.last_published_boundaries
+            if item.ref not in {boundary.ref for boundary in boundaries}) + boundaries,
+    )
+    if updated == state:
+        return False
+    cas_write_state(workspace, state_oid, updated)
+    return True
+
+
+def _revalidate_sync_dependencies(
+    workspace: str | Path, github: GitHubClient, plan: NoOp | Apply
+) -> None:
+    """Revalidate mutation authority immediately before journaling/sending."""
+    dependencies = plan.dependencies
+    state_oid, _state = read_state(workspace)
+    if state_oid != dependencies.state_blob_oid:
+        raise ConcurrentUpdate("tracked state changed since confirmation")
+    current_prs = github.pull_requests(tuple(pr.identity for pr in dependencies.prs))
+    if current_prs != dependencies.prs:
+        raise ConcurrentUpdate("pull request state or topology changed since confirmation")
+
+
+def apply(
+    plan: SyncPlan,
+    workspace: str | Path,
+    github: GitHubClient,
+    *,
+    dry_run: bool = False,
+    git_transport: GitTransport | None = None,
+) -> ApplyResult:
+    """Apply an existing complete stack; a later invocation recovers automatically."""
+    git = git_transport or SubprocessGitTransport(workspace)
+    if isinstance(plan, Blocked):
+        return Stopped("plan", "a blocked plan cannot be applied")
+    _oid, journal = read_recovery(workspace)
+    if dry_run:
+        try:
+            unresolved = settle_recovery(
+                workspace, github, dry_run=True, git_transport=git
+            )
+        except Error as exc:
+            return Stopped("recovery", str(exc))
+        if any(_attempt_conflicts_plan(entry, plan) for entry in unresolved):
+            return Stopped("recovery", "a conflicting mutation remains unresolved")
+        return Verified()
+    with repository_lock(workspace):
+        _locked_oid, locked_journal = read_recovery(workspace)
+        try:
+            unresolved = settle_recovery(
+                workspace, github, git_transport=git
+            )
+        except Error as exc:
+            return Stopped("recovery", str(exc))
+        if any(_attempt_conflicts_plan(entry, plan) for entry in unresolved):
+            return Stopped("recovery", "a conflicting mutation remains unresolved")
+        try:
+            _revalidate_sync_dependencies(workspace, github, plan)
+        except Error as exc:
+            return Stopped("revalidate", str(exc))
+        if isinstance(plan, NoOp):
+            try:
+                return Verified(
+                    state_recorded=_record_verified_state(
+                        workspace,
+                        _plan_tracking(plan),
+                        (),
+                        plan.boundary_receipts,
+                        expected_oid=plan.dependencies.state_blob_oid,
+                    )
+                )
+            except Error as exc:
+                return Stopped("receipt", str(exc))
+
+        head_published = False
+        metadata_updated = False
+        state_recorded = False
+        pending_journal_oid: str | None = None
+        pending_entry_identity: str | None = None
+        if plan.head_updates:
+            tracking = _plan_tracking(plan)
+            publications = _plan_publications(plan)
+            attempt = HeadMutationAttempt(
+                plan.desired.repository,
+                plan.dependencies.push_url,
+                plan.head_updates,
+                tracking,
+                publications,
+                tuple(
+                    boundary
+                    for boundary in plan.boundary_receipts
+                    if any(update.ref == boundary.ref for update in plan.head_updates)
+                ),
+            )
+            oid, entry = _append_recovery(workspace, attempt)
+            entry = RecoveryEntry(entry.identity, attempt, possibly_live=True)
+            oid = _replace_recovery_entry(
+                workspace,
+                oid,
+                entry,
+            )
+            try:
+                git.push_exact_head_updates(
+                    plan.dependencies.push_url, plan.head_updates
+                )
+            except GitPushError:
+                pass
+            try:
+                result = _classify_attempt(workspace, github, attempt, git)
+            except Error as exc:
+                return Stopped("heads", f"publication readback is unresolved: {exc}")
+            if result != "applied":
+                # A negative read after send cannot prove that the push will
+                # not land later. Keep the possibly-live exact attempt unless
+                # the transport conclusively rejected it before any effect.
+                return Stopped("heads", f"atomic publication was {result}")
+            head_published = True
+            try:
+                state_recorded = _record_verified_state(
+                    workspace,
+                    tracking,
+                    publications,
+                    plan.boundary_receipts,
+                    expected_oid=plan.dependencies.state_blob_oid,
+                )
+            except Error as exc:
+                return Stopped("receipt", str(exc))
+            try:
+                _remove_recovery_entry(workspace, oid, entry.identity)
+            except Error as exc:
+                return Stopped("recovery-retirement", str(exc))
+
+        old_prs = {pr.identity: pr for pr in plan.dependencies.prs}
+        for update in plan.metadata_updates:
+            if pending_journal_oid is not None:
+                assert pending_entry_identity is not None
+                _remove_recovery_entry(
+                    workspace, pending_journal_oid, pending_entry_identity
+                )
+                pending_journal_oid = None
+                pending_entry_identity = None
+            old = old_prs[update.pr_identity]
+            attempt = MetadataMutationAttempt(
+                plan.desired.repository, update, old.title, old.body
+            )
+            oid, entry = _append_recovery(workspace, attempt)
+            try:
+                before = _classify_attempt(workspace, github, attempt, git)
+            except Error as exc:
+                return Stopped("metadata", f"metadata preflight is unresolved: {exc}")
+            if before == "foreign":
+                _remove_recovery_entry(workspace, oid, entry.identity)
+                return Stopped("metadata", "metadata changed before mutation")
+            if before == "not-applied":
+                try:
+                    repository = github.resolve_repository(plan.desired.repository)
+                except Error as exc:
+                    return Stopped("metadata", f"metadata preflight is unresolved: {exc}")
+                entry = RecoveryEntry(entry.identity, attempt, possibly_live=True)
+                oid = _replace_recovery_entry(
+                    workspace,
+                    oid,
+                    entry,
+                )
+                try:
+                    github.update_pull_request(
+                        repository,
+                        update.pr_identity,
+                        title=update.title,
+                        body=update.body,
+                    )
+                except GitHubTransportError:
+                    pass
+                except GitHubHttpError:
+                    _remove_recovery_entry(workspace, oid, entry.identity)
+                    return Stopped("metadata", "metadata mutation was rejected")
+            try:
+                result = _classify_attempt(workspace, github, attempt, git)
+            except Error as exc:
+                return Stopped("metadata", f"metadata readback is unresolved: {exc}")
+            if result != "applied":
+                return Stopped(
+                    "metadata",
+                    "metadata mutation is unresolved"
+                    if result == "not-applied"
+                    else f"metadata mutation was {result}",
+                )
+            metadata_updated = True
+            pending_journal_oid = oid
+            pending_entry_identity = entry.identity
+        if not head_published:
+            try:
+                state_recorded = (
+                    _record_verified_state(
+                        workspace,
+                        _plan_tracking(plan),
+                        (),
+                        plan.boundary_receipts,
+                        expected_oid=plan.dependencies.state_blob_oid,
+                    )
+                    or state_recorded
+                )
+            except Error as exc:
+                return Stopped("receipt", str(exc))
+        if pending_journal_oid is not None:
+            assert pending_entry_identity is not None
+            try:
+                _remove_recovery_entry(
+                    workspace, pending_journal_oid, pending_entry_identity
+                )
+            except Error as exc:
+                return Stopped("recovery-retirement", str(exc))
+        return Verified(head_published, metadata_updated, state_recorded)
+
+
+def execute(
+    workspace: str | Path,
+    github: GitHubClient,
+    recompute: Callable[[], SyncPlan],
+    *,
+    confirm: Callable[[Apply], bool] | None = None,
+    dry_run: bool = False,
+    git_transport: GitTransport | None = None,
+) -> tuple[SyncPlan | None, ApplyResult]:
+    """Settle uncertainty, recompute from current inputs, then optionally apply.
+
+    Recovery precedes recomputation and confirmation: an effect authorized before a
+    crash is only read back, never reconfirmed or resent.
+    """
+    try:
+        with repository_lock(workspace):
+            settle_recovery(
+                workspace,
+                github,
+                dry_run=dry_run,
+                git_transport=git_transport,
+            )
+    except Error as exc:
+        return None, Stopped("recovery", str(exc))
+    try:
+        plan = recompute()
+    except Error as exc:
+        return None, Stopped("observe", str(exc))
+    if isinstance(plan, Apply) and confirm is not None and not confirm(plan):
+        return plan, Stopped("confirmation", "application was not confirmed")
+    if isinstance(plan, Apply) and confirm is not None and not dry_run:
+        try:
+            current = recompute()
+        except Error as exc:
+            return plan, Stopped("revalidate", str(exc))
+        if current != plan:
+            return plan, Stopped(
+                "revalidate", "authority-bearing facts changed during confirmation"
+            )
+    return plan, apply(
+        plan,
+        workspace,
+        github,
+        dry_run=dry_run,
+        git_transport=git_transport,
+    )

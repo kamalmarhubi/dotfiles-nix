@@ -928,3 +928,134 @@ class FakeGitHubClient:
             None,
             lambda: self._server.apply_unstack(repository, identity),
         )
+
+
+@dataclass
+class _GitWriteFault:
+    kind: str
+    method: _Mutation
+    pending: PendingRequest | None = None
+    consumed: bool = False
+
+
+class FakeGitTransport:
+    """Git transport sharing the fake server's authoritative remote refs."""
+
+    _MUTATIONS = {
+        sync.GitTransport.push_exact_head_updates,
+        sync.GitTransport.push_absent_heads,
+    }
+
+    def __init__(self, server: FakeGitHubServer) -> None:
+        self._server = server
+        self._write_fault: _GitWriteFault | None = None
+        self._read_override: FakeGitHubServer | str | None = None
+
+    @contextmanager
+    def fail_before(self, method: _Mutation) -> Iterator[None]:
+        with self._fault(_GitWriteFault("before", method)):
+            yield
+
+    @contextmanager
+    def lose_response(self, method: _Mutation) -> Iterator[None]:
+        with self._fault(_GitWriteFault("after", method)):
+            yield
+
+    @contextmanager
+    def hold_next(self, method: _Mutation) -> Iterator[PendingRequest]:
+        pending = PendingRequest()
+        with self._fault(_GitWriteFault("hold", method, pending)):
+            yield pending
+
+    @contextmanager
+    def stale_reads(
+        self, snapshot: FakeGitHubServer | None = None
+    ) -> Iterator[None]:
+        frozen = self._server.snapshot() if snapshot is None else snapshot.snapshot()
+        with self._reads_from(frozen):
+            yield
+
+    @contextmanager
+    def unavailable_reads(self) -> Iterator[None]:
+        with self._reads_from("unavailable"):
+            yield
+
+    @contextmanager
+    def _fault(self, fault: _GitWriteFault) -> Iterator[None]:
+        if fault.method not in self._MUTATIONS:
+            raise ValueError(f"unknown Git mutation {fault.method.__name__}")
+        if self._write_fault is not None:
+            raise ValueError("a Git write fault is already active")
+        self._write_fault = fault
+        try:
+            yield
+            if not fault.consumed:
+                raise AssertionError("configured Git write fault was not exercised")
+        finally:
+            if self._write_fault is fault:
+                self._write_fault = None
+
+    @contextmanager
+    def _reads_from(self, source: FakeGitHubServer | str) -> Iterator[None]:
+        if self._read_override is not None:
+            raise ValueError("a Git read fault is already active")
+        self._read_override = source
+        try:
+            yield
+        finally:
+            self._read_override = None
+
+    def _reader(self) -> FakeGitHubServer:
+        if self._read_override == "unavailable":
+            raise sync.SourceUnavailable("injected remote-ref read failure")
+        return self._server if self._read_override is None else self._read_override
+
+    def _mutation(self, method: _Mutation, invoke: Callable[[], None]) -> None:
+        fault = self._write_fault
+        if fault is None or fault.consumed or fault.method != method:
+            invoke()
+            return
+        fault.consumed = True
+        if fault.kind == "before":
+            raise sync.GitPushError("injected pre-send failure")
+        if fault.kind == "hold":
+            assert fault.pending is not None
+            fault.pending._capture(invoke)
+            raise sync.GitPushError("injected held request")
+        invoke()
+        raise sync.GitPushError("injected lost response")
+
+    def observe_live_refs(
+        self,
+        push_url: str,
+        repository: sync.GitHubRepositoryId,
+        full_names: Sequence[str],
+    ) -> tuple[sync.LiveRemoteRef, ...]:
+        return self._reader().observe_live_refs(
+            push_url, repository, tuple(full_names)
+        )
+
+    def push_exact_head_updates(
+        self,
+        push_url: str,
+        updates: Sequence[sync.PlannedHeadUpdate],
+    ) -> None:
+        selected = tuple(updates)
+        self._mutation(
+            sync.GitTransport.push_exact_head_updates,
+            lambda: self._server.apply_exact_head_updates(push_url, selected),
+        )
+
+    def push_absent_heads(
+        self,
+        push_url: str,
+        repository: sync.GitHubRepositoryId,
+        goals: Sequence[sync.NewPullRequestGoal],
+    ) -> None:
+        selected = tuple(goals)
+        self._mutation(
+            sync.GitTransport.push_absent_heads,
+            lambda: self._server.apply_absent_heads(
+                push_url, repository, selected
+            ),
+        )
