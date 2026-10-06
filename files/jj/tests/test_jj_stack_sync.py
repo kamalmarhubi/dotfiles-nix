@@ -1333,6 +1333,126 @@ def stacked_snapshot(
     return observed, sync.StackSelection("main", tuple(assignments))
 
 
+def remote_restack_snapshots() -> tuple[sync.Snapshot, sync.Snapshot]:
+    before, _selection = stacked_snapshot(count=2)
+    old_ids = tuple(pr.head_oid for pr in before.pull_requests)
+    new_ids = ("3" * 40, "4" * 40)
+    base = "b" * 40
+    tracked = sync.TrackedStack(
+        before.repository,
+        "main",
+        tuple(pr.identity for pr in before.pull_requests),
+    )
+    boundary = sync.LastPublishedBoundary(
+        before.pull_requests[0].identity,
+        sync.RemoteBranchRef(before.repository, "refs/heads/main"),
+        base,
+    )
+    state = sync.TrackedState((tracked,), (), last_published_boundaries=(boundary,))
+    pull_requests = tuple(
+        dataclasses.replace(
+            pr,
+            head_oid=new_ids[index],
+            base_oid=base if index == 0 else new_ids[index - 1],
+        )
+        for index, pr in enumerate(before.pull_requests)
+    )
+    live_refs = tuple(
+        dataclasses.replace(ref, commit_id=new_ids[index])
+        if ref.ref.full_name == f"refs/heads/topic-{index + 1}"
+        else ref
+        for ref in before.live_refs
+        for index in range(2)
+        if ref.ref.full_name
+        in {"refs/heads/main", f"refs/heads/topic-{index + 1}"}
+    )
+    live_refs = tuple(dict((ref.ref, ref) for ref in live_refs).values())
+    remote_bookmarks = tuple(
+        sync.JjRemoteBookmark(
+            "origin",
+            f"topic-{index + 1}",
+            sync.CommitTarget(old_ids[index]),
+            sync.TrackingState.TRACKED,
+        )
+        for index in range(2)
+    )
+    before = dataclasses.replace(
+        before,
+        tool_state=sync.ToolStateRead(None, state, None),
+        pull_requests=pull_requests,
+        live_refs=live_refs,
+        local=dataclasses.replace(
+            before.local,
+            workspace_targets=(*before.local.workspace_targets, ("unrelated", base)),
+            remote_bookmarks=remote_bookmarks,
+        ),
+    )
+    old_commits = tuple(
+        dataclasses.replace(commit, is_hidden=True) for commit in before.local.commits
+    )
+    new_commits = tuple(
+        sync.ObservedCommit(
+            new_ids[index],
+            (base if index == 0 else new_ids[index - 1],),
+            before.local.commits[index].change_id,
+            before.local.commits[index].description,
+            False,
+            False,
+        )
+        for index in range(2)
+    )
+    after = dataclasses.replace(
+        before,
+        local=dataclasses.replace(
+            before.local,
+            operation_id="after-fetch",
+            workspace_targets=(("default", new_ids[-1]), ("unrelated", base)),
+            local_bookmarks=tuple(
+                sync.LocalBookmark(
+                    f"topic-{index + 1}", sync.CommitTarget(new_ids[index])
+                )
+                for index in range(2)
+            ),
+            remote_bookmarks=tuple(
+                dataclasses.replace(
+                    bookmark, target=sync.CommitTarget(new_ids[index])
+                )
+                for index, bookmark in enumerate(remote_bookmarks)
+            ),
+            commits=(*new_commits, *old_commits),
+        ),
+    )
+    return before, after
+
+
+def prove_remote_restack(monkeypatch, *, mismatch: str | None = None) -> None:
+    base = "b" * 40
+    segments = {
+        (base, "1" * 40): ("1" * 40,),
+        ("1" * 40, "2" * 40): ("2" * 40,),
+        (base, "3" * 40): ("3" * 40,),
+        ("3" * 40, "4" * 40): ("4" * 40,),
+    }
+    fingerprints = {
+        "1" * 40: ("change-1", "patch-1"),
+        "2" * 40: ("change-2", "patch-2"),
+        "3" * 40: (
+            "different" if mismatch == "change" else "change-1",
+            "patch-1",
+        ),
+        "4" * 40: (
+            "change-2",
+            "different" if mismatch == "patch" else "patch-2",
+        ),
+    }
+    monkeypatch.setattr(
+        sync, "_linear_segment", lambda _git_dir, start, end: segments[(start, end)]
+    )
+    monkeypatch.setattr(
+        sync, "_commit_fingerprint", lambda _git_dir, commit: fingerprints[commit]
+    )
+
+
 @pytest.mark.parametrize("count", (2, 3))
 def test_multi_pr_planner_aggregates_complete_unchanged_topology(count: int) -> None:
     observed, selected = stacked_snapshot(count=count)
@@ -1947,6 +2067,524 @@ def test_observations_are_deeply_immutable() -> None:
     with pytest.raises(dataclasses.FrozenInstanceError):
         observed.local.operation_id = "other"  # type: ignore[misc]
     assert isinstance(observed.live_refs, tuple)
+
+
+def test_remote_restack_adoption_fetches_exact_branches_and_records_authority(
+    jj_repo: Path, monkeypatch
+) -> None:
+    before, after = remote_restack_snapshots()
+    oid = sync.cas_write_state(jj_repo, None, before.tool_state.state)
+    before = dataclasses.replace(
+        before, tool_state=dataclasses.replace(before.tool_state, state_blob_oid=oid)
+    )
+    after = dataclasses.replace(
+        after, tool_state=dataclasses.replace(after.tool_state, state_blob_oid=oid)
+    )
+    plan = sync.plan_remote_restack_adoption(before)
+    assert isinstance(plan, sync.RemoteRestackAdoption)
+    observations = iter((before, after))
+    monkeypatch.setattr(
+        sync, "_observe_adoption", lambda *_args, **_kwargs: next(observations)
+    )
+    prove_remote_restack(monkeypatch)
+    commands: list[list[str]] = []
+    original_run = sync.subprocess.run
+
+    def run_fetch(command, **kwargs):
+        if command[:3] == ["jj", "git", "fetch"]:
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return original_run(command, **kwargs)
+
+    monkeypatch.setattr(sync.subprocess, "run", run_fetch)
+    _server, github = fake_github(before)
+
+    result = sync.adopt_remote_restack(plan, jj_repo, github)
+
+    receipts = tuple(
+        sync.LastAdoptedHead(
+            boundary.pr_identity,
+            sync.RemoteBranchRef(
+                before.repository, f"refs/heads/{boundary.branch}"
+            ),
+            boundary.remote_commit_id,
+        )
+        for boundary in plan.boundaries
+    )
+    assert result == sync.AdoptionVerified(receipts)
+    assert commands == [
+        [
+            "jj",
+            "git",
+            "fetch",
+            "--remote",
+            "origin",
+            "--branch",
+            "topic-1",
+            "--branch",
+            "topic-2",
+        ]
+    ]
+    assert sync.read_state(jj_repo)[1] == sync.TrackedState(
+        before.tool_state.state.stacks, (), receipts,
+        last_published_boundaries=before.tool_state.state.last_published_boundaries,
+    )
+
+
+def test_remote_restack_without_prefetch_base_evidence_blocks_before_fetch(
+    jj_repo: Path, monkeypatch
+) -> None:
+    before, _after = remote_restack_snapshots()
+    before = dataclasses.replace(
+        before,
+        tool_state=dataclasses.replace(
+            before.tool_state,
+            state=dataclasses.replace(
+                before.tool_state.state, last_published_boundaries=()
+            ),
+        ),
+    )
+    fetched = False
+
+    def reject_fetch(command, **kwargs):
+        nonlocal fetched
+        if command[:3] == ["jj", "git", "fetch"]:
+            fetched = True
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(sync.subprocess, "run", reject_fetch)
+
+    plan = sync.plan_remote_restack_adoption(before)
+
+    assert isinstance(plan, sync.Blocked)
+    assert plan.reasons[0].code == "boundary-unavailable"
+    assert not fetched
+
+
+def test_remote_restack_does_not_record_authority_after_stale_state_cas(
+    jj_repo: Path, monkeypatch
+) -> None:
+    before, after = remote_restack_snapshots()
+    oid = sync.cas_write_state(jj_repo, None, before.tool_state.state)
+    before = dataclasses.replace(
+        before, tool_state=dataclasses.replace(before.tool_state, state_blob_oid=oid)
+    )
+    after = dataclasses.replace(
+        after, tool_state=dataclasses.replace(after.tool_state, state_blob_oid=oid)
+    )
+    plan = sync.plan_remote_restack_adoption(before)
+    assert isinstance(plan, sync.RemoteRestackAdoption)
+    prove_remote_restack(monkeypatch)
+    observations = iter((before, after))
+
+    def observe(*_args, **_kwargs):
+        result = next(observations)
+        if result is after:
+            sync.cas_write_state(
+                jj_repo,
+                oid,
+                sync.TrackedState(
+                    before.tool_state.state.stacks,
+                    (
+                        sync.LastPublishedHead(
+                            before.pull_requests[0].identity,
+                            sync.RemoteBranchRef(
+                                before.repository, "refs/heads/unrelated"
+                            ),
+                            "9" * 40,
+                        ),
+                    ),
+                ),
+            )
+        return result
+
+    monkeypatch.setattr(sync, "_observe_adoption", observe)
+    original_run = sync.subprocess.run
+    monkeypatch.setattr(
+        sync.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, "", "")
+        if command[:3] == ["jj", "git", "fetch"]
+        else original_run(command, **kwargs),
+    )
+    _server, github = fake_github(before)
+
+    result = sync.adopt_remote_restack(plan, jj_repo, github)
+
+    assert isinstance(result, sync.Stopped)
+    assert result.stage == "adoption"
+    assert sync.read_state(jj_repo)[1].last_adopted_heads == ()
+
+
+@pytest.mark.parametrize("mismatch", ("change", "patch"))
+def test_remote_restack_requires_both_ordered_change_and_patch_identity(
+    mismatch: str, monkeypatch
+) -> None:
+    before, after = remote_restack_snapshots()
+    plan = sync.plan_remote_restack_adoption(before)
+    assert isinstance(plan, sync.RemoteRestackAdoption)
+    prove_remote_restack(monkeypatch, mismatch=mismatch)
+
+    assert sync._verify_adoption(before, after, plan) == (
+        "ordered change IDs or patch IDs differ for topic-1"
+        if mismatch == "change"
+        else "ordered change IDs or patch IDs differ for topic-2"
+    )
+
+
+def test_restack_fingerprint_survives_a_real_jj_rebase(jj_repo: Path) -> None:
+    old = jj(jj_repo, "log", "-r", "topic", "--no-graph", "-T", "commit_id")
+    jj(jj_repo, "new", "root()")
+    (jj_repo / "base").write_text("new base\n")
+    jj(jj_repo, "describe", "-m", "New base")
+    base = jj(jj_repo, "log", "-r", "@", "--no-graph", "-T", "commit_id")
+    jj(jj_repo, "rebase", "-b", "topic", "-d", base)
+    new = jj(jj_repo, "log", "-r", "topic", "--no-graph", "-T", "commit_id")
+
+    assert new != old
+    assert sync._commit_fingerprint(sync.git_common_dir(jj_repo), old) == (
+        sync._commit_fingerprint(sync.git_common_dir(jj_repo), new)
+    )
+
+
+def test_real_asymmetric_multicommit_restack_uses_each_graphs_seam(
+    jj_repo: Path,
+) -> None:
+    jj(jj_repo, "new", "root()")
+    (jj_repo / "old-main").write_text("old main\n")
+    jj(jj_repo, "describe", "-m", "Old main")
+    old_seam = jj(jj_repo, "log", "-r", "@", "--no-graph", "-T", "commit_id")
+    jj(jj_repo, "rebase", "-b", "topic", "-d", old_seam)
+    first_topic = jj(jj_repo, "log", "-r", "topic", "--no-graph", "-T", "commit_id")
+    jj(jj_repo, "new", "topic")
+    (jj_repo / "second").write_text("second\n")
+    jj(jj_repo, "describe", "-m", "Second topic commit")
+    jj(jj_repo, "bookmark", "set", "topic", "-r", "@")
+    old_head = jj(jj_repo, "log", "-r", "topic", "--no-graph", "-T", "commit_id")
+    jj(jj_repo, "new", "root()")
+    (jj_repo / "advanced-main").write_text("advanced\n")
+    jj(jj_repo, "describe", "-m", "Advanced main")
+    new_seam = jj(jj_repo, "log", "-r", "@", "--no-graph", "-T", "commit_id")
+    jj(jj_repo, "rebase", "-s", first_topic, "-d", new_seam)
+    new_head = jj(jj_repo, "log", "-r", "topic", "--no-graph", "-T", "commit_id")
+    git_dir = sync.git_common_dir(jj_repo)
+
+    old_segment = sync._linear_segment(git_dir, old_seam, old_head)
+    new_segment = sync._linear_segment(git_dir, new_seam, new_head)
+
+    assert len(old_segment) == len(new_segment) == 2
+    assert [sync._commit_fingerprint(git_dir, oid) for oid in old_segment] == [
+        sync._commit_fingerprint(git_dir, oid) for oid in new_segment
+    ]
+
+
+def test_adoption_state_interruption_recovers_old_oid_authority(
+    jj_repo: Path, monkeypatch
+) -> None:
+    before, after = remote_restack_snapshots()
+    oid = sync.cas_write_state(jj_repo, None, before.tool_state.state)
+    before = dataclasses.replace(
+        before, tool_state=dataclasses.replace(before.tool_state, state_blob_oid=oid)
+    )
+    after = dataclasses.replace(
+        after, tool_state=dataclasses.replace(after.tool_state, state_blob_oid=oid)
+    )
+    plan = sync.plan_remote_restack_adoption(before)
+    assert isinstance(plan, sync.RemoteRestackAdoption)
+    observations = iter((before, after, after))
+    monkeypatch.setattr(sync, "_observe_adoption", lambda *_a, **_k: next(observations))
+    prove_remote_restack(monkeypatch)
+    original_run = sync.subprocess.run
+    monkeypatch.setattr(
+        sync.subprocess, "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, "", "")
+        if command[:3] == ["jj", "git", "fetch"]
+        else original_run(command, **kwargs),
+    )
+    original_record = sync._record_adoptions
+    calls = 0
+
+    def interrupted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sync.Error("simulated state interruption")
+        return original_record(*args, **kwargs)
+
+    monkeypatch.setattr(sync, "_record_adoptions", interrupted)
+    _server, github = fake_github(before)
+
+    first = sync.adopt_remote_restack(plan, jj_repo, github)
+    assert isinstance(first, sync.Stopped)
+    _journal_oid, journal = sync.read_recovery(jj_repo)
+    assert journal is not None
+    attempt = journal.entries[0].attempt
+    assert isinstance(attempt, sync.AdoptionAttempt)
+    assert tuple(item.old_commit_id for item in attempt.boundaries) == ("1" * 40, "2" * 40)
+
+    second = sync.adopt_remote_restack(plan, jj_repo, github)
+    assert isinstance(second, sync.AdoptionVerified)
+    assert {item.verified_commit_id for item in second.adopted_heads} == {"3" * 40, "4" * 40}
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_adoption_retry_retires_attempt_after_exact_receipts_were_persisted(
+    jj_repo: Path, monkeypatch
+) -> None:
+    before, after = remote_restack_snapshots()
+    oid = sync.cas_write_state(jj_repo, None, before.tool_state.state)
+    before = dataclasses.replace(
+        before, tool_state=dataclasses.replace(before.tool_state, state_blob_oid=oid)
+    )
+    after = dataclasses.replace(
+        after, tool_state=dataclasses.replace(after.tool_state, state_blob_oid=oid)
+    )
+    plan = sync.plan_remote_restack_adoption(before)
+    assert isinstance(plan, sync.RemoteRestackAdoption)
+    observations = 0
+
+    def observe(*_args, **_kwargs):
+        nonlocal observations
+        observations += 1
+        if observations == 1:
+            return before
+        if observations == 2:
+            return after
+        state_oid, state = sync.read_state(jj_repo)
+        return dataclasses.replace(
+            after,
+            tool_state=sync.ToolStateRead(state_oid, state, None),
+        )
+
+    monkeypatch.setattr(sync, "_observe_adoption", observe)
+    prove_remote_restack(monkeypatch)
+    original_run = sync.subprocess.run
+    monkeypatch.setattr(
+        sync.subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, "", "")
+        if command[:3] == ["jj", "git", "fetch"]
+        else original_run(command, **kwargs),
+    )
+    remove = sync._remove_recovery_entry
+    interrupted = True
+
+    def interrupt_after_receipt(*args, **kwargs):
+        nonlocal interrupted
+        if interrupted:
+            interrupted = False
+            raise sync.Error("simulated interruption after receipt")
+        return remove(*args, **kwargs)
+
+    monkeypatch.setattr(sync, "_remove_recovery_entry", interrupt_after_receipt)
+    _server, github = fake_github(before)
+
+    first = sync.adopt_remote_restack(plan, jj_repo, github)
+    state_after_first = sync.read_state(jj_repo)
+    second = sync.adopt_remote_restack(plan, jj_repo, github)
+
+    assert isinstance(first, sync.Stopped)
+    assert isinstance(second, sync.AdoptionVerified)
+    assert sync.read_state(jj_repo) == state_after_first
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_remote_restack_rejects_partial_and_mixed_movement() -> None:
+    before, _after = remote_restack_snapshots()
+    old_second = "2" * 40
+    partial = dataclasses.replace(
+        before,
+        pull_requests=(
+            before.pull_requests[0],
+            dataclasses.replace(before.pull_requests[1], head_oid=old_second),
+        ),
+        live_refs=tuple(
+            dataclasses.replace(ref, commit_id=old_second)
+            if ref.ref.full_name == "refs/heads/topic-2"
+            else ref
+            for ref in before.live_refs
+        ),
+    )
+    mixed = dataclasses.replace(
+        before,
+        local=dataclasses.replace(
+            before.local,
+            local_bookmarks=(
+                dataclasses.replace(
+                    before.local.local_bookmarks[0], target=sync.CommitTarget("9" * 40)
+                ),
+                *before.local.local_bookmarks[1:],
+            ),
+        ),
+    )
+
+    partial_plan = sync.plan_remote_restack_adoption(partial)
+    mixed_plan = sync.plan_remote_restack_adoption(mixed)
+    assert isinstance(partial_plan, sync.Blocked)
+    assert partial_plan.reasons[0].code == "partial-restack"
+    assert isinstance(mixed_plan, sync.Blocked)
+    assert mixed_plan.reasons[0].code == "mixed-movement"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("old-visible", "superseded commit remains visible or absent for topic-1"),
+        ("new-hidden", "adopted commit is hidden, absent, or conflicted for topic-1"),
+        ("new-conflicted", "adopted commit is hidden, absent, or conflicted for topic-1"),
+        ("bookmark", "canonical PR/ref or bookmark state disagrees for topic-1"),
+        ("workspace", "workspace default did not move to the unique adopted change"),
+    ),
+)
+def test_remote_restack_verifies_complete_poststate(
+    mutation: str, message: str, monkeypatch
+) -> None:
+    before, after = remote_restack_snapshots()
+    plan = sync.plan_remote_restack_adoption(before)
+    assert isinstance(plan, sync.RemoteRestackAdoption)
+    prove_remote_restack(monkeypatch)
+    commits = list(after.local.commits)
+    bookmarks = list(after.local.local_bookmarks)
+    workspaces = after.local.workspace_targets
+    if mutation == "old-visible":
+        commits[2] = dataclasses.replace(commits[2], is_hidden=False)
+    elif mutation == "new-hidden":
+        commits[0] = dataclasses.replace(commits[0], is_hidden=True)
+    elif mutation == "new-conflicted":
+        commits[0] = dataclasses.replace(commits[0], has_conflicts=True)
+    elif mutation == "bookmark":
+        bookmarks[0] = dataclasses.replace(
+            bookmarks[0], target=sync.CommitTarget("9" * 40)
+        )
+    else:
+        workspaces = (("default", "9" * 40), ("unrelated", "b" * 40))
+    after = dataclasses.replace(
+        after,
+        local=dataclasses.replace(
+            after.local,
+            commits=tuple(commits),
+            local_bookmarks=tuple(bookmarks),
+            workspace_targets=workspaces,
+        ),
+    )
+
+    assert sync._verify_adoption(before, after, plan) == message
+
+
+def test_remote_restack_ignores_main_movement_and_unrelated_workspace(
+    monkeypatch,
+) -> None:
+    before, after = remote_restack_snapshots()
+    plan = sync.plan_remote_restack_adoption(before)
+    assert isinstance(plan, sync.RemoteRestackAdoption)
+    prove_remote_restack(monkeypatch)
+    after = dataclasses.replace(
+        after,
+        live_refs=tuple(
+            dataclasses.replace(ref, commit_id="9" * 40)
+            if ref.ref.full_name == "refs/heads/main"
+            else ref
+            for ref in after.live_refs
+        ),
+    )
+
+    assert sync._verify_adoption(before, after, plan) is None
+
+
+def test_adopted_head_is_distinct_exact_replacement_authority() -> None:
+    observed, pr = snapshot(desired="3" * 40, live="2" * 40, parent="0" * 40)
+    ref = sync.RemoteBranchRef(observed.repository, "refs/heads/topic")
+    receipt = sync.LastAdoptedHead(pr, ref, "2" * 40)
+    observed = dataclasses.replace(
+        observed,
+        tool_state=dataclasses.replace(
+            observed.tool_state,
+            state=sync.TrackedState((), (), (receipt,)),
+        ),
+    )
+
+    plan = sync.plan_sync(
+        observed, sync.derive_desired(observed, selection(observed, pr))
+    )
+    assert isinstance(plan, sync.Apply)
+    assert plan.head_updates[0].authority == sync.MatchesLastAdoption(receipt)
+
+    stale = dataclasses.replace(receipt, verified_commit_id="8" * 40)
+    blocked_observation = dataclasses.replace(
+        observed,
+        tool_state=dataclasses.replace(
+            observed.tool_state, state=sync.TrackedState((), (), (stale,))
+        ),
+    )
+    blocked = sync.plan_sync(
+        blocked_observation,
+        sync.derive_desired(blocked_observation, selection(blocked_observation, pr)),
+    )
+    assert isinstance(blocked, sync.Blocked)
+
+
+def test_verified_publication_supersedes_adopted_authority(jj_repo: Path) -> None:
+    _observed, plan = head_plan()
+    tracking = sync._plan_tracking(plan)
+    publication = sync._plan_publications(plan)[0]
+    adoption = sync.LastAdoptedHead(
+        publication.pr,
+        publication.ref,
+        plan.head_updates[0].expected_old_commit_id,
+    )
+    sync.cas_write_state(
+        jj_repo, None, sync.TrackedState((tracking,), (), (adoption,))
+    )
+
+    assert sync._record_verified_state(
+        jj_repo, tracking, (publication,)
+    )
+
+    state = sync.read_state(jj_repo)[1]
+    assert state.last_published_heads == (publication,)
+    assert state.last_adopted_heads == ()
+
+    with pytest.raises(ValueError, match="ambiguous head authority"):
+        sync._validate_state(
+            sync.TrackedState(
+                (tracking,),
+                (publication,),
+                (
+                    sync.LastAdoptedHead(
+                        publication.pr,
+                        publication.ref,
+                        publication.verified_commit_id,
+                    ),
+                ),
+            )
+        )
+
+
+def test_remote_restack_dry_run_does_not_fetch_or_record(
+    jj_repo: Path, monkeypatch
+) -> None:
+    before, _after = remote_restack_snapshots()
+    plan = sync.plan_remote_restack_adoption(before)
+    assert isinstance(plan, sync.RemoteRestackAdoption)
+    monkeypatch.setattr(
+        sync,
+        "_observe_adoption",
+        lambda *_args, **_kwargs: before,
+    )
+    original_run = sync.subprocess.run
+
+    def reject_fetch(command, **kwargs):
+        if command[:3] == ["jj", "git", "fetch"]:
+            pytest.fail("dry-run fetched")
+        return original_run(command, **kwargs)
+
+    monkeypatch.setattr(sync.subprocess, "run", reject_fetch)
+    _server, github = fake_github(before)
+
+    assert sync.adopt_remote_restack(
+        plan, jj_repo, github, dry_run=True
+    ) == sync.AdoptionVerified(())
+    assert sync.read_state(jj_repo) == (None, sync.EMPTY_STATE)
 
 
 def test_noop_records_membership_without_manufacturing_publication_authority(

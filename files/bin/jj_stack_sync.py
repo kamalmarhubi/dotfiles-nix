@@ -659,6 +659,29 @@ Authority = (
 
 
 @dataclass(frozen=True)
+class RemoteRestackBoundary:
+    pr_identity: PullRequestId
+    branch: str
+    old_seam_commit_id: str
+    new_seam_commit_id: str
+    old_commit_id: str
+    remote_commit_id: str
+
+
+@dataclass(frozen=True)
+class RemoteRestackAdoption:
+    repository: GitHubRepositoryId
+    remote: str
+    state_blob_oid: str | None
+    boundaries: tuple[RemoteRestackBoundary, ...]
+
+
+@dataclass(frozen=True)
+class AdoptionVerified:
+    adopted_heads: tuple[LastAdoptedHead, ...]
+
+
+@dataclass(frozen=True)
 class PlannedHeadUpdate:
     ref: RemoteBranchRef
     expected_old_commit_id: str
@@ -754,9 +777,22 @@ class MetadataMutationAttempt:
             raise ValueError("metadata mutation belongs to another repository")
 
 
+@dataclass(frozen=True)
+class AdoptionAttempt:
+    repository: GitHubRepositoryId
+    remote: str
+    state_blob_oid: str | None
+    boundaries: tuple[RemoteRestackBoundary, ...]
+
+    def __post_init__(self) -> None:
+        if not self.remote or not self.boundaries:
+            raise ValueError("adoption attempt must be nonempty")
+
+
 MutationAttempt = (
     HeadMutationAttempt
     | MetadataMutationAttempt
+    | AdoptionAttempt
 )
 
 
@@ -2562,6 +2598,13 @@ def _recovery_entry_to_dict(entry: RecoveryEntry) -> dict[str, object]:
             "expected_title": attempt.expected_title,
             "expected_body": attempt.expected_body,
         }
+    elif isinstance(attempt, AdoptionAttempt):
+        payload = {"kind": "adoption", "identity": entry.identity,
+            "possibly_live": entry.possibly_live, "repository": asdict(attempt.repository),
+            "remote": attempt.remote, "state_blob_oid": attempt.state_blob_oid,
+            "boundaries": [{"pr": x.pr_identity.number, "branch": x.branch,
+                "old_seam": x.old_seam_commit_id, "new_seam": x.new_seam_commit_id,
+                "old": x.old_commit_id, "new": x.remote_commit_id} for x in attempt.boundaries]}
     else:
         raise ValueError("unknown recovery attempt")
     return payload
@@ -2590,6 +2633,8 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
         else common_fields
         | {"pr", "title", "body", "expected_title", "expected_body"}
         if kind == "metadata"
+        else common_fields | {"remote", "state_blob_oid", "boundaries"}
+        if kind == "adoption"
         else None
     )
     if expected_fields is None or set(raw) != expected_fields:
@@ -2609,7 +2654,25 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
     possibly_live = raw["possibly_live"]
     if not isinstance(possibly_live, bool):
         raise ValueError("possibly_live must be a boolean")
-    if kind == "heads":
+    if kind == "adoption":
+        boundaries_raw = raw["boundaries"]
+        if not isinstance(raw["remote"], str) or not isinstance(boundaries_raw, list):
+            raise ValueError("adoption attempt is malformed")
+        if raw["state_blob_oid"] is not None and not isinstance(raw["state_blob_oid"], str):
+            raise ValueError("adoption state OID is malformed")
+        fields = {"pr", "branch", "old_seam", "new_seam", "old", "new"}
+        boundaries = []
+        for value in boundaries_raw:
+            if not isinstance(value, dict) or set(value) != fields:
+                raise ValueError("adoption boundary is malformed")
+            boundaries.append(RemoteRestackBoundary(
+                PullRequestId(repository, value["pr"]), value["branch"],
+                value["old_seam"], value["new_seam"], value["old"], value["new"]
+            ))
+        attempt = AdoptionAttempt(
+            repository, raw["remote"], raw["state_blob_oid"], tuple(boundaries)
+        )
+    elif kind == "heads":
         updates_raw = raw["updates"]
         if not isinstance(updates_raw, list):
             raise ValueError("head updates must be an array")
@@ -3213,18 +3276,30 @@ def _plan_publication(
         and item.ref == head.ref
         and item.verified_commit_id == head.commit_id
     )
-    if len(publications) != 1:
+    adoptions = tuple(
+        item
+        for item in snapshot.tool_state.state.last_adopted_heads
+        if item.pr == wanted.pr_identity
+        and item.ref == head.ref
+        and item.verified_commit_id == head.commit_id
+    )
+    if len(publications) + len(adoptions) != 1:
         return _block(
             "replacement-unauthorized",
             head.ref.full_name,
-            "live head is neither an ancestor nor one unambiguous last publication",
+            "live head is neither an ancestor nor one unambiguous verified authority",
         )
+    authority: Authority = (
+        MatchesLastPublication(publications[0])
+        if publications
+        else MatchesLastAdoption(adoptions[0])
+    )
     return (
         PlannedHeadUpdate(
             head.ref,
             head.commit_id,
             wanted.desired_commit_id,
-            MatchesLastPublication(publications[0]),
+            authority,
         ),
     )
 
@@ -3255,6 +3330,144 @@ def _one_bookmark_target(
     if len(values) != 1 or not isinstance(values[0], CommitTarget):
         return None
     return values[0].commit_id
+
+
+def plan_remote_restack_adoption(snapshot: Snapshot) -> RemoteRestackAdoption | Blocked:
+    """Recognize an externally moved, already-tracked complete stack."""
+    membership = tuple(pr.identity for pr in snapshot.pull_requests)
+    tracked = tuple(
+        stack
+        for stack in snapshot.tool_state.state.stacks
+        if stack.repository == snapshot.repository
+        and stack.base_branch
+        == (
+            snapshot.membership.base_branch
+            if isinstance(snapshot.membership, ServerStackMembership)
+            else snapshot.pull_requests[0].base_branch
+        )
+        and stack.ordered_prs == membership
+    )
+    if len(tracked) != 1:
+        return _block("untracked-membership", "stack", "exact complete membership is not tracked")
+    live = {ref.ref.full_name: ref.commit_id for ref in snapshot.live_refs}
+    boundaries: list[RemoteRestackBoundary] = []
+    previous_old: str | None = None
+    previous_new: str | None = None
+    base_ref = RemoteBranchRef(
+        snapshot.repository, f"refs/heads/{tracked[0].base_branch}"
+    )
+    boundary_evidence = tuple(
+        item.verified_commit_id
+        for item in snapshot.tool_state.state.last_published_boundaries
+        if item.ref == base_ref
+    )
+    old_base_seam = _one_bookmark_target(snapshot.local, None, tracked[0].base_branch)
+    if old_base_seam is None and len(boundary_evidence) == 1:
+        old_base_seam = boundary_evidence[0]
+    if old_base_seam is None:
+        old_base_seam = _one_bookmark_target(
+            snapshot.local, snapshot.remote, tracked[0].base_branch
+        )
+    if old_base_seam is None:
+        return _block(
+            "boundary-unavailable", tracked[0].base_branch,
+            "tracked base has no unique local boundary",
+        )
+    for pr in snapshot.pull_requests:
+        if pr.state is not PullRequestState.OPEN:
+            continue
+        local = _one_bookmark_target(snapshot.local, None, pr.head_branch)
+        baseline = _one_bookmark_target(snapshot.local, snapshot.remote, pr.head_branch)
+        remote = live.get(f"refs/heads/{pr.head_branch}")
+        if local is None or baseline is None or remote is None or remote != pr.head_oid:
+            return _block("boundary-unavailable", pr.head_branch, "L, T, PR, and live head must agree uniquely")
+        if local != baseline:
+            return _block("mixed-movement", pr.head_branch, "local and remote movement cannot be combined")
+        old = local
+        if local == remote:
+            ref = RemoteBranchRef(
+                snapshot.repository, f"refs/heads/{pr.head_branch}"
+            )
+            prior = tuple(
+                item.verified_commit_id
+                for item in (
+                    snapshot.tool_state.state.last_published_heads
+                    + snapshot.tool_state.state.last_adopted_heads
+                )
+                if item.pr == pr.identity
+                and item.ref == ref
+                and item.verified_commit_id != remote
+            )
+            if len(prior) > 1:
+                return _block(
+                    "ambiguous-head-authority",
+                    pr.head_branch,
+                    "converged bookmarks have multiple prior authorities",
+                )
+            if prior:
+                old = prior[0]
+        if previous_old is None:
+            # The local tracked-base bookmark is explicit pre-fetch boundary
+            # evidence.  Do not infer this seam from however many ancestors the
+            # caller happened to include in its local commit observation.
+            old_seam = old_base_seam
+        else:
+            old_seam = previous_old
+        new_seam = previous_new or pr.base_oid
+        if not new_seam:
+            return _block("boundary-unavailable", pr.head_branch, "new segment seam is absent")
+        boundaries.append(
+            RemoteRestackBoundary(
+                pr.identity, pr.head_branch, old_seam, new_seam, old, remote
+            )
+        )
+        previous_old = old
+        previous_new = remote
+    if not boundaries or all(item.old_commit_id == item.remote_commit_id for item in boundaries):
+        return _block("remote-unchanged", "stack", "no external restack is present")
+    # A restack is stack-wide: unchanged boundaries interspersed with changed ones
+    # indicate a partial rewrite, not a coherent replacement.
+    changed = tuple(item.old_commit_id != item.remote_commit_id for item in boundaries)
+    if not all(changed):
+        return _block("partial-restack", "stack", "not every open boundary was rewritten")
+    return RemoteRestackAdoption(
+        snapshot.repository,
+        snapshot.remote,
+        snapshot.tool_state.state_blob_oid,
+        tuple(boundaries),
+    )
+
+
+def _commit_fingerprint(git_dir: str | Path, commit_id: str) -> tuple[str, str]:
+    payload = _run(["git", f"--git-dir={git_dir}", "cat-file", "-p", commit_id])
+    header = payload.partition("\n\n")[0]
+    changes = tuple(
+        line.removeprefix("change-id ")
+        for line in header.splitlines()
+        if line.startswith("change-id ")
+    )
+    if len(changes) != 1 or not changes[0]:
+        raise SourceMismatch(f"commit {commit_id} has no unique raw jj change ID")
+    patch = _run(
+        ["git", f"--git-dir={git_dir}", "show", "--pretty=format:", "--no-ext-diff", "--binary", commit_id]
+    )
+    fields = _run(["git", "patch-id", "--stable"], stdin=patch).split()
+    if len(fields) != 2 or re.fullmatch(r"[0-9a-f]{40}", fields[0]) is None:
+        raise SourceMismatch(f"commit {commit_id} has no stable patch ID")
+    return changes[0], fields[0]
+
+
+def _linear_segment(git_dir: str | Path, base: str, head: str) -> tuple[str, ...]:
+    commits = tuple(_run(["git", f"--git-dir={git_dir}", "rev-list", "--reverse", "--ancestry-path", f"{base}..{head}"]).splitlines())
+    predecessor = base
+    for commit in commits:
+        row = _run(["git", f"--git-dir={git_dir}", "rev-list", "--parents", "-n", "1", commit]).split()
+        if len(row) != 2 or row[1] != predecessor:
+            raise SourceMismatch("restack segment is not a complete linear chain")
+        predecessor = commit
+    if not commits or commits[-1] != head:
+        raise SourceMismatch("restack segment is empty or disconnected")
+    return commits
 
 
 def plan_sync(
@@ -3383,6 +3596,51 @@ def settle_recovery(
         # The generic driver, not legacy settlement, reconciles or retires them.
         if not entry.possibly_live:
             continue
+        if isinstance(entry.attempt, AdoptionAttempt):
+            attempt = entry.attempt
+            plan = RemoteRestackAdoption(
+                attempt.repository, attempt.remote, attempt.state_blob_oid,
+                attempt.boundaries,
+            )
+            try:
+                after = _observe_adoption(
+                    workspace,
+                    github,
+                    plan,
+                    include_remote=True,
+                    git_transport=git_transport,
+                )
+                if _verify_adoption(after, after, plan, recovery=True) is not None:
+                    remaining.append(entry)
+                    continue
+                receipts = tuple(
+                    LastAdoptedHead(
+                        item.pr_identity,
+                        RemoteBranchRef(attempt.repository, f"refs/heads/{item.branch}"),
+                        item.remote_commit_id,
+                    )
+                    for item in attempt.boundaries
+                )
+                if not dry_run:
+                    current_oid, current = read_state(workspace)
+                    keys = {(item.pr, item.ref) for item in receipts}
+                    exact = {
+                        (item.pr, item.ref): item for item in current.last_adopted_heads
+                        if (item.pr, item.ref) in keys
+                    }
+                    if tuple(exact.get((item.pr, item.ref)) for item in receipts) != receipts:
+                        # Recovery may only consume the state version frozen by
+                        # the attempt.  A later unrelated state cannot be
+                        # overwritten using the repeatedly stale original CAS.
+                        if current_oid != attempt.state_blob_oid:
+                            remaining.append(entry)
+                            continue
+                        _record_adoptions(
+                            workspace, current_oid, current, receipts
+                        )
+            except Error:
+                remaining.append(entry)
+            continue
         try:
             classification = _classify_attempt(
                 workspace, github, entry.attempt, git_transport
@@ -3438,6 +3696,14 @@ def _attempt_conflicts_plan(entry: RecoveryEntry, plan: NoOp | Apply) -> bool:
         RemoteBranchRef(plan.desired.repository, f"refs/heads/{pr.head_branch}")
         for pr in plan.dependencies.prs
     }
+    if isinstance(attempt, AdoptionAttempt):
+        adoption_prs = {boundary.pr_identity for boundary in attempt.boundaries}
+        adoption_refs = {
+            RemoteBranchRef(attempt.repository, f"refs/heads/{boundary.branch}")
+            for boundary in attempt.boundaries
+        }
+        return bool(active_prs.intersection(adoption_prs)
+                    or active_refs.intersection(adoption_refs))
     if isinstance(attempt, HeadMutationAttempt):
         return bool(active_refs.intersection(update.ref for update in attempt.updates))
     raise AssertionError(f"unhandled recovery attempt: {type(attempt).__name__}")
@@ -3531,6 +3797,254 @@ def _revalidate_sync_dependencies(
     current_prs = github.pull_requests(tuple(pr.identity for pr in dependencies.prs))
     if current_prs != dependencies.prs:
         raise ConcurrentUpdate("pull request state or topology changed since confirmation")
+
+
+def _observe_adoption(
+    workspace: str | Path,
+    github: GitHubClient,
+    plan: RemoteRestackAdoption,
+    *,
+    include_remote: bool,
+    git_transport: GitTransport | None = None,
+) -> Snapshot:
+    revision = " | ".join(
+        (
+            f"{boundary.old_commit_id}:: | {boundary.remote_commit_id}::"
+            if include_remote
+            else f"{boundary.old_commit_id}::"
+        )
+        for boundary in plan.boundaries
+    )
+    return observe_snapshot(
+        workspace,
+        github,
+        revision=revision,
+        config_keys=("git.push",),
+        remote=plan.remote,
+        selected_pr_number=plan.boundaries[0].pr_identity.number,
+        git_transport=git_transport,
+    )
+
+
+def _verify_adoption(
+    before: Snapshot, after: Snapshot, plan: RemoteRestackAdoption, *, recovery: bool = False
+) -> str | None:
+    current = plan_remote_restack_adoption(before) if not recovery else plan
+    if current != plan:
+        return "adoption inputs no longer describe the same restack"
+    if after.repository != plan.repository or after.membership != before.membership:
+        return "repository or complete membership changed during adoption"
+    post_prs = {pr.identity: pr for pr in after.pull_requests}
+    live_heads = {item.ref.full_name: item.commit_id for item in after.live_refs}
+    commits = {commit.commit_id: commit for commit in after.local.commits}
+    git_dir = after.local.git_common_dir
+    rewritten_old_ids: set[str] = set()
+    for boundary in plan.boundaries:
+        pr = post_prs.get(boundary.pr_identity)
+        if (
+            pr is None
+            or pr.head_oid != boundary.remote_commit_id
+            or live_heads.get(f"refs/heads/{boundary.branch}")
+            != boundary.remote_commit_id
+            or _one_bookmark_target(after.local, None, boundary.branch)
+            != boundary.remote_commit_id
+            or _one_bookmark_target(after.local, plan.remote, boundary.branch)
+            != boundary.remote_commit_id
+        ):
+            return f"canonical PR/ref or bookmark state disagrees for {boundary.branch}"
+        old = commits.get(boundary.old_commit_id)
+        new = commits.get(boundary.remote_commit_id)
+        if old is None or not old.is_hidden:
+            return f"superseded commit remains visible or absent for {boundary.branch}"
+        if new is None or new.is_hidden or new.has_conflicts:
+            return f"adopted commit is hidden, absent, or conflicted for {boundary.branch}"
+        try:
+            old_segment = _linear_segment(
+                git_dir, boundary.old_seam_commit_id, boundary.old_commit_id
+            )
+            new_segment = _linear_segment(
+                git_dir, boundary.new_seam_commit_id, boundary.remote_commit_id
+            )
+            if len(old_segment) != len(new_segment) or any(
+                _commit_fingerprint(git_dir, old_id)
+                != _commit_fingerprint(git_dir, new_id)
+                for old_id, new_id in zip(old_segment, new_segment, strict=True)
+            ):
+                return f"ordered change IDs or patch IDs differ for {boundary.branch}"
+            rewritten_old_ids.update(old_segment)
+        except Error as exc:
+            return str(exc)
+    visible_by_change: dict[str, list[str]] = {}
+    for commit in after.local.commits:
+        if not commit.is_hidden:
+            visible_by_change.setdefault(commit.change_id, []).append(commit.commit_id)
+    before_commits = {commit.commit_id: commit for commit in before.local.commits}
+    if recovery:
+        return None
+    for workspace, old_target in before.local.workspace_targets:
+        if old_target not in rewritten_old_ids:
+            continue
+        old = before_commits.get(old_target)
+        targets = tuple(target for name, target in after.local.workspace_targets if name == workspace)
+        if old is None or len(targets) != 1 or visible_by_change.get(old.change_id) != [targets[0]]:
+            return f"workspace {workspace} did not move to the unique adopted change"
+    return None
+
+
+def _record_adoptions(
+    workspace: str | Path,
+    expected_oid: str | None,
+    state: TrackedState,
+    receipts: tuple[LastAdoptedHead, ...],
+) -> None:
+    keys = {(item.pr, item.ref) for item in receipts}
+    publications = tuple(
+        item for item in state.last_published_heads if (item.pr, item.ref) not in keys
+    )
+    adoptions = tuple(
+        item for item in state.last_adopted_heads if (item.pr, item.ref) not in keys
+    ) + receipts
+    cas_write_state(
+        workspace,
+        expected_oid,
+        TrackedState(
+            state.stacks,
+            publications,
+            adoptions,
+            state.detached_associations,
+            state.last_published_boundaries,
+        ),
+    )
+
+
+def adopt_remote_restack(
+    plan: RemoteRestackAdoption,
+    workspace: str | Path,
+    github: GitHubClient,
+    *,
+    dry_run: bool = False,
+    git_transport: GitTransport | None = None,
+) -> AdoptionVerified | Stopped:
+    """Fetch exact stack branches and persist authority only after full verification."""
+    if dry_run:
+        try:
+            before = _observe_adoption(
+                workspace,
+                github,
+                plan,
+                include_remote=False,
+                git_transport=git_transport,
+            )
+            if plan_remote_restack_adoption(before) != plan:
+                return Stopped(
+                    "recompute", "current facts no longer describe this restack"
+                )
+            return AdoptionVerified(())
+        except Error as exc:
+            return Stopped("adoption", str(exc))
+    with repository_lock(workspace):
+        try:
+            recovery_oid, journal = read_recovery(workspace)
+            attempt = AdoptionAttempt(
+                plan.repository, plan.remote, plan.state_blob_oid, plan.boundaries
+            )
+            matching = tuple(
+                entry for entry in (() if journal is None else journal.entries)
+                if entry.attempt == attempt
+            )
+            if matching:
+                if len(matching) != 1 or recovery_oid is None:
+                    return Stopped("adoption", "adoption recovery authority is ambiguous")
+                after = _observe_adoption(
+                    workspace,
+                    github,
+                    plan,
+                    include_remote=True,
+                    git_transport=git_transport,
+                )
+                mismatch = _verify_adoption(after, after, plan, recovery=True)
+                if mismatch is not None:
+                    return Stopped("verify", mismatch)
+                receipts = tuple(
+                    LastAdoptedHead(
+                        boundary.pr_identity,
+                        RemoteBranchRef(plan.repository, f"refs/heads/{boundary.branch}"),
+                        boundary.remote_commit_id,
+                    )
+                    for boundary in plan.boundaries
+                )
+                recorded = {
+                    (item.pr, item.ref, item.verified_commit_id)
+                    for item in after.tool_state.state.last_adopted_heads
+                }
+                wanted = {
+                    (item.pr, item.ref, item.verified_commit_id) for item in receipts
+                }
+                if wanted <= recorded:
+                    _remove_recovery_entry(
+                        workspace, recovery_oid, matching[0].identity
+                    )
+                    return AdoptionVerified(receipts)
+                _record_adoptions(
+                    workspace, plan.state_blob_oid, after.tool_state.state, receipts
+                )
+                _remove_recovery_entry(workspace, recovery_oid, matching[0].identity)
+                return AdoptionVerified(receipts)
+            before = _observe_adoption(
+                workspace,
+                github,
+                plan,
+                include_remote=False,
+                git_transport=git_transport,
+            )
+            current = plan_remote_restack_adoption(before)
+            if current != plan:
+                return Stopped("recompute", "current facts no longer describe this restack")
+            recovery_oid, recovery_entry = _append_recovery(workspace, attempt)
+            live_entry = RecoveryEntry(
+                recovery_entry.identity, attempt, possibly_live=True
+            )
+            recovery_oid = _replace_recovery_entry(
+                workspace, recovery_oid, live_entry
+            )
+            result = subprocess.run(
+                [
+                    "jj", "git", "fetch", "--remote", plan.remote,
+                    *(arg for boundary in plan.boundaries for arg in ("--branch", boundary.branch)),
+                ],
+                cwd=workspace,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            if result.returncode:
+                _remove_recovery_entry(workspace, recovery_oid, live_entry.identity)
+                return Stopped("fetch", result.stderr.strip() or result.stdout.strip())
+            after = _observe_adoption(
+                workspace,
+                github,
+                plan,
+                include_remote=True,
+                git_transport=git_transport,
+            )
+            mismatch = _verify_adoption(before, after, plan)
+            if mismatch is not None:
+                return Stopped("verify", mismatch)
+            receipts = tuple(
+                LastAdoptedHead(
+                    boundary.pr_identity,
+                    RemoteBranchRef(plan.repository, f"refs/heads/{boundary.branch}"),
+                    boundary.remote_commit_id,
+                )
+                for boundary in plan.boundaries
+            )
+            _record_adoptions(
+                workspace, plan.state_blob_oid, after.tool_state.state, receipts
+            )
+            _remove_recovery_entry(workspace, recovery_oid, live_entry.identity)
+            return AdoptionVerified(receipts)
+        except Error as exc:
+            return Stopped("adoption", str(exc))
 
 
 def apply(
