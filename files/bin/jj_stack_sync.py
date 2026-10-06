@@ -552,6 +552,33 @@ class Snapshot:
 
 
 @dataclass(frozen=True)
+class DesiredExistingPR:
+    pr_identity: PullRequestId
+    desired_commit_id: str
+    title: str
+    body: str
+
+
+@dataclass(frozen=True)
+class ExistingPRAssignment:
+    pr_identity: PullRequestId
+    commit_id: str
+
+
+@dataclass(frozen=True)
+class StackSelection:
+    base_branch: str
+    ordered: tuple[ExistingPRAssignment, ...]
+
+    def __post_init__(self) -> None:
+        if not self.base_branch:
+            raise ValueError("stack selection must have a base")
+        identities = tuple(item.pr_identity for item in self.ordered)
+        if len(set(identities)) != len(identities):
+            raise ValueError("stack selection must not assign a PR more than once")
+
+
+@dataclass(frozen=True)
 class NewPullRequestGoal:
     commit_id: str
     branch_name: str
@@ -580,6 +607,38 @@ class NewPullRequestGoal:
 
 
 @dataclass(frozen=True)
+class DesiredStack:
+    repository: GitHubRepositoryId
+    base_branch: str
+    active: tuple[DesiredExistingPR, ...]
+
+
+@dataclass(frozen=True)
+class Blocker:
+    code: str
+    subject: str
+    detail: str
+
+
+@dataclass(frozen=True)
+class Blocked:
+    reasons: tuple[Blocker, ...]
+
+
+@dataclass(frozen=True)
+class Dependencies:
+    effective_config: tuple[tuple[str, str], ...]
+    push_url: str
+    remote: str
+    state_blob_oid: str | None
+    recovery_blob_oid: str | None
+    prs: tuple[GitHubPullRequest, ...]
+    membership: PullRequestMembership
+    live_heads: tuple[LiveRemoteRef, ...]
+    live_bases: tuple[LiveRemoteRef, ...]
+
+
+@dataclass(frozen=True)
 class FastForward:
     pass
 
@@ -605,6 +664,32 @@ class PlannedHeadUpdate:
     expected_old_commit_id: str
     new_commit_id: str
     authority: Authority
+
+
+@dataclass(frozen=True)
+class PRMetadataUpdate:
+    pr_identity: PullRequestId
+    title: str
+    body: str
+
+
+@dataclass(frozen=True)
+class NoOp:
+    desired: DesiredStack
+    dependencies: Dependencies
+    boundary_receipts: tuple[LastPublishedBoundary, ...] = ()
+
+
+@dataclass(frozen=True)
+class Apply:
+    desired: DesiredStack
+    head_updates: tuple[PlannedHeadUpdate, ...]
+    metadata_updates: tuple[PRMetadataUpdate, ...]
+    dependencies: Dependencies
+    boundary_receipts: tuple[LastPublishedBoundary, ...] = ()
+
+
+SyncPlan = Blocked | NoOp | Apply
 
 
 def _run(
@@ -2349,3 +2434,537 @@ def repository_lock(workspace: str | Path) -> Iterator[None]:
         yield
     finally:
         os.close(descriptor)
+
+
+def _block(code: str, subject: str, detail: str) -> Blocked:
+    return Blocked((Blocker(code, subject, detail),))
+
+
+def _record_newline(state: StateInline, silent: bool) -> bool:
+    offset = state.pos
+    token_count = len(state.tokens)
+    matched = _parse_newline(state, silent)
+    if (
+        matched
+        and not silent
+        and len(state.tokens) > token_count
+        and state.tokens[-1].type == "softbreak"
+    ):
+        state.tokens[-1].meta["inline_offset"] = offset
+    return matched
+
+
+_MARKDOWN = MarkdownIt("commonmark").enable("table")
+_MARKDOWN.inline.ruler.at("newline", _record_newline)
+
+
+def _reflow_markdown(body: str) -> str:
+    tokens = _MARKDOWN.parse(body)
+    line_endings = list(re.finditer(r"\r\n|\r|\n", body))
+    edits: list[tuple[int, int]] = []
+    for index, token in enumerate(tokens):
+        if token.type != "paragraph_open" or token.level != 0:
+            continue
+        inline = tokens[index + 1]
+        if inline.type != "inline" or inline.map is None:
+            raise Error("markdown parser returned an unexpected paragraph structure")
+        for child in inline.children or []:
+            if child.type != "softbreak":
+                continue
+            offset = child.meta.get("inline_offset")
+            if not isinstance(offset, int):
+                raise Error("markdown parser returned a soft break without an offset")
+            line = inline.map[0] + inline.content.count("\n", 0, offset)
+            if line >= len(line_endings):
+                raise Error("markdown parser returned an invalid soft-break offset")
+            edits.append(line_endings[line].span())
+    for start, end in reversed(edits):
+        body = body[:start] + " " + body[end:]
+    return body
+
+
+def _metadata(description: str) -> tuple[str, str] | None:
+    description = description.rstrip("\n")
+    title, separator, body = description.partition("\n")
+    if not title:
+        return None
+    if separator:
+        body = _reflow_markdown(body.removeprefix("\n"))
+    return title, body
+
+
+def _complete_selection(
+    snapshot: Snapshot,
+    assignments: Sequence[ExistingPRAssignment],
+) -> StackSelection | Blocked:
+    if isinstance(snapshot.membership, StandalonePullRequest):
+        membership = (snapshot.membership.pr,)
+        matches = tuple(
+            pr for pr in snapshot.pull_requests if pr.identity == snapshot.membership.pr
+        )
+        if len(matches) != 1:
+            return _block(
+                "incomplete-membership",
+                "stack",
+                "standalone membership was not observed exactly once",
+            )
+        base_branch = matches[0].base_branch
+    else:
+        membership = snapshot.membership.ordered_prs
+        base_branch = snapshot.membership.base_branch
+    active = tuple(
+        pr.identity
+        for pr in snapshot.pull_requests
+        if pr.state is PullRequestState.OPEN
+    )
+    if tuple(item.pr_identity for item in assignments) != active:
+        return _block(
+            "incomplete-selection",
+            "stack",
+            "assignments must exactly cover the ordered open membership",
+        )
+    if tuple(pr.identity for pr in snapshot.pull_requests) != membership:
+        return _block(
+            "incomplete-membership",
+            "stack",
+            "observed PRs do not exactly cover membership",
+        )
+    return StackSelection(base_branch, tuple(assignments))
+
+
+def select_explicit_stack(
+    snapshot: Snapshot, assignments: Sequence[ExistingPRAssignment]
+) -> StackSelection | Blocked:
+    """Resolve explicit complete intent without silently adding server members."""
+    return _complete_selection(snapshot, assignments)
+
+
+def select_tracked_stack(
+    snapshot: Snapshot, assignments: Sequence[ExistingPRAssignment]
+) -> StackSelection | Blocked:
+    """Resolve implicit intent only from one exact persisted membership."""
+    selected = _complete_selection(snapshot, assignments)
+    if isinstance(selected, Blocked):
+        return selected
+    membership = (
+        (snapshot.membership.pr,)
+        if isinstance(snapshot.membership, StandalonePullRequest)
+        else snapshot.membership.ordered_prs
+    )
+    matches = tuple(
+        stack
+        for stack in snapshot.tool_state.state.stacks
+        if stack.repository == snapshot.repository
+        and stack.base_branch == selected.base_branch
+        and stack.ordered_prs == membership
+    )
+    if len(matches) != 1:
+        return _block(
+            "untracked-membership",
+            "stack",
+            "implicit selection requires one exact tracked membership",
+        )
+    return selected
+
+
+def derive_desired(
+    snapshot: Snapshot, selection: StackSelection
+) -> DesiredStack | Blocked:
+    desired: list[DesiredExistingPR] = []
+    for assignment in selection.ordered:
+        matches = tuple(
+            pr for pr in snapshot.pull_requests if pr.identity == assignment.pr_identity
+        )
+        if len(matches) != 1:
+            return _block(
+                "selected-pr-unavailable",
+                "selected PR",
+                "assigned PR was not observed exactly once",
+            )
+        pr = matches[0]
+        commits = tuple(
+            item
+            for item in snapshot.local.commits
+            if item.commit_id == assignment.commit_id
+        )
+        if len(commits) != 1:
+            return _block(
+                "commit-unobserved",
+                assignment.commit_id,
+                "assigned commit was not observed exactly once",
+            )
+        metadata = _metadata(commits[0].description)
+        if metadata is None:
+            return _block(
+                "title-missing",
+                commits[0].commit_id,
+                "selected revision has no description title",
+            )
+        title, body = metadata
+        desired.append(
+            DesiredExistingPR(pr.identity, commits[0].commit_id, title, body)
+        )
+    return DesiredStack(
+        snapshot.repository,
+        selection.base_branch,
+        tuple(desired),
+    )
+
+
+def _dependencies(
+    snapshot: Snapshot,
+    prs: tuple[GitHubPullRequest, ...],
+    heads: tuple[LiveRemoteRef, ...],
+    bases: tuple[LiveRemoteRef, ...],
+) -> Dependencies:
+    return Dependencies(
+        tuple(
+            item for item in snapshot.local.effective_config if item[0] != "git.push"
+        ),
+        snapshot.push_url,
+        snapshot.remote,
+        snapshot.tool_state.state_blob_oid,
+        snapshot.tool_state.recovery_blob_oid,
+        prs,
+        snapshot.membership,
+        heads,
+        bases,
+    )
+
+
+def _is_ancestor(
+    commits: tuple[ObservedCommit, ...],
+    ancestor_commit_id: str,
+    descendant_commit_id: str,
+) -> bool:
+    parents = {commit.commit_id: commit.parent_commit_ids for commit in commits}
+    pending = [descendant_commit_id]
+    seen: set[str] = set()
+    while pending:
+        commit_id = pending.pop()
+        if commit_id == ancestor_commit_id:
+            return True
+        if commit_id not in seen:
+            seen.add(commit_id)
+            pending.extend(parents.get(commit_id, ()))
+    return False
+
+
+def _comparison_is_nonempty_linear_and_conflict_free(
+    commits: tuple[ObservedCommit, ...], base_commit_id: str, head_commit_id: str
+) -> bool:
+    if base_commit_id == head_commit_id:
+        return False
+    by_commit_id: dict[str, ObservedCommit] = {}
+    for commit in commits:
+        if commit.commit_id in by_commit_id:
+            return False
+        by_commit_id[commit.commit_id] = commit
+    current = head_commit_id
+    seen: set[str] = set()
+    while current != base_commit_id:
+        if current in seen:
+            return False
+        seen.add(current)
+        commit = by_commit_id.get(current)
+        if commit is None or commit.has_conflicts or len(commit.parent_commit_ids) != 1:
+            return False
+        current = commit.parent_commit_ids[0]
+    return True
+
+
+def _validate_plan_scope(
+    snapshot: Snapshot, desired: DesiredStack
+) -> tuple[GitHubPullRequest, ...] | Blocked:
+    if desired.repository != snapshot.repository:
+        return _block(
+            "repository-mismatch",
+            "repository",
+            "desired repository differs from the observed repository",
+        )
+    observed = {pr.identity: pr for pr in snapshot.pull_requests}
+    if len(observed) != len(snapshot.pull_requests):
+        return _block(
+            "ambiguous-membership",
+            "stack",
+            "pull request observations contain duplicate identities",
+        )
+    if isinstance(snapshot.membership, StandalonePullRequest):
+        ordered_members = (snapshot.membership.pr,)
+        observed_base = observed.get(snapshot.membership.pr)
+        base_branch = observed_base.base_branch if observed_base is not None else None
+    else:
+        ordered_members = snapshot.membership.ordered_prs
+        base_branch = snapshot.membership.base_branch
+    if tuple(observed) != ordered_members:
+        return _block(
+            "incomplete-membership",
+            "stack",
+            "observed PRs do not exactly match complete ordered membership",
+        )
+    if desired.base_branch != base_branch:
+        return _block(
+            "target-mismatch",
+            desired.base_branch,
+            "desired target differs from the observed stack base branch",
+        )
+    seen_open = False
+    for pr in snapshot.pull_requests:
+        if (
+            pr.identity.repository != snapshot.repository
+            or pr.head_repository != snapshot.repository
+        ):
+            return _block(
+                "nonlocal-pr",
+                f"PR #{pr.number}",
+                "planner requires repository-local PRs",
+            )
+        if pr.state is PullRequestState.OPEN:
+            seen_open = True
+        elif pr.state is PullRequestState.CLOSED or seen_open:
+            return _block(
+                "unsupported-member-state",
+                f"PR #{pr.number}",
+                "membership must be a merged prefix followed by open PRs",
+            )
+    active = tuple(
+        pr for pr in snapshot.pull_requests if pr.state is PullRequestState.OPEN
+    )
+    if tuple(item.pr_identity for item in desired.active) != tuple(
+        pr.identity for pr in active
+    ):
+        return _block(
+            "incomplete-selection",
+            "stack",
+            "desired assignments must exactly cover the ordered open membership",
+        )
+    return active
+
+
+def _validate_pr_dependencies(
+    snapshot: Snapshot,
+    desired: DesiredStack,
+    prs: tuple[GitHubPullRequest, ...],
+) -> (
+    tuple[
+        tuple[LiveRemoteRef, ...],
+        tuple[LiveRemoteRef, ...],
+        tuple[LiveRemoteRef, ...],
+    ]
+    | Blocked
+):
+    base_name = f"refs/heads/{desired.base_branch}"
+    base_ref = RemoteBranchRef(snapshot.repository, base_name)
+    bases = tuple(value for value in snapshot.live_refs if value.ref == base_ref)
+    if len(bases) != 1 or bases[0].commit_id is None:
+        return _block(
+            "base-disagrees",
+            base_name,
+            "authoritative stack base ref is absent or ambiguous",
+        )
+    all_heads: list[LiveRemoteRef] = []
+    all_bases: list[LiveRemoteRef] = []
+    heads_by_pr: dict[PullRequestId, LiveRemoteRef] = {}
+    previous_pr: GitHubPullRequest | None = None
+    for pr in snapshot.pull_requests:
+        head_name = f"refs/heads/{pr.head_branch}"
+        head_ref = RemoteBranchRef(snapshot.repository, head_name)
+        heads = tuple(value for value in snapshot.live_refs if value.ref == head_ref)
+        if len(heads) != 1 or heads[0].commit_id != pr.head_oid:
+            return _block(
+                "head-disagrees",
+                head_name,
+                "GitHub PR head and authoritative live ref disagree",
+            )
+        expected_base_branch = (
+            previous_pr.head_branch if previous_pr is not None else desired.base_branch
+        )
+        if pr.base_branch != expected_base_branch:
+            return _block(
+                "topology-changed",
+                f"PR #{pr.number}",
+                "PR literal base does not match unchanged stack order",
+            )
+        pr_base_name = f"refs/heads/{pr.base_branch}"
+        pr_base_ref = RemoteBranchRef(snapshot.repository, pr_base_name)
+        pr_bases = tuple(
+            value for value in snapshot.live_refs if value.ref == pr_base_ref
+        )
+        if len(pr_bases) != 1 or pr_bases[0].commit_id != pr.base_oid:
+            return _block(
+                "base-disagrees",
+                pr_base_name,
+                "GitHub PR base and authoritative live ref disagree",
+            )
+        all_heads.append(heads[0])
+        if pr_bases[0] not in all_bases:
+            all_bases.append(pr_bases[0])
+        heads_by_pr[pr.identity] = heads[0]
+        previous_pr = pr
+    merged = tuple(
+        pr for pr in snapshot.pull_requests if pr.state is PullRequestState.MERGED
+    )
+    comparison_base = merged[-1].head_oid if merged else bases[0].commit_id
+    active_heads: list[LiveRemoteRef] = []
+    for pr, wanted in zip(prs, desired.active, strict=True):
+        commits = tuple(
+            value
+            for value in snapshot.local.commits
+            if value.commit_id == wanted.desired_commit_id
+        )
+        if len(commits) != 1 or commits[0].has_conflicts:
+            return _block(
+                "commit-conflicted",
+                wanted.desired_commit_id,
+                "desired commit is absent, duplicated, or conflicted",
+            )
+        if not _comparison_is_nonempty_linear_and_conflict_free(
+            snapshot.local.commits,
+            comparison_base,
+            wanted.desired_commit_id,
+        ):
+            return _block(
+                "invalid-comparison",
+                wanted.desired_commit_id,
+                "desired predecessor-to-head segment is empty, nonlinear, incomplete, or conflicted",
+            )
+        active_heads.append(heads_by_pr[pr.identity])
+        comparison_base = wanted.desired_commit_id
+    return (
+        tuple(active_heads),
+        tuple(all_heads),
+        tuple(all_bases),
+    )
+
+
+def _plan_publication(
+    snapshot: Snapshot,
+    wanted: DesiredExistingPR,
+    head: LiveRemoteRef,
+) -> tuple[PlannedHeadUpdate, ...] | Blocked:
+    assert head.commit_id is not None
+    if wanted.desired_commit_id == head.commit_id:
+        return ()
+    if _is_ancestor(snapshot.local.commits, head.commit_id, wanted.desired_commit_id):
+        return (
+            PlannedHeadUpdate(
+                head.ref,
+                head.commit_id,
+                wanted.desired_commit_id,
+                FastForward(),
+            ),
+        )
+    publications = tuple(
+        item
+        for item in snapshot.tool_state.state.last_published_heads
+        if item.pr == wanted.pr_identity
+        and item.ref == head.ref
+        and item.verified_commit_id == head.commit_id
+    )
+    if len(publications) != 1:
+        return _block(
+            "replacement-unauthorized",
+            head.ref.full_name,
+            "live head is neither an ancestor nor one unambiguous last publication",
+        )
+    return (
+        PlannedHeadUpdate(
+            head.ref,
+            head.commit_id,
+            wanted.desired_commit_id,
+            MatchesLastPublication(publications[0]),
+        ),
+    )
+
+
+def _metadata_updates(
+    pr: GitHubPullRequest, wanted: DesiredExistingPR
+) -> tuple[PRMetadataUpdate, ...]:
+    if (pr.title, pr.body) == (wanted.title, wanted.body):
+        return ()
+    return (PRMetadataUpdate(pr.identity, wanted.title, wanted.body),)
+
+
+def _one_bookmark_target(
+    local: LocalObservation, remote: str | None, name: str
+) -> str | None:
+    targets = (
+        (item.target for item in local.local_bookmarks if remote is None and item.name == name)
+        if remote is None
+        else (
+            item.target
+            for item in local.remote_bookmarks
+            if item.remote == remote
+            and item.name == name
+            and item.tracking_state is TrackingState.TRACKED
+        )
+    )
+    values = tuple(targets)
+    if len(values) != 1 or not isinstance(values[0], CommitTarget):
+        return None
+    return values[0].commit_id
+
+
+def plan_sync(
+    snapshot: Snapshot,
+    desired: DesiredStack | Blocked,
+) -> SyncPlan:
+    if isinstance(desired, Blocked):
+        return desired
+    prs = _validate_plan_scope(snapshot, desired)
+    if isinstance(prs, Blocked):
+        return prs
+    pr_dependencies = _validate_pr_dependencies(snapshot, desired, prs)
+    if isinstance(pr_dependencies, Blocked):
+        return pr_dependencies
+    heads, all_heads, all_bases = pr_dependencies
+    planned_heads: list[PlannedHeadUpdate] = []
+    planned_metadata: list[PRMetadataUpdate] = []
+    for pr, wanted, head in zip(prs, desired.active, heads, strict=True):
+        head_updates = _plan_publication(snapshot, wanted, head)
+        if isinstance(head_updates, Blocked):
+            return head_updates
+        planned_heads.extend(head_updates)
+        planned_metadata.extend(_metadata_updates(pr, wanted))
+    head_updates = tuple(planned_heads)
+    metadata = tuple(planned_metadata)
+    dependencies = _dependencies(snapshot, snapshot.pull_requests, all_heads, all_bases)
+    if not head_updates and not metadata:
+        return NoOp(desired, dependencies)
+    for pr in prs:
+        if pr.auto_merge_enabled or pr.in_merge_queue:
+            return _block(
+                "active-automation",
+                f"PR #{pr.number}",
+                "mutation is blocked while auto-merge or merge queue state is active",
+            )
+    return Apply(
+        desired,
+        head_updates,
+        metadata,
+        dependencies,
+    )
+
+
+def render(plan: SyncPlan) -> str:
+    if isinstance(plan, Blocked):
+        return "\n".join(
+            f"blocked [{item.code}] {item.subject}: {item.detail}"
+            for item in plan.reasons
+        )
+    if isinstance(plan, NoOp):
+        return "no-op: observed head and metadata already equal desired state"
+    pr_numbers = {pr.identity: pr.number for pr in plan.dependencies.prs}
+    consequences = [
+        *(
+            (
+                f"publish {item.new_commit_id} to {item.ref.full_name}"
+            )
+            for item in plan.head_updates
+        ),
+        *(
+            f"update metadata for PR #{pr_numbers[item.pr_identity]}"
+            for item in plan.metadata_updates
+        ),
+    ]
+    return "apply:\n" + "\n".join(f"  - {item}" for item in consequences)

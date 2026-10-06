@@ -843,5 +843,787 @@ def test_observation_record_parsers_reject_wrong_types_and_contradictions() -> N
         sync._commit_record({**commit, "hidden": "false"})
 
 
+def snapshot(*, desired: str, live: str, parent: str, recovery_oid: str | None = None):
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    pr_key = sync.PullRequestId(repository, 7)
+    head_ref = sync.RemoteBranchRef(repository, "refs/heads/topic")
+    base_ref = sync.RemoteBranchRef(repository, "refs/heads/main")
+    commit = sync.ObservedCommit(
+        desired, (parent,), "change", "Desired title\n\nDesired body", False, False
+    )
+    parent_commit = sync.ObservedCommit(parent, ("b" * 40,), "old", "Old", False, False)
+    local = sync.LocalObservation(
+        "/repo",
+        "op",
+        (("git.push", "origin"),),
+        (("default", desired),),
+        (sync.LocalBookmark("topic", sync.CommitTarget(desired)),),
+        (
+            sync.JjRemoteBookmark(
+                "origin", "topic", sync.CommitTarget(live), sync.TrackingState.TRACKED
+            ),
+        ),
+        (sync.GitRemoteTrackingRef("refs/remotes/origin/topic", live),),
+        (commit, parent_commit),
+        "/git",
+        ("origin",),
+    )
+    pr = sync.GitHubPullRequest(
+        pr_key,
+        "PR_node",
+        sync.PullRequestState.OPEN,
+        False,
+        repository,
+        "topic",
+        live,
+        "main",
+        "b" * 40,
+        False,
+        False,
+        "Desired title",
+        "Desired body",
+        None,
+    )
+    observed = sync.Snapshot(
+        repository,
+        "ssh://git@github.com/o/r.git",
+        "origin",
+        local,
+        sync.ToolStateRead(None, sync.EMPTY_STATE, recovery_oid),
+        (pr,),
+        sync.StandalonePullRequest(pr_key),
+        (
+            sync.LiveRemoteRef(head_ref, live),
+            sync.LiveRemoteRef(base_ref, "b" * 40),
+        ),
+    )
+    return observed, pr_key
+
+
+def selection(observed: sync.Snapshot, *prs: sync.PullRequestId) -> sync.StackSelection:
+    base = (
+        observed.membership.base_branch
+        if isinstance(observed.membership, sync.ServerStackMembership)
+        else "main"
+    )
+    return sync.StackSelection(
+        base,
+        tuple(
+            sync.ExistingPRAssignment(pr, observed.local.commits[index].commit_id)
+            for index, pr in enumerate(prs)
+        ),
+    )
+
+
+def stacked_snapshot(
+    *, count: int, merged_prefix: int = 0
+) -> tuple[sync.Snapshot, sync.StackSelection]:
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    stack = sync.GitHubStackSummary(
+        sync.GitHubStackId(repository, 17), "STACK_node", "main"
+    )
+    base = "b" * 40
+    prs: list[sync.GitHubPullRequest] = []
+    commits: list[sync.ObservedCommit] = []
+    bookmarks: list[sync.LocalBookmark] = []
+    live_refs = [
+        sync.LiveRemoteRef(sync.RemoteBranchRef(repository, "refs/heads/main"), base)
+    ]
+    assignments: list[sync.ExistingPRAssignment] = []
+    previous = base
+    previous_branch = "main"
+    for index in range(count):
+        identity = sync.PullRequestId(repository, index + 1)
+        commit_id = str(index + 1) * 40
+        branch = f"topic-{index + 1}"
+        state = (
+            sync.PullRequestState.MERGED
+            if index < merged_prefix
+            else sync.PullRequestState.OPEN
+        )
+        prs.append(
+            sync.GitHubPullRequest(
+                identity,
+                f"PR_{index + 1}",
+                state,
+                False,
+                repository,
+                branch,
+                commit_id,
+                previous_branch,
+                previous,
+                False,
+                False,
+                f"Title {index + 1}",
+                f"Body {index + 1}",
+                stack,
+            )
+        )
+        live_refs.append(
+            sync.LiveRemoteRef(
+                sync.RemoteBranchRef(repository, f"refs/heads/{branch}"), commit_id
+            )
+        )
+        if state is sync.PullRequestState.OPEN:
+            commits.append(
+                sync.ObservedCommit(
+                    commit_id,
+                    (previous,),
+                    f"change-{index + 1}",
+                    f"Title {index + 1}\n\nBody {index + 1}",
+                    False,
+                    False,
+                )
+            )
+            bookmarks.append(sync.LocalBookmark(branch, sync.CommitTarget(commit_id)))
+            assignments.append(sync.ExistingPRAssignment(identity, commit_id))
+        previous = commit_id
+        previous_branch = branch
+    selected = prs[0].identity
+    local = sync.LocalObservation(
+        "/repo",
+        "op",
+        (("git.push", "origin"),),
+        (("default", previous),),
+        tuple(bookmarks),
+        (),
+        (),
+        tuple(commits),
+        "/git",
+        ("origin",),
+    )
+    observed = sync.Snapshot(
+        repository,
+        "ssh://git@github.com/o/r.git",
+        "origin",
+        local,
+        sync.ToolStateRead(None, sync.EMPTY_STATE, None),
+        tuple(prs),
+        sync.ServerStackMembership(
+            selected,
+            stack,
+            tuple(pr.identity for pr in prs),
+        ),
+        tuple(live_refs),
+    )
+    return observed, sync.StackSelection("main", tuple(assignments))
+
+
+@pytest.mark.parametrize("count", (2, 3))
+def test_multi_pr_planner_aggregates_complete_unchanged_topology(count: int) -> None:
+    observed, selected = stacked_snapshot(count=count)
+
+    desired = sync.derive_desired(observed, selected)
+    no_op = sync.plan_sync(observed, desired)
+    stale = dataclasses.replace(
+        observed,
+        pull_requests=tuple(
+            dataclasses.replace(pr, title=f"Stale {pr.number}")
+            for pr in observed.pull_requests
+        ),
+    )
+    metadata_plan = sync.plan_sync(stale, sync.derive_desired(stale, selected))
+
+    assert isinstance(no_op, sync.NoOp)
+    assert len(no_op.dependencies.prs) == count
+    assert len(no_op.dependencies.live_heads) == count
+    assert isinstance(metadata_plan, sync.Apply)
+    assert metadata_plan.head_updates == ()
+    assert len(metadata_plan.metadata_updates) == count
+
+
+def test_multi_pr_planner_aggregates_multiple_head_updates() -> None:
+    observed, selected = stacked_snapshot(count=2)
+    base = "b" * 40
+    old_heads = (base, "1" * 40)
+    pull_requests = tuple(
+        dataclasses.replace(
+            pr,
+            head_oid=old,
+            base_oid=base if index == 0 else old_heads[index - 1],
+        )
+        for index, (pr, old) in enumerate(
+            zip(observed.pull_requests, old_heads, strict=True)
+        )
+    )
+    live_refs = tuple(
+        dataclasses.replace(ref, commit_id=old_heads[index])
+        if ref.ref.full_name == f"refs/heads/topic-{index + 1}"
+        else ref
+        for index in range(2)
+        for ref in observed.live_refs
+        if ref.ref.full_name in {"refs/heads/main", f"refs/heads/topic-{index + 1}"}
+    )
+    # The comprehension above repeats the base; retain one exact observation.
+    live_refs = tuple(dict((ref.ref, ref) for ref in live_refs).values())
+    observed = dataclasses.replace(
+        observed, pull_requests=pull_requests, live_refs=live_refs
+    )
+
+    plan = sync.plan_sync(observed, sync.derive_desired(observed, selected))
+
+    assert isinstance(plan, sync.Apply)
+    assert (
+        tuple(update.expected_old_commit_id for update in plan.head_updates)
+        == old_heads
+    )
+    assert tuple(update.new_commit_id for update in plan.head_updates) == (
+        "1" * 40,
+        "2" * 40,
+    )
+
+
+def test_tracked_and_explicit_selection_have_distinct_membership_policy() -> None:
+    observed, selected = stacked_snapshot(count=2)
+
+    explicit = sync.select_explicit_stack(observed, selected.ordered)
+    untracked = sync.select_tracked_stack(observed, selected.ordered)
+    tracked_state = sync.TrackedState(
+        (
+            sync.TrackedStack(
+                observed.repository,
+                "main",
+                observed.membership.ordered_prs,
+            ),
+        ),
+        (),
+    )
+    tracked_snapshot = dataclasses.replace(
+        observed,
+        tool_state=dataclasses.replace(observed.tool_state, state=tracked_state),
+    )
+    tracked = sync.select_tracked_stack(tracked_snapshot, selected.ordered)
+
+    assert explicit == selected
+    assert isinstance(untracked, sync.Blocked)
+    assert untracked.reasons[0].code == "untracked-membership"
+    assert tracked == selected
+
+
+def test_multi_pr_planner_validates_each_desired_predecessor_segment() -> None:
+    observed, selected = stacked_snapshot(count=3)
+    broken_commits = (
+        observed.local.commits[0],
+        dataclasses.replace(observed.local.commits[1], parent_commit_ids=("9" * 40,)),
+        observed.local.commits[2],
+    )
+    observed = dataclasses.replace(
+        observed,
+        local=dataclasses.replace(observed.local, commits=broken_commits),
+    )
+
+    plan = sync.plan_sync(observed, sync.derive_desired(observed, selected))
+
+    assert isinstance(plan, sync.Blocked)
+    assert plan.reasons[0].code == "invalid-comparison"
+    assert plan.reasons[0].subject == "2" * 40
+
+
+def test_multi_pr_planner_blocks_changed_literal_base_topology() -> None:
+    observed, selected = stacked_snapshot(count=2)
+    second = dataclasses.replace(
+        observed.pull_requests[1],
+        base_branch="main",
+        base_oid="b" * 40,
+    )
+    observed = dataclasses.replace(
+        observed, pull_requests=(observed.pull_requests[0], second)
+    )
+
+    plan = sync.plan_sync(observed, sync.derive_desired(observed, selected))
+
+    assert isinstance(plan, sync.Blocked)
+    assert plan.reasons[0].code == "topology-changed"
+
+
+@pytest.mark.parametrize("case", ("missing", "duplicate", "wrong"))
+def test_derive_rejects_unavailable_selected_pr(case: str) -> None:
+    observed, pr = snapshot(desired="1" * 40, live="1" * 40, parent="0" * 40)
+    selected = pr
+    if case == "missing":
+        observed = dataclasses.replace(observed, pull_requests=())
+    elif case == "duplicate":
+        observed = dataclasses.replace(
+            observed, pull_requests=(observed.pull_requests[0],) * 2
+        )
+    else:
+        selected = sync.PullRequestId(observed.repository, 8)
+
+    result = sync.derive_desired(observed, selection(observed, selected))
+
+    assert isinstance(result, sync.Blocked)
+    assert result.reasons[0].code == "selected-pr-unavailable"
+    assert result.reasons[0].subject == "selected PR"
+
+
+@pytest.mark.parametrize("bookmark_target", (None, "9" * 40))
+def test_explicit_assignment_is_authoritative_after_resolution(
+    bookmark_target: str | None,
+) -> None:
+    observed, pr = snapshot(desired="1" * 40, live="1" * 40, parent="0" * 40)
+    bookmarks = (
+        ()
+        if bookmark_target is None
+        else (sync.LocalBookmark("topic", sync.CommitTarget(bookmark_target)),)
+    )
+    observed = dataclasses.replace(
+        observed,
+        local=dataclasses.replace(observed.local, local_bookmarks=bookmarks),
+    )
+
+    result = sync.derive_desired(observed, selection(observed, pr))
+
+    assert isinstance(result, sync.DesiredStack)
+    assert result.active[0].desired_commit_id == "1" * 40
+
+
+@pytest.mark.parametrize(
+    "state", (sync.PullRequestState.CLOSED, sync.PullRequestState.MERGED)
+)
+def test_planner_rejects_non_open_pull_request(state: sync.PullRequestState) -> None:
+    observed, pr = snapshot(desired="2" * 40, live="1" * 40, parent="1" * 40)
+    observed = dataclasses.replace(
+        observed,
+        pull_requests=(dataclasses.replace(observed.pull_requests[0], state=state),),
+    )
+
+    plan = sync.plan_sync(
+        observed, sync.derive_desired(observed, selection(observed, pr))
+    )
+
+    assert isinstance(plan, sync.Blocked)
+    assert plan.reasons[0].code == (
+        "unsupported-member-state"
+        if state is sync.PullRequestState.CLOSED
+        else "incomplete-selection"
+    )
+    assert plan.reasons[0].subject == (
+        "PR #7" if state is sync.PullRequestState.CLOSED else "stack"
+    )
+
+
+def test_planner_rejects_fork_head_repository() -> None:
+    observed, pr = snapshot(desired="2" * 40, live="1" * 40, parent="1" * 40)
+    fork = sync.GitHubRepositoryId("github.com", "R_fork")
+    observed = dataclasses.replace(
+        observed,
+        pull_requests=(
+            dataclasses.replace(observed.pull_requests[0], head_repository=fork),
+        ),
+    )
+
+    plan = sync.plan_sync(
+        observed, sync.derive_desired(observed, selection(observed, pr))
+    )
+
+    assert isinstance(plan, sync.Blocked)
+    assert plan.reasons[0].code == "nonlocal-pr"
+    assert plan.reasons[0].subject == "PR #7"
+
+
+def test_planner_rejects_valid_multi_member_server_stack() -> None:
+    observed, pr = snapshot(desired="2" * 40, live="1" * 40, parent="1" * 40)
+    other = sync.PullRequestId(observed.repository, 8)
+    observed = dataclasses.replace(
+        observed,
+        membership=sync.ServerStackMembership(
+            pr,
+            sync.GitHubStackSummary(
+                sync.GitHubStackId(observed.repository, 17), "STACK_node", "main"
+            ),
+            (pr, other),
+        ),
+    )
+
+    plan = sync.plan_sync(
+        observed, sync.derive_desired(observed, selection(observed, pr))
+    )
+
+    assert isinstance(plan, sync.Blocked)
+    assert plan.reasons[0].code == "incomplete-membership"
+    assert plan.reasons[0].subject == "stack"
+
+
+@pytest.mark.parametrize(
+    ("desired_commit", "live_commit", "parent_commit", "expected_type", "rendered"),
+    (
+        (
+            "1" * 40,
+            "1" * 40,
+            "0" * 40,
+            sync.NoOp,
+            "no-op: observed head and metadata already equal desired state",
+        ),
+        (
+            "2" * 40,
+            "1" * 40,
+            "1" * 40,
+            sync.Apply,
+            f"apply:\n  - publish {'2' * 40} to refs/heads/topic",
+        ),
+    ),
+)
+def test_successful_derive_plan_and_render_are_pure(
+    desired_commit: str,
+    live_commit: str,
+    parent_commit: str,
+    expected_type: type[sync.NoOp] | type[sync.Apply],
+    rendered: str,
+    monkeypatch,
+) -> None:
+    observed, pr = snapshot(
+        desired=desired_commit, live=live_commit, parent=parent_commit
+    )
+
+    def unexpected_io(*_args, **_kwargs):
+        pytest.fail("derive/plan/render performed I/O")
+
+    monkeypatch.setattr(sync, "_run", unexpected_io)
+    monkeypatch.setattr(sync.subprocess, "run", unexpected_io)
+
+    selected = selection(observed, pr)
+    desired = sync.derive_desired(observed, selected)
+    plan = sync.plan_sync(observed, desired)
+
+    assert isinstance(plan, expected_type)
+    assert sync.render(plan) == rendered
+    assert sync.derive_desired(observed, selected) == desired
+    assert sync.plan_sync(observed, desired) == plan
+
+
+def test_pure_planner_distinguishes_fast_forward_from_tracking_equality() -> None:
+    old, new = "1" * 40, "2" * 40
+    observed, pr = snapshot(desired=new, live=old, parent=old)
+
+    desired = sync.derive_desired(observed, selection(observed, pr))
+    plan = sync.plan_sync(observed, desired)
+
+    assert isinstance(plan, sync.Apply)
+    assert isinstance(plan.head_updates[0].authority, sync.FastForward)
+    assert plan.head_updates[0] == sync.PlannedHeadUpdate(
+        sync.RemoteBranchRef(observed.repository, "refs/heads/topic"),
+        old,
+        new,
+        sync.FastForward(),
+    )
+    assert sync.plan_sync(observed, desired) == plan
+
+    # A fetched/tracking value equal to the live head is deliberately not
+    # replacement authority when that head is not an ancestor.
+    divergent = dataclasses.replace(
+        observed,
+        local=dataclasses.replace(
+            observed.local,
+            commits=(
+                dataclasses.replace(
+                    observed.local.commits[0], parent_commit_ids=("3" * 40,)
+                ),
+                dataclasses.replace(observed.local.commits[1], commit_id="3" * 40),
+            ),
+        ),
+    )
+    blocked = sync.plan_sync(
+        divergent, sync.derive_desired(divergent, selection(divergent, pr))
+    )
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "replacement-unauthorized"
+
+
+def test_planner_produces_noop_metadata_only_and_head_plus_metadata_effects() -> None:
+    commit_id = "1" * 40
+    observed, pr = snapshot(desired=commit_id, live=commit_id, parent="0" * 40)
+    desired = sync.derive_desired(observed, selection(observed, pr))
+    no_op = sync.plan_sync(observed, desired)
+    assert isinstance(no_op, sync.NoOp)
+
+    metadata_drift = dataclasses.replace(
+        observed,
+        pull_requests=(
+            dataclasses.replace(
+                observed.pull_requests[0], title="Stale title", body="Stale body"
+            ),
+        ),
+    )
+    metadata_desired = sync.derive_desired(
+        metadata_drift, selection(metadata_drift, pr)
+    )
+    metadata_only = sync.plan_sync(metadata_drift, metadata_desired)
+    assert isinstance(metadata_only, sync.Apply)
+    assert metadata_drift.local.commits == observed.local.commits
+    assert metadata_desired == desired
+    assert metadata_only.head_updates == ()
+    assert metadata_only.metadata_updates == (
+        sync.PRMetadataUpdate(pr, "Desired title", "Desired body"),
+    )
+    assert sync.render(metadata_only) == "apply:\n  - update metadata for PR #7"
+
+    rewritten, pr = snapshot(desired="2" * 40, live=commit_id, parent=commit_id)
+    rewritten = dataclasses.replace(
+        rewritten,
+        local=dataclasses.replace(
+            rewritten.local,
+            commits=(
+                dataclasses.replace(
+                    rewritten.local.commits[0], description="New title\n\nNew body"
+                ),
+                rewritten.local.commits[1],
+            ),
+        ),
+    )
+    head_and_metadata = sync.plan_sync(
+        rewritten,
+        sync.derive_desired(rewritten, selection(rewritten, pr)),
+    )
+    assert isinstance(head_and_metadata, sync.Apply)
+    assert len(head_and_metadata.head_updates) == 1
+    assert len(head_and_metadata.metadata_updates) == 1
+
+
+def test_operation_id_is_observation_provenance_not_a_plan_dependency() -> None:
+    observed, pr = snapshot(desired="2" * 40, live="1" * 40, parent="1" * 40)
+    desired = sync.derive_desired(observed, selection(observed, pr))
+    plan = sync.plan_sync(observed, desired)
+    changed = dataclasses.replace(
+        observed,
+        local=dataclasses.replace(observed.local, operation_id="unrelated-operation"),
+    )
+    changed_desired = sync.derive_desired(changed, selection(changed, pr))
+    changed_plan = sync.plan_sync(changed, changed_desired)
+
+    assert changed.local == dataclasses.replace(
+        observed.local, operation_id="unrelated-operation"
+    )
+    assert changed_desired == desired
+    assert changed_plan == plan
+    assert isinstance(plan, sync.Apply)
+    assert changed_plan.dependencies == plan.dependencies
+    assert changed_plan.head_updates == plan.head_updates
+    assert changed_plan.metadata_updates == plan.metadata_updates
+
+
+@pytest.mark.parametrize("automation_field", ("auto_merge_enabled", "in_merge_queue"))
+def test_active_automation_blocks_mutation_but_allows_exact_noop(
+    automation_field: str,
+) -> None:
+    live = "1" * 40
+    mutating, pr = snapshot(desired="2" * 40, live=live, parent=live)
+    automated_pr = dataclasses.replace(
+        mutating.pull_requests[0], **{automation_field: True}
+    )
+    mutating = dataclasses.replace(mutating, pull_requests=(automated_pr,))
+    blocked = sync.plan_sync(
+        mutating,
+        sync.derive_desired(mutating, selection(mutating, pr)),
+    )
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "active-automation"
+
+    equal, pr = snapshot(desired=live, live=live, parent="0" * 40)
+    equal = dataclasses.replace(
+        equal,
+        pull_requests=(
+            dataclasses.replace(equal.pull_requests[0], **{automation_field: True}),
+        ),
+    )
+    no_op = sync.plan_sync(
+        equal,
+        sync.derive_desired(equal, selection(equal, pr)),
+    )
+    assert isinstance(no_op, sync.NoOp)
+
+
+def test_comparison_validation_covers_boundaries_and_multicommit_success() -> None:
+    base = "b" * 40
+    live = "1" * 40
+
+    empty, pr = snapshot(desired=base, live=live, parent="0" * 40)
+    merge, _ = snapshot(desired="2" * 40, live=live, parent=live)
+    merge = dataclasses.replace(
+        merge,
+        local=dataclasses.replace(
+            merge.local,
+            commits=(
+                dataclasses.replace(
+                    merge.local.commits[0], parent_commit_ids=(live, "3" * 40)
+                ),
+                merge.local.commits[1],
+            ),
+        ),
+    )
+    conflicted, _ = snapshot(desired="2" * 40, live=live, parent=live)
+    conflicted = dataclasses.replace(
+        conflicted,
+        local=dataclasses.replace(
+            conflicted.local,
+            commits=(
+                dataclasses.replace(conflicted.local.commits[0], has_conflicts=True),
+                conflicted.local.commits[1],
+            ),
+        ),
+    )
+    missing, _ = snapshot(desired="2" * 40, live=live, parent=live)
+    missing = dataclasses.replace(
+        missing,
+        local=dataclasses.replace(
+            missing.local,
+            commits=(
+                dataclasses.replace(
+                    missing.local.commits[0], parent_commit_ids=("9" * 40,)
+                ),
+                missing.local.commits[1],
+            ),
+        ),
+    )
+    cycle, _ = snapshot(desired="2" * 40, live=live, parent=live)
+    cycle = dataclasses.replace(
+        cycle,
+        local=dataclasses.replace(
+            cycle.local,
+            commits=(
+                cycle.local.commits[0],
+                dataclasses.replace(
+                    cycle.local.commits[1], parent_commit_ids=("2" * 40,)
+                ),
+            ),
+        ),
+    )
+
+    for observed, code in (
+        (empty, "invalid-comparison"),
+        (merge, "invalid-comparison"),
+        (conflicted, "commit-conflicted"),
+        (missing, "invalid-comparison"),
+        (cycle, "invalid-comparison"),
+    ):
+        plan = sync.plan_sync(
+            observed,
+            sync.derive_desired(observed, selection(observed, pr)),
+        )
+        assert isinstance(plan, sync.Blocked)
+        assert plan.reasons[0].code == code
+
+    linear, pr = snapshot(desired="2" * 40, live=live, parent=live)
+    plan = sync.plan_sync(
+        linear,
+        sync.derive_desired(linear, selection(linear, pr)),
+    )
+    assert isinstance(plan, sync.Apply)
+
+
+def test_same_branch_in_another_repository_is_not_authoritative() -> None:
+    old, new = "1" * 40, "2" * 40
+    observed, pr = snapshot(desired=new, live=old, parent=old)
+    other_repository = sync.GitHubRepositoryId(observed.repository.host, "R_other_repo")
+    wrong_refs = tuple(
+        dataclasses.replace(
+            live_ref,
+            ref=dataclasses.replace(live_ref.ref, repository=other_repository),
+        )
+        for live_ref in observed.live_refs
+    )
+    observed = dataclasses.replace(observed, live_refs=wrong_refs)
+
+    blocked = sync.plan_sync(
+        observed,
+        sync.derive_desired(observed, selection(observed, pr)),
+    )
+
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "base-disagrees"
+
+
+@pytest.mark.parametrize(
+    ("branch", "commit_id", "code"),
+    (
+        ("topic", None, "head-disagrees"),
+        ("topic", "9" * 40, "head-disagrees"),
+        ("main", None, "base-disagrees"),
+        ("main", "8" * 40, "base-disagrees"),
+    ),
+)
+def test_planner_rejects_missing_and_disagreeing_live_refs(
+    branch: str, commit_id: str | None, code: str
+) -> None:
+    observed, pr = snapshot(desired="2" * 40, live="1" * 40, parent="1" * 40)
+    full_name = f"refs/heads/{branch}"
+    observed = dataclasses.replace(
+        observed,
+        live_refs=tuple(
+            dataclasses.replace(ref, commit_id=commit_id)
+            if ref.ref.full_name == full_name
+            else ref
+            for ref in observed.live_refs
+        ),
+    )
+
+    plan = sync.plan_sync(
+        observed, sync.derive_desired(observed, selection(observed, pr))
+    )
+
+    assert isinstance(plan, sync.Blocked)
+    assert plan.reasons[0].code == code
+    assert plan.reasons[0].subject == full_name
+
+
+def test_last_publication_uses_logical_repo_identity_not_push_transport() -> None:
+    live, desired = "1" * 40, "2" * 40
+    observed, pr = snapshot(desired=desired, live=live, parent="3" * 40)
+    publication = sync.LastPublishedHead(
+        pr,
+        sync.RemoteBranchRef(observed.repository, "refs/heads/topic"),
+        live,
+    )
+    state = sync.TrackedState((), (publication,))
+    observed = dataclasses.replace(
+        observed, tool_state=sync.ToolStateRead("a" * 40, state, None)
+    )
+
+    plan = sync.plan_sync(
+        dataclasses.replace(observed, push_url="https://github.com/o/r.git"),
+        sync.derive_desired(observed, selection(observed, pr)),
+    )
+    assert isinstance(plan, sync.Apply)
+    assert plan.head_updates[0].authority == sync.MatchesLastPublication(publication)
+    assert plan.dependencies.push_url == "https://github.com/o/r.git"
+
+    stale = dataclasses.replace(publication, verified_commit_id="9" * 40)
+    observed = dataclasses.replace(
+        observed,
+        tool_state=sync.ToolStateRead("b" * 40, sync.TrackedState((), (stale,)), None),
+    )
+    blocked = sync.plan_sync(
+        observed,
+        sync.derive_desired(observed, selection(observed, pr)),
+    )
+    assert isinstance(blocked, sync.Blocked)
+
+
+def test_description_metadata_uses_existing_markdown_normalization() -> None:
+    observed, pr = snapshot(desired="1" * 40, live="1" * 40, parent="0" * 40)
+    description = "Title\n\nsoft\nwrapped\n\n- list\n- stays"
+    observed = dataclasses.replace(
+        observed,
+        local=dataclasses.replace(
+            observed.local,
+            commits=(
+                dataclasses.replace(observed.local.commits[0], description=description),
+            ),
+        ),
+    )
+
+    desired = sync.derive_desired(observed, selection(observed, pr))
+
+    assert isinstance(desired, sync.DesiredStack)
+    assert desired.active[0].title == "Title"
+    assert desired.active[0].body == "soft wrapped\n\n- list\n- stays"
+
+
+def test_observations_are_deeply_immutable() -> None:
+    observed, _pr = snapshot(desired="1" * 40, live="1" * 40, parent="0" * 40)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        observed.local.operation_id = "other"  # type: ignore[misc]
+    assert isinstance(observed.live_refs, tuple)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
