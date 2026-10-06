@@ -1,0 +1,1004 @@
+"""Observation, planning, application, and recovery for ``jj stack sync``."""
+
+from __future__ import annotations
+
+import fcntl
+import http.client
+import json
+import os
+import re
+import socket
+import ssl
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, replace
+from enum import StrEnum
+from pathlib import Path
+from typing import Protocol
+from urllib.parse import quote, urlparse
+from markdown_it import MarkdownIt
+from markdown_it.rules_inline.newline import newline as _parse_newline
+from markdown_it.rules_inline.state_inline import StateInline
+
+
+STATE_REF = "refs/jj-stack/state"
+RECOVERY_REF = "refs/jj-stack/recovery"
+
+
+class Error(Exception):
+    pass
+
+
+class ConcurrentUpdate(Error):
+    pass
+
+
+class LockBusy(Error):
+    pass
+
+
+class RemoteResolutionError(Error):
+    pass
+
+
+class SourceUnavailable(Error):
+    pass
+
+
+class MalformedSource(Error):
+    pass
+
+
+class IncompleteSource(Error):
+    pass
+
+
+class SourceMismatch(Error):
+    pass
+
+
+@dataclass(frozen=True)
+class GitHubRepositoryId:
+    """GitHub host plus the repository's immutable GraphQL node ID."""
+
+    host: str
+    node_id: str
+
+
+@dataclass(frozen=True)
+class GitHubRepository:
+    identity: GitHubRepositoryId
+    name_with_owner: str
+    url: str
+    default_branch: str | None
+
+
+@dataclass(frozen=True)
+class PullRequestId:
+    """One repository-qualified pull request number."""
+
+    repository: GitHubRepositoryId
+    number: int
+
+    def __post_init__(self) -> None:
+        if type(self.number) is not int or self.number <= 0:
+            raise ValueError("pull request number must be a positive integer")
+
+
+@dataclass(frozen=True)
+class GitHubStackId:
+    repository: GitHubRepositoryId
+    number: int
+
+    def __post_init__(self) -> None:
+        if type(self.number) is not int or self.number <= 0:
+            raise ValueError("stack number must be a positive integer")
+
+
+@dataclass(frozen=True)
+class GitHubStackSummary:
+    identity: GitHubStackId
+    node_id: str
+    base_branch: str
+
+
+@dataclass(frozen=True)
+class RemoteBranchRef:
+    """A fully qualified branch in one logical GitHub repository."""
+
+    repository: GitHubRepositoryId
+    full_name: str
+
+    def __post_init__(self) -> None:
+        if (
+            not self.full_name.startswith("refs/heads/")
+            or self.full_name == "refs/heads/"
+        ):
+            raise ValueError("remote branch ref must use the refs/heads namespace")
+
+
+@dataclass(frozen=True)
+class AbsentBookmarkTarget:
+    """jj returned a bookmark/ref record whose target is absent."""
+
+    pass
+
+
+@dataclass(frozen=True)
+class CommitTarget:
+    """The bookmark resolves to exactly one commit."""
+
+    commit_id: str
+
+
+@dataclass(frozen=True)
+class BookmarkConflict:
+    """The removed and added terms of an unresolved jj ref conflict."""
+
+    removed_commit_ids: tuple[str, ...]
+    added_commit_ids: tuple[str, ...]
+
+
+BookmarkTarget = AbsentBookmarkTarget | CommitTarget | BookmarkConflict
+
+
+class TrackingState(StrEnum):
+    TRACKED = "tracked"
+    UNTRACKED = "untracked"
+
+
+@dataclass(frozen=True)
+class LocalBookmark:
+    name: str
+    target: BookmarkTarget
+
+
+@dataclass(frozen=True)
+class JjRemoteBookmark:
+    remote: str
+    name: str
+    target: BookmarkTarget
+    tracking_state: TrackingState
+
+
+@dataclass(frozen=True)
+class GitRemoteTrackingRef:
+    """A local Git refs/remotes entry; never publication authority."""
+
+    full_name: str
+    commit_id: str
+
+
+@dataclass(frozen=True)
+class LiveRemoteRef:
+    """Authoritative destination read; None means confirmed absence."""
+
+    ref: RemoteBranchRef
+    commit_id: str | None
+
+
+@dataclass(frozen=True)
+class ObservedCommit:
+    commit_id: str
+    parent_commit_ids: tuple[str, ...]
+    change_id: str
+    description: str
+    has_conflicts: bool
+    is_hidden: bool
+
+
+class PullRequestState(StrEnum):
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+    MERGED = "MERGED"
+
+
+class PullRequestUpdateState(StrEnum):
+    OPEN = "open"
+    CLOSED = "closed"
+
+
+class CommitStatusState(StrEnum):
+    ERROR = "error"
+    FAILURE = "failure"
+    PENDING = "pending"
+    SUCCESS = "success"
+
+
+@dataclass(frozen=True)
+class GitHubPullRequest:
+    """Validated GitHub fields used by planning, not a raw API response."""
+
+    identity: PullRequestId
+    node_id: str
+    state: PullRequestState
+    draft: bool
+    head_repository: GitHubRepositoryId | None
+    head_branch: str
+    head_oid: str | None
+    base_branch: str
+    base_oid: str | None
+    auto_merge_enabled: bool
+    in_merge_queue: bool
+    title: str
+    body: str
+    stack: GitHubStackSummary | None
+
+    @property
+    def number(self) -> int:
+        return self.identity.number
+
+
+@dataclass(frozen=True)
+class GitHubStack:
+    identity: GitHubStackId
+    node_id: str
+    base_branch: str
+    pull_requests: tuple[PullRequestId, ...]
+
+
+@dataclass(frozen=True)
+class StandalonePullRequest:
+    pr: PullRequestId
+
+
+@dataclass(frozen=True)
+class ServerStackMembership:
+    """Complete ordered membership for the stack containing selected_pr."""
+
+    selected_pr: PullRequestId
+    stack: GitHubStackSummary
+    ordered_prs: tuple[PullRequestId, ...]
+
+    def __post_init__(self) -> None:
+        if not self.ordered_prs:
+            raise ValueError("server stack identity and membership must be nonempty")
+        if self.selected_pr not in self.ordered_prs:
+            raise ValueError("selected PR must belong to the observed server stack")
+        if len(set(self.ordered_prs)) != len(self.ordered_prs):
+            raise ValueError("server stack membership must not contain duplicates")
+        if any(pr.repository != self.selected_pr.repository for pr in self.ordered_prs):
+            raise ValueError("all server stack members must belong to one repository")
+        if self.stack.identity.repository != self.selected_pr.repository:
+            raise ValueError("server stack and members must belong to one repository")
+
+    @property
+    def base_branch(self) -> str:
+        return self.stack.base_branch
+
+    @property
+    def server_stack_id(self) -> str:
+        return self.stack.node_id
+
+    @property
+    def server_stack_number(self) -> int:
+        return self.stack.identity.number
+
+
+PullRequestMembership = StandalonePullRequest | ServerStackMembership
+
+
+@dataclass(frozen=True)
+class LocalObservation:
+    workspace: str
+    operation_id: str
+    effective_config: tuple[tuple[str, str], ...]
+    workspace_targets: tuple[tuple[str, str], ...]
+    local_bookmarks: tuple[LocalBookmark, ...]
+    remote_bookmarks: tuple[JjRemoteBookmark, ...]
+    git_remote_tracking_refs: tuple[GitRemoteTrackingRef, ...]
+    commits: tuple[ObservedCommit, ...]
+    git_common_dir: str
+    git_remotes: tuple[str, ...] = ()
+
+
+def resolve_remote(local: LocalObservation, explicit: str | None = None) -> str:
+    """Choose one publication remote using native jj precedence."""
+    configured = dict(local.effective_config).get("git.push")
+    selected = explicit if explicit is not None else configured
+    if selected is not None:
+        if not selected or selected not in local.git_remotes:
+            raise RemoteResolutionError(
+                f"selected Git remote does not exist: {selected or '<empty>'}"
+            )
+        return selected
+    if not local.git_remotes:
+        raise RemoteResolutionError("no Git remote is configured")
+    if len(local.git_remotes) == 1:
+        return local.git_remotes[0]
+    if "origin" in local.git_remotes:
+        return "origin"
+    raise RemoteResolutionError("multiple Git remotes are configured without origin")
+
+
+@dataclass(frozen=True)
+class LastPublishedHead:
+    """Last commit this tool published and verified for one exact branch."""
+
+    pr: PullRequestId
+    ref: RemoteBranchRef
+    verified_commit_id: str
+
+
+@dataclass(frozen=True)
+class LastAdoptedHead:
+    """An exact GitHub head accepted after a verified external restack."""
+
+    pr: PullRequestId
+    ref: RemoteBranchRef
+    verified_commit_id: str
+
+
+@dataclass(frozen=True)
+class LastPublishedBoundary:
+    """Verified ownership of a merged-prefix alias, never of the merged head.
+
+    A boundary aliases the integration branch at the seam immediately after
+    ``merged_pr``.  Keeping this receipt separate from head authority is
+    intentional: equality with either a PR head or the integration ref does
+    not grant permission to move the alias.
+    """
+
+    merged_pr: PullRequestId
+    ref: RemoteBranchRef
+    verified_commit_id: str
+
+
+@dataclass(frozen=True)
+class TrackedStack:
+    repository: GitHubRepositoryId
+    base_branch: str
+    ordered_prs: tuple[PullRequestId, ...]
+
+
+class DetachedDisposition(StrEnum):
+    CLEANUP = "cleanup"
+    KEEP = "keep"
+
+
+@dataclass(frozen=True)
+class DetachedAssociation:
+    """Durable ownership evidence for a PR no longer in an active stack."""
+
+    pr: PullRequestId
+    ref: RemoteBranchRef
+    verified_commit_id: str
+    disposition: DetachedDisposition = DetachedDisposition.CLEANUP
+
+    def __post_init__(self) -> None:
+        if self.pr.repository != self.ref.repository or not self.verified_commit_id:
+            raise ValueError("detached association ownership is malformed")
+
+
+@dataclass(frozen=True)
+class TrackedState:
+    stacks: tuple[TrackedStack, ...]
+    last_published_heads: tuple[LastPublishedHead, ...]
+    last_adopted_heads: tuple[LastAdoptedHead, ...] = ()
+    detached_associations: tuple[DetachedAssociation, ...] = ()
+    last_published_boundaries: tuple[LastPublishedBoundary, ...] = ()
+
+
+EMPTY_STATE = TrackedState((), (), (), (), ())
+
+
+@dataclass(frozen=True)
+class ToolStateRead:
+    """Decoded tool state bound to the exact local blob ref observations."""
+
+    state_blob_oid: str | None
+    state: TrackedState
+    recovery_blob_oid: str | None
+
+
+def _run(
+    args: Sequence[str], *, cwd: str | Path | None = None, stdin: str | None = None
+) -> str:
+    result = subprocess.run(
+        args, cwd=cwd, input=stdin, text=True, capture_output=True, check=False
+    )
+    if result.returncode:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise Error(f"`{' '.join(args)}` failed" + (f": {detail}" if detail else ""))
+    return result.stdout
+
+
+def _jj(workspace: str | Path, operation: str | None, *args: str) -> str:
+    command = ["jj", "--color=never", "--repository", os.fspath(workspace)]
+    if operation is not None:
+        command.append(f"--at-op={operation}")
+    command.append("--ignore-working-copy")
+    command.extend(args)
+    return _run(command)
+
+
+def pin_operation(workspace: str | Path) -> str:
+    """Capture the current operation without snapshotting or reconciling the WC."""
+    rows = _jj(
+        workspace,
+        "@",
+        "op",
+        "log",
+        "--no-graph",
+        "--limit",
+        "1",
+        "-T",
+        'self.id() ++ "\\n"',
+    ).splitlines()
+    if len(rows) != 1 or not rows[0]:
+        raise Error("could not capture exactly one jj operation")
+    return rows[0]
+
+
+def _json_lines(output: str, source: str) -> tuple[dict[str, object], ...]:
+    try:
+        values = tuple(json.loads(line) for line in output.split("\n") if line)
+    except json.JSONDecodeError as exc:
+        raise Error(f"invalid structured output from {source}") from exc
+    if any(not isinstance(value, dict) for value in values):
+        raise Error(f"invalid structured output from {source}")
+    return values  # type: ignore[return-value]
+
+
+def git_common_dir(workspace: str | Path, operation: str | None = None) -> Path:
+    operation = operation or pin_operation(workspace)
+    git_root = Path(_jj(workspace, operation, "git", "root").strip())
+    value = _run(
+        [
+            "git",
+            f"--git-dir={git_root}",
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-common-dir",
+        ]
+    ).strip()
+    return Path(value).resolve()
+
+
+def read_ref_oid(
+    workspace: str | Path, ref: str, operation: str | None = None
+) -> str | None:
+    common = git_common_dir(workspace, operation)
+    result = subprocess.run(
+        ["git", f"--git-dir={common}", "rev-parse", "--verify", "--quiet", ref],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode == 1:
+        return None
+    if result.returncode:
+        raise Error(f"could not read private ref {ref}: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def _bookmark_record(
+    record: dict[str, object],
+) -> tuple[str, str, BookmarkTarget, TrackingState]:
+    if set(record) != {
+        "name",
+        "remote",
+        "conflict",
+        "target",
+        "removed",
+        "added",
+        "tracked",
+    }:
+        raise Error("invalid structured output from jj bookmark list")
+    name, remote = record["name"], record["remote"]
+    conflict, commit_id = record["conflict"], record["target"]
+    removed, added, tracked = record["removed"], record["added"], record["tracked"]
+    if (
+        not isinstance(name, str)
+        or not name
+        or not isinstance(remote, str)
+        or type(conflict) is not bool
+        or not isinstance(commit_id, str)
+        or not isinstance(removed, list)
+        or not isinstance(added, list)
+        or any(not isinstance(value, str) or not value for value in (*removed, *added))
+        or type(tracked) is not bool
+    ):
+        raise Error("invalid structured output from jj bookmark list")
+    if conflict:
+        if commit_id or not removed and not added:
+            raise Error("invalid structured output from jj bookmark list")
+        target: BookmarkTarget = BookmarkConflict(tuple(removed), tuple(added))
+    else:
+        if removed or added != ([commit_id] if commit_id else []):
+            raise Error("invalid structured output from jj bookmark list")
+        target = CommitTarget(commit_id) if commit_id else AbsentBookmarkTarget()
+    return (
+        name,
+        remote,
+        target,
+        TrackingState.TRACKED if tracked else TrackingState.UNTRACKED,
+    )
+
+
+def _commit_record(record: dict[str, object]) -> ObservedCommit:
+    if set(record) != {
+        "commit_id",
+        "parent_commit_ids",
+        "change",
+        "description",
+        "conflicts",
+        "hidden",
+    }:
+        raise Error("invalid structured output from jj log")
+    commit_id = record["commit_id"]
+    parent_commit_ids = record["parent_commit_ids"]
+    change_id = record["change"]
+    description = record["description"]
+    conflicts = record["conflicts"]
+    hidden = record["hidden"]
+    if (
+        not isinstance(commit_id, str)
+        or not commit_id
+        or not isinstance(parent_commit_ids, list)
+        or any(not isinstance(value, str) or not value for value in parent_commit_ids)
+        or not isinstance(change_id, str)
+        or not change_id
+        or not isinstance(description, str)
+        or type(conflicts) is not bool
+        or type(hidden) is not bool
+    ):
+        raise Error("invalid structured output from jj log")
+    return ObservedCommit(
+        commit_id,
+        tuple(parent_commit_ids),
+        change_id,
+        description,
+        conflicts,
+        hidden,
+    )
+
+
+def observe_commits(
+    workspace: str | Path,
+    operation: str,
+    revision: str,
+    *,
+    ancestry_order: bool = False,
+) -> tuple[ObservedCommit, ...]:
+    """Observe only commit records at one already-pinned operation."""
+    commit_template = (
+        "'{\"commit_id\":' ++ stringify(commit_id).escape_json()"
+        " ++ ',\"parent_commit_ids\":' ++ json(parents.map(|p| p.commit_id()))"
+        " ++ ',\"change\":' ++ stringify(change_id).escape_json()"
+        " ++ ',\"description\":' ++ description.escape_json()"
+        " ++ ',\"conflicts\":' ++ conflict"
+        " ++ ',\"hidden\":' ++ hidden ++ '}' ++ \"\\n\""
+    )
+    arguments = ["log", "--no-graph"]
+    if ancestry_order:
+        arguments.append("--reversed")
+    arguments.extend(("-r", revision, "-T", commit_template))
+    records = _json_lines(
+        _jj(workspace, operation, *arguments),
+        "jj log",
+    )
+    commits = tuple(_commit_record(row) for row in records)
+    if len({commit.commit_id for commit in commits}) != len(commits):
+        raise Error("duplicate commit in structured output from jj log")
+    return commits
+
+
+def observe_local(
+    workspace: str | Path,
+    *,
+    revision: str,
+    config_keys: Sequence[str],
+) -> LocalObservation:
+    """Observe local jj/Git state at one pinned operation without mutating it."""
+    workspace = Path(workspace).resolve()
+    operation = pin_operation(workspace)
+    bookmark_template = (
+        "'{\"name\":' ++ name.escape_json()"
+        " ++ ',\"remote\":' ++ if(remote, remote.escape_json(), '\"\"')"
+        " ++ ',\"conflict\":' ++ conflict"
+        " ++ ',\"target\":' ++ if(normal_target, stringify(normal_target.commit_id()).escape_json(), '\"\"')"
+        " ++ ',\"removed\":' ++ json(removed_targets.map(|c| c.commit_id()))"
+        " ++ ',\"added\":' ++ json(added_targets.map(|c| c.commit_id()))"
+        " ++ ',\"tracked\":' ++ tracking_present ++ '}' ++ \"\\n\""
+    )
+    records = _json_lines(
+        _jj(workspace, operation, "bookmark", "list", "--all", "-T", bookmark_template),
+        "jj bookmark list",
+    )
+    locals_: list[LocalBookmark] = []
+    remotes: list[JjRemoteBookmark] = []
+    for record in records:
+        name, remote, target, tracking_state = _bookmark_record(record)
+        if remote:
+            remotes.append(JjRemoteBookmark(remote, name, target, tracking_state))
+        else:
+            locals_.append(LocalBookmark(name, target))
+    if len({item.name for item in locals_}) != len(locals_) or len(
+        {(item.remote, item.name) for item in remotes}
+    ) != len(remotes):
+        raise Error("duplicate bookmark in structured output from jj bookmark list")
+
+    git_root = Path(_jj(workspace, operation, "git", "root").strip())
+    commits = observe_commits(workspace, operation, revision)
+    workspace_rows = _jj(
+        workspace,
+        operation,
+        "workspace",
+        "list",
+        "-T",
+        'name ++ "\\t" ++ target.commit_id() ++ "\\n"',
+    ).splitlines()
+    workspace_targets: list[tuple[str, str]] = []
+    for row in workspace_rows:
+        fields = row.split("\t")
+        if len(fields) != 2 or not all(fields):
+            raise Error("invalid structured output from jj workspace list")
+        workspace_targets.append((fields[0], fields[1]))
+    if len({name for name, _target in workspace_targets}) != len(workspace_targets):
+        raise Error("duplicate workspace in structured output from jj workspace list")
+    config: list[tuple[str, str]] = []
+    for key in config_keys:
+        # Configuration is intentionally captured separately from the pinned op.
+        try:
+            value = _jj(workspace, None, "config", "get", key).rstrip("\n")
+        except Error as exc:
+            if key in {
+                "git.push",
+            } and f"Value not found for {key}" in str(exc):
+                continue
+            raise
+        config.append((key, value))
+
+    remote_rows = _jj(workspace, operation, "git", "remote", "list").splitlines()
+    git_remotes: list[str] = []
+    for row in remote_rows:
+        fields = row.split(maxsplit=1)
+        if len(fields) != 2 or not all(fields):
+            raise Error("invalid structured output from jj git remote list")
+        git_remotes.append(fields[0])
+    if len(set(git_remotes)) != len(git_remotes):
+        raise Error("duplicate remote in structured output from jj git remote list")
+
+    raw = _run(
+        [
+            "git",
+            f"--git-dir={git_root}",
+            "for-each-ref",
+            "--format=%(refname)%09%(objectname)",
+            "refs/remotes",
+        ]
+    ).splitlines()
+    tracking: list[GitRemoteTrackingRef] = []
+    for row in raw:
+        fields = row.split("\t")
+        if len(fields) != 2 or not all(fields):
+            raise Error("invalid structured output from git for-each-ref")
+        tracking.append(GitRemoteTrackingRef(fields[0], fields[1]))
+    if len({item.full_name for item in tracking}) != len(tracking):
+        raise Error("duplicate ref in structured output from git for-each-ref")
+    common = git_common_dir(workspace, operation)
+    return LocalObservation(
+        os.fspath(workspace),
+        operation,
+        tuple(config),
+        tuple(workspace_targets),
+        tuple(sorted(locals_, key=lambda value: value.name)),
+        tuple(sorted(remotes, key=lambda value: (value.remote, value.name))),
+        tuple(tracking),
+        commits,
+        os.fspath(common),
+        tuple(sorted(git_remotes)),
+    )
+
+
+def resolve_push_url(local: LocalObservation, remote: str) -> str:
+    if not remote:
+        raise ValueError("push remote must be nonempty")
+    urls = _run(
+        [
+            "git",
+            f"--git-dir={local.git_common_dir}",
+            "remote",
+            "get-url",
+            "--push",
+            "--all",
+            remote,
+        ]
+    ).splitlines()
+    if len(urls) != 1 or not urls[0]:
+        raise SourceMismatch("selected remote does not have one unambiguous push URL")
+    return urls[0]
+
+
+def state_to_json(state: TrackedState) -> str:
+    _validate_state(state)
+    return json.dumps(asdict(state), sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def parse_state(data: str) -> TrackedState:
+    def record(value: object, context: str) -> dict[str, object]:
+        if not isinstance(value, dict):
+            raise ValueError(f"{context} must be an object")
+        return value
+
+    def fields(
+        value: dict[str, object], expected: set[str], context: str
+    ) -> dict[str, object]:
+        if set(value) != expected:
+            raise ValueError(f"{context} has unexpected fields")
+        return value
+
+    def array(value: object, context: str) -> list[object]:
+        if not isinstance(value, list):
+            raise ValueError(f"{context} must be an array")
+        return value
+
+    def text(value: object, context: str) -> str:
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"{context} must be a nonempty string")
+        return value
+
+    def positive_integer(value: object, context: str) -> int:
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{context} must be a positive integer")
+        return value
+
+    def repository(value: object, context: str) -> GitHubRepositoryId:
+        raw = fields(record(value, context), {"host", "node_id"}, context)
+        return GitHubRepositoryId(
+            text(raw.get("host"), f"{context}.host"),
+            text(raw.get("node_id"), f"{context}.node_id"),
+        )
+
+    def pull_request(value: object, context: str) -> PullRequestId:
+        raw = fields(record(value, context), {"repository", "number"}, context)
+        return PullRequestId(
+            repository(raw.get("repository"), f"{context}.repository"),
+            positive_integer(raw.get("number"), f"{context}.number"),
+        )
+
+    def tracked_stack(value: object, index: int) -> TrackedStack:
+        context = f"stacks[{index}]"
+        raw = fields(
+            record(value, context),
+            {"repository", "base_branch", "ordered_prs"},
+            context,
+        )
+        return TrackedStack(
+            repository(raw.get("repository"), f"{context}.repository"),
+            text(raw.get("base_branch"), f"{context}.base_branch"),
+            tuple(
+                pull_request(pr, f"{context}.ordered_prs[{pr_index}]")
+                for pr_index, pr in enumerate(
+                    array(raw.get("ordered_prs"), f"{context}.ordered_prs")
+                )
+            ),
+        )
+
+    def last_published_head(value: object, index: int) -> LastPublishedHead:
+        context = f"last_published_heads[{index}]"
+        raw = fields(
+            record(value, context),
+            {"pr", "ref", "verified_commit_id"},
+            context,
+        )
+        ref_context = f"{context}.ref"
+        ref = fields(
+            record(raw.get("ref"), ref_context),
+            {"repository", "full_name"},
+            ref_context,
+        )
+        return LastPublishedHead(
+            pull_request(raw.get("pr"), f"{context}.pr"),
+            RemoteBranchRef(
+                repository(ref.get("repository"), f"{ref_context}.repository"),
+                text(ref.get("full_name"), f"{ref_context}.full_name"),
+            ),
+            text(raw.get("verified_commit_id"), f"{context}.verified_commit_id"),
+        )
+
+    def last_adopted_head(value: object, index: int) -> LastAdoptedHead:
+        context = f"last_adopted_heads[{index}]"
+        raw = fields(
+            record(value, context), {"pr", "ref", "verified_commit_id"}, context
+        )
+        ref_context = f"{context}.ref"
+        ref = fields(
+            record(raw.get("ref"), ref_context),
+            {"repository", "full_name"},
+            ref_context,
+        )
+        return LastAdoptedHead(
+            pull_request(raw.get("pr"), f"{context}.pr"),
+            RemoteBranchRef(
+                repository(ref.get("repository"), f"{ref_context}.repository"),
+                text(ref.get("full_name"), f"{ref_context}.full_name"),
+            ),
+            text(raw.get("verified_commit_id"), f"{context}.verified_commit_id"),
+        )
+
+    def detached_association(value: object, index: int) -> DetachedAssociation:
+        context = f"detached_associations[{index}]"
+        raw = fields(record(value, context),
+            {"pr", "ref", "verified_commit_id", "disposition"}, context)
+        ref_context = f"{context}.ref"
+        ref = fields(record(raw.get("ref"), ref_context),
+            {"repository", "full_name"}, ref_context)
+        return DetachedAssociation(
+            pull_request(raw.get("pr"), f"{context}.pr"),
+            RemoteBranchRef(repository(ref.get("repository"), f"{ref_context}.repository"),
+                text(ref.get("full_name"), f"{ref_context}.full_name")),
+            text(raw.get("verified_commit_id"), f"{context}.verified_commit_id"),
+            DetachedDisposition(raw.get("disposition")),
+        )
+
+    def published_boundary(value: object, index: int) -> LastPublishedBoundary:
+        context = f"last_published_boundaries[{index}]"
+        raw = fields(record(value, context),
+            {"merged_pr", "ref", "verified_commit_id"}, context)
+        ref_context = f"{context}.ref"
+        ref = fields(record(raw.get("ref"), ref_context),
+            {"repository", "full_name"}, ref_context)
+        return LastPublishedBoundary(
+            pull_request(raw.get("merged_pr"), f"{context}.merged_pr"),
+            RemoteBranchRef(repository(ref.get("repository"), f"{ref_context}.repository"),
+                text(ref.get("full_name"), f"{ref_context}.full_name")),
+            text(raw.get("verified_commit_id"), f"{context}.verified_commit_id"),
+        )
+
+    try:
+        raw = record(json.loads(data), "root")
+        old_fields = {"stacks", "last_published_heads", "last_adopted_heads"}
+        optional_fields = {"detached_associations", "last_published_boundaries"}
+        if not old_fields <= set(raw) or not set(raw) <= old_fields | optional_fields:
+            raise ValueError("root has unexpected fields")
+        stacks = tuple(
+            tracked_stack(value, index)
+            for index, value in enumerate(array(raw.get("stacks"), "stacks"))
+        )
+        publications = tuple(
+            last_published_head(value, index)
+            for index, value in enumerate(
+                array(raw.get("last_published_heads"), "last_published_heads")
+            )
+        )
+        adoptions = tuple(
+            last_adopted_head(value, index)
+            for index, value in enumerate(
+                array(raw.get("last_adopted_heads"), "last_adopted_heads")
+            )
+        )
+        detached = tuple(detached_association(value, index) for index, value in enumerate(
+            array(raw.get("detached_associations", []), "detached_associations")))
+        boundaries = tuple(published_boundary(value, index) for index, value in enumerate(
+            array(raw.get("last_published_boundaries", []), "last_published_boundaries")))
+        state = TrackedState(stacks, publications, adoptions, detached, boundaries)
+        _validate_state(state)
+        return state
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise Error(f"invalid refs/jj-stack/state payload: {exc}") from exc
+
+
+def _validate_state(state: TrackedState) -> None:
+    def require_text(*values: object) -> None:
+        if any(not isinstance(value, str) or not value for value in values):
+            raise ValueError("state identity fields must be nonempty strings")
+
+    authority_keys: set[tuple[GitHubRepositoryId, PullRequestId, str]] = set()
+    memberships: set[tuple[GitHubRepositoryId, PullRequestId]] = set()
+    detached_ids: set[PullRequestId] = set()
+    for association in state.detached_associations:
+        require_text(association.pr.repository.host, association.pr.repository.node_id,
+            association.ref.full_name, association.verified_commit_id)
+        if association.pr in detached_ids or association.pr.repository != association.ref.repository:
+            raise ValueError("ambiguous detached association")
+        detached_ids.add(association.pr)
+    for stack in state.stacks:
+        require_text(
+            stack.base_branch,
+            stack.repository.host,
+            stack.repository.node_id,
+        )
+        if not stack.ordered_prs:
+            raise ValueError("invalid tracked stack")
+        for pr in stack.ordered_prs:
+            require_text(pr.repository.host, pr.repository.node_id)
+            if pr.repository != stack.repository:
+                raise ValueError("stack contains a PR from another repository")
+            membership = (stack.repository, pr)
+            if membership in memberships:
+                raise ValueError("overlapping tracked stack membership")
+            memberships.add(membership)
+    if detached_ids.intersection(pr for _repository, pr in memberships):
+        raise ValueError("detached association is still active")
+    for publication in (*state.last_published_heads, *state.last_adopted_heads):
+        require_text(
+            publication.pr.repository.host,
+            publication.pr.repository.node_id,
+            publication.ref.repository.host,
+            publication.ref.repository.node_id,
+            publication.ref.full_name,
+            publication.verified_commit_id,
+        )
+        if (
+            publication.pr.repository != publication.ref.repository
+            or not publication.ref.full_name.startswith("refs/heads/")
+        ):
+            raise ValueError("invalid last-published head")
+        key = (publication.ref.repository, publication.pr, publication.ref.full_name)
+        if key in authority_keys:
+            raise ValueError("ambiguous head authority")
+        authority_keys.add(key)
+    if detached_ids.intersection(pr for _repository, pr, _ref in authority_keys):
+        raise ValueError("detached ownership is recorded twice")
+    boundary_refs: set[RemoteBranchRef] = set()
+    for boundary in state.last_published_boundaries:
+        require_text(boundary.merged_pr.repository.host,
+            boundary.merged_pr.repository.node_id, boundary.ref.full_name,
+            boundary.verified_commit_id)
+        if (boundary.merged_pr.repository != boundary.ref.repository
+                or boundary.ref in boundary_refs):
+            raise ValueError("ambiguous boundary authority")
+        boundary_refs.add(boundary.ref)
+
+
+def read_state(workspace: str | Path) -> tuple[str | None, TrackedState]:
+    observed_oid = read_ref_oid(workspace, STATE_REF)
+    if observed_oid is None:
+        return None, EMPTY_STATE
+    common = git_common_dir(workspace)
+    payload = _run(["git", f"--git-dir={common}", "cat-file", "blob", observed_oid])
+    return observed_oid, parse_state(payload)
+
+
+def observe_tool_state(workspace: str | Path) -> ToolStateRead:
+    state_oid, state = read_state(workspace)
+    return ToolStateRead(
+        state_oid,
+        state,
+        read_ref_oid(workspace, RECOVERY_REF),
+    )
+
+
+def cas_write_state(
+    workspace: str | Path, expected_oid: str | None, state: TrackedState
+) -> str:
+    common = git_common_dir(workspace)
+    new_oid = _run(
+        ["git", f"--git-dir={common}", "hash-object", "-w", "--stdin"],
+        stdin=state_to_json(state),
+    ).strip()
+    expected = expected_oid or ("0" * len(new_oid))
+    result = subprocess.run(
+        ["git", f"--git-dir={common}", "update-ref", STATE_REF, new_oid, expected],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode:
+        if read_ref_oid(workspace, STATE_REF) != expected_oid:
+            raise ConcurrentUpdate("state ref changed during compare-and-swap")
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise Error("could not update state ref" + (f": {detail}" if detail else ""))
+    return new_oid
+
+
+@contextmanager
+def repository_lock(workspace: str | Path) -> Iterator[None]:
+    path = git_common_dir(workspace) / "jj-stack.lock"
+    descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise LockBusy(
+                "another jj-stack process holds the repository lock"
+            ) from exc
+        yield
+    finally:
+        os.close(descriptor)
