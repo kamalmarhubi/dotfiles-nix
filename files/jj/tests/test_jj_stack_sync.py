@@ -17,6 +17,11 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "files" / "bin"))
 import jj_stack_sync as sync  # noqa: E402
+from fake_github import (  # noqa: E402
+    FakeGitHubClient,
+    FakeGitHubServer,
+    RefUpdatePolicy,
+)
 
 
 def run(*args: str | Path, cwd: Path | None = None) -> str:
@@ -509,6 +514,333 @@ def test_remote_branch_ref_requires_heads_namespace() -> None:
         sync.RemoteBranchRef(repository, "topic")
     with pytest.raises(ValueError, match="refs/heads"):
         sync.RemoteBranchRef(repository, "refs/heads/")
+
+
+def pr_source_record(**changes: object) -> dict[str, object]:
+    record: dict[str, object] = {
+        "id": "PR_node",
+        "number": 7,
+        "state": "OPEN",
+        "isDraft": False,
+        "headRepository": {"id": "R_repo"},
+        "headRefName": "topic",
+        "headRefOid": "1" * 40,
+        "baseRefName": "main",
+        "baseRefOid": "0" * 40,
+        "autoMergeRequest": None,
+        "mergeQueueEntry": None,
+        "title": "Title",
+        "body": None,
+        "stack": None,
+    }
+    record.update(changes)
+    return record
+
+
+def test_github_source_parsing_distinguishes_confirmed_null_and_stack_membership() -> (
+    None
+):
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+
+    standalone = sync._parse_github_pull_request(pr_source_record(), repository, 7)
+    stacked = sync._parse_github_pull_request(
+        pr_source_record(
+            stack={"id": "STACK_node", "number": 3, "baseRefName": "main"}
+        ),
+        repository,
+        7,
+    )
+
+    assert standalone.stack is None
+    assert standalone.identity == sync.PullRequestId(repository.identity, 7)
+    assert standalone.node_id == "PR_node"
+    assert standalone.body == ""
+    assert stacked.stack == sync.GitHubStackSummary(
+        sync.GitHubStackId(repository.identity, 3), "STACK_node", "main"
+    )
+
+    deleted_fork = sync._parse_github_pull_request(
+        pr_source_record(headRepository=None), repository, 7
+    )
+    assert deleted_fork.head_repository is None
+
+    missing_oids = sync._parse_github_pull_request(
+        pr_source_record(headRefOid=None, baseRefOid=None), repository, 7
+    )
+    assert missing_oids.head_oid is None
+    assert missing_oids.base_oid is None
+
+
+@pytest.mark.parametrize(
+    ("changes", "error"),
+    (
+        ({"number": 8}, sync.SourceMismatch),
+        ({"isDraft": 0}, sync.MalformedSource),
+        ({"state": "UNKNOWN"}, sync.MalformedSource),
+        ({"stack": {"id": "STACK_node"}}, sync.MalformedSource),
+    ),
+)
+def test_github_source_rejects_incomplete_mismatched_and_malformed_records(
+    changes: dict[str, object], error: type[Exception]
+) -> None:
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    with pytest.raises(error):
+        sync._parse_github_pull_request(pr_source_record(**changes), repository, 7)
+
+
+def test_github_json_transport_preserves_exact_strings_and_separates_status() -> None:
+    title = "control:\u2028 paragraph:\u2029 replacement:\ufffd"
+    body = json.dumps({"title": title}, ensure_ascii=False).encode()
+
+    assert sync._github_json_response(
+        sync.GitHubHttpResponse(200, (("X-Test", "yes"),), body), "test"
+    ) == {"title": title}
+    with pytest.raises(sync.GitHubHttpError, match="HTTP 422"):
+        sync._github_json_response(sync.GitHubHttpResponse(422, (), body), "test")
+    with pytest.raises(sync.MalformedSource, match="invalid JSON"):
+        sync._github_json_response(sync.GitHubHttpResponse(200, (), b"{"), "test")
+
+
+def test_github_token_is_secret_safe_and_noninteractive(monkeypatch) -> None:
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured.update(args=args, kwargs=kwargs)
+        return subprocess.CompletedProcess(args, 0, "secret-token\n", "")
+
+    monkeypatch.setenv("GH_DEBUG", "api")
+    monkeypatch.setenv("DEBUG", "1")
+    monkeypatch.setattr(sync.subprocess, "run", fake_run)
+
+    assert sync._github_token("github.com") == "secret-token"
+    assert captured["args"] == ["gh", "auth", "token", "--hostname", "github.com"]
+    assert captured["kwargs"]["stdin"] is subprocess.DEVNULL
+    assert captured["kwargs"]["env"]["GH_PROMPT_DISABLED"] == "1"
+    assert "GH_DEBUG" not in captured["kwargs"]["env"]
+    assert "DEBUG" not in captured["kwargs"]["env"]
+    assert "secret-token" not in captured["args"]
+
+
+def test_github_routing_accepts_canonical_ssh_aliases_only(monkeypatch) -> None:
+    def fake_run(args, **_kwargs):
+        host = args[-1]
+        output = {
+            "work-github": "hostname github.com\nport 22\n",
+            "github-443": "hostname ssh.github.com\nport 443\n",
+            "enterprise": "hostname github.example.com\nport 22\n",
+        }[host]
+        return subprocess.CompletedProcess(args, 0, output, "")
+
+    monkeypatch.setattr(sync.subprocess, "run", fake_run)
+
+    assert sync._github_repository_locator("git@work-github:owner/repo.git") == (
+        "github.com",
+        "owner/repo",
+    )
+    assert sync._github_repository_locator("ssh://git@github-443/owner/repo.git") == (
+        "github.com",
+        "owner/repo",
+    )
+    with pytest.raises(sync.SourceUnavailable, match="canonical GitHub.com"):
+        sync._github_repository_locator("git@enterprise:owner/repo.git")
+    with pytest.raises(sync.SourceUnavailable, match="unsupported GitHub host"):
+        sync._github_repository_locator("https://github.example.com/owner/repo.git")
+
+
+def test_github_transport_rejects_errors_partial_data_and_repository_mismatch(
+    monkeypatch,
+) -> None:
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+
+    monkeypatch.setattr(
+        sync, "_github_graphql", lambda *_args, **_kwargs: {"errors": []}
+    )
+    with pytest.raises(sync.MalformedSource):
+        sync._read_github_pull_request(repository, 7)
+
+    monkeypatch.setattr(
+        sync,
+        "_github_graphql",
+        lambda *_args, **_kwargs: {
+            "data": {"repository": {"id": "R_other", "pullRequest": pr_source_record()}}
+        },
+    )
+    with pytest.raises(sync.SourceMismatch):
+        sync._read_github_pull_request(repository, 7)
+
+    monkeypatch.setattr(
+        sync,
+        "_github_graphql",
+        lambda *_args, **_kwargs: {"data": {"repository": None}},
+    )
+    with pytest.raises(sync.IncompleteSource):
+        sync._read_github_pull_request(repository, 7)
+
+
+def test_fake_github_derives_stack_associations_and_preserves_requested_order() -> None:
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        None,
+    )
+    first = sync._parse_github_pull_request(pr_source_record(), repository, 7)
+    second = sync._parse_github_pull_request(
+        pr_source_record(id="PR_second", number=8, headRefName="second"),
+        repository,
+        8,
+    )
+    stack = sync.GitHubStack(
+        sync.GitHubStackId(repository.identity, 3),
+        "STACK_node",
+        "main",
+        (first.identity, second.identity),
+    )
+    server = FakeGitHubServer()
+    server.seed_repository(repository, aliases=("ssh://github/owner/repo",))
+    server.seed_pull_request(first)
+    server.seed_pull_request(second)
+    server.seed_stack(stack)
+    client = FakeGitHubClient(server)
+
+    observed = client.pull_requests((second.identity, first.identity, second.identity))
+
+    assert tuple(item.identity for item in observed) == (
+        second.identity,
+        first.identity,
+        second.identity,
+    )
+    assert all(
+        item.stack
+        == sync.GitHubStackSummary(stack.identity, stack.node_id, stack.base_branch)
+        for item in observed
+    )
+    assert client.stack(repository, stack.identity) == stack
+    assert client.resolve_repository(repository.identity) == repository
+    assert client.resolve_repository("ssh://github/owner/repo") == repository
+
+
+def test_complete_stack_source_validates_order_membership_and_base() -> None:
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_repo"),
+        "owner/repo",
+        "https://github.com/owner/repo",
+        "main",
+    )
+    response = {
+        "id": 99,
+        "number": 17,
+        "node_id": "STACK_node",
+        "url": "https://api.github.com/repos/owner/repo/stacks/17",
+        "base": {"ref": "main"},
+        "open": True,
+        "created_at": "2026-01-01T00:00:00Z",
+        "pull_requests": [
+            {
+                "number": number,
+                "state": "open",
+                "draft": False,
+                "merged_at": None,
+                "head": {"ref": f"topic-{number}", "sha": str(number) * 40},
+            }
+            for number in (1, 2, 3)
+        ],
+    }
+    identity = sync.GitHubStackId(repository.identity, 17)
+
+    stack = sync._parse_github_stack(response, repository.identity, identity)
+
+    assert stack.identity == identity
+    assert stack.node_id == "STACK_node"
+    assert stack.base_branch == "main"
+    assert tuple(pr.number for pr in stack.pull_requests) == (1, 2, 3)
+
+    response["pull_requests"][2]["number"] = 2
+    with pytest.raises(sync.SourceMismatch, match="duplicate"):
+        sync._parse_github_stack(response, repository.identity, identity)
+
+    response["pull_requests"][2]["number"] = 3
+    response["number"] = 18
+    with pytest.raises(sync.SourceMismatch, match="stack number"):
+        sync._parse_github_stack(response, repository.identity, identity)
+
+
+def test_live_ref_observation_uses_destination_and_preserves_confirmed_absence(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    source = tmp_path / "source"
+    run("git", "init", "--bare", remote)
+    run("git", "init", source)
+    run("git", "-C", source, "config", "user.name", "Test")
+    run("git", "-C", source, "config", "user.email", "test@example.com")
+    (source / "file").write_text("content\n")
+    run("git", "-C", source, "add", "file")
+    run("git", "-C", source, "commit", "-m", "base")
+    oid = run("git", "-C", source, "rev-parse", "HEAD")
+    run("git", "-C", source, "push", os.fspath(remote), "HEAD:refs/heads/main")
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+
+    refs = sync.observe_live_refs(
+        os.fspath(remote),
+        repository,
+        ("refs/heads/main", "refs/heads/missing"),
+    )
+
+    assert refs == (
+        sync.LiveRemoteRef(sync.RemoteBranchRef(repository, "refs/heads/main"), oid),
+        sync.LiveRemoteRef(
+            sync.RemoteBranchRef(repository, "refs/heads/missing"), None
+        ),
+    )
+
+
+def test_observation_record_parsers_reject_wrong_types_and_contradictions() -> None:
+    bookmark = {
+        "name": "topic",
+        "remote": "",
+        "conflict": False,
+        "target": "a" * 40,
+        "removed": [],
+        "added": ["a" * 40],
+        "tracked": False,
+    }
+    commit = {
+        "commit_id": "a" * 40,
+        "parent_commit_ids": ["b" * 40],
+        "change": "change",
+        "description": "Title",
+        "conflicts": False,
+        "hidden": False,
+    }
+
+    _, _, absent, _ = sync._bookmark_record({**bookmark, "target": "", "added": []})
+    assert isinstance(absent, sync.AbsentBookmarkTarget)
+    with pytest.raises(sync.Error, match="jj bookmark list"):
+        sync._bookmark_record({**bookmark, "conflict": "false"})
+    with pytest.raises(sync.Error, match="jj bookmark list"):
+        sync._bookmark_record({**bookmark, "conflict": True})
+    with pytest.raises(sync.Error, match="jj log"):
+        sync._commit_record({**commit, "commit_id": 7})
+    with pytest.raises(sync.Error, match="jj log"):
+        sync._commit_record({**commit, "conflicts": "false"})
+    with pytest.raises(sync.Error, match="jj log"):
+        sync._commit_record({**commit, "hidden": "false"})
 
 
 if __name__ == "__main__":
