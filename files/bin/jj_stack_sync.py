@@ -701,6 +701,20 @@ class RetainedTopologyPlan:
 
 
 @dataclass(frozen=True)
+class DetachedAssociationView:
+    association: DetachedAssociation
+    pull_request: GitHubPullRequest | None
+    blocker: str | None = None
+
+
+@dataclass(frozen=True)
+class DetachedCleanupPlan:
+    selected: tuple[DetachedAssociation, ...]
+    retire: tuple[DetachedAssociation, ...]
+    blocked: tuple[DetachedAssociationView, ...]
+
+
+@dataclass(frozen=True)
 class DesiredStack:
     repository: GitHubRepositoryId
     base_branch: str
@@ -1014,6 +1028,19 @@ class StackDissolutionAttempt:
 
 
 @dataclass(frozen=True)
+class DetachedCloseAttempt:
+    association: DetachedAssociation
+    expected_state: PullRequestState = PullRequestState.OPEN
+
+    def __post_init__(self) -> None:
+        if (
+            self.association.disposition is not DetachedDisposition.CLEANUP
+            or self.expected_state is not PullRequestState.OPEN
+        ):
+            raise ValueError("detached close requires cleanup-eligible open state")
+
+
+@dataclass(frozen=True)
 class AdoptionAttempt:
     repository: GitHubRepositoryId
     remote: str
@@ -1034,6 +1061,7 @@ MutationAttempt = (
     | StackCreationAttempt
     | StackAppendAttempt
     | StackDissolutionAttempt
+    | DetachedCloseAttempt
 )
 
 
@@ -1100,6 +1128,12 @@ def _attempt_resources(attempt: MutationAttempt) -> _MutationResources:
             frozenset(item.ref for item in attempt.live_refs),
             frozenset((attempt.stack,)), members,
         )
+    if isinstance(attempt, DetachedCloseAttempt):
+        return _MutationResources(
+            attempt.association.pr.repository,
+            frozenset((attempt.association.pr,)),
+            frozenset((attempt.association.ref,)),
+        )
     assert isinstance(attempt, AdoptionAttempt)
     return _MutationResources(
         attempt.repository,
@@ -1124,7 +1158,7 @@ def _resources_conflict(
     )
 
 
-def _plan_resources(plan: NoOp | Apply | FirstPublicationPlan | StackAppendPlan | RetainedTopologyPlan) -> _MutationResources | None:
+def _plan_resources(plan: NoOp | Apply | FirstPublicationPlan | StackAppendPlan | RetainedTopologyPlan | DetachedCleanupPlan) -> _MutationResources | None:
     if isinstance(plan, (NoOp, Apply)):
         repository = plan.desired.repository
         prs = frozenset((pr.identity for pr in plan.dependencies.prs))
@@ -3011,7 +3045,17 @@ def _recovery_entry_to_dict(entry: RecoveryEntry) -> dict[str, object]:
             ],
         }
     else:
-        raise ValueError("unknown recovery attempt")
+        assert isinstance(attempt, DetachedCloseAttempt)
+        association = attempt.association
+        payload = {
+            "kind": "close-detached", "identity": entry.identity,
+            "possibly_live": entry.possibly_live,
+            "repository": asdict(association.pr.repository),
+            "pr": association.pr.number, "ref": association.ref.full_name,
+            "commit": association.verified_commit_id,
+            "disposition": association.disposition.value,
+            "expected_state": attempt.expected_state.value,
+        }
     return payload
 
 
@@ -3071,6 +3115,8 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
         if kind == 'append-stack'
         else common_fields | {'stack', 'stack_node_id', 'base_branch', 'members', 'pull_requests', 'live_refs', 'ownership'}
         if kind == 'unstack'
+        else common_fields | {'pr', 'ref', 'commit', 'disposition', 'expected_state'}
+        if kind == 'close-detached'
         else None
     )
     if expected_fields is None or set(raw) != expected_fields:
@@ -3258,7 +3304,11 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
             TrackedStack(repository, raw["base_branch"], members), tuple(ownership),
         )
     else:
-        raise ValueError("unknown recovery attempt")
+        attempt = DetachedCloseAttempt(DetachedAssociation(
+            PullRequestId(repository, raw["pr"]), RemoteBranchRef(repository, raw["ref"]),
+            raw["commit"], DetachedDisposition(raw["disposition"])),
+            PullRequestState(raw["expected_state"]),
+        )
     return RecoveryEntry(identity, attempt, possibly_live)
 
 
@@ -3835,6 +3885,93 @@ def plan_retained_topology(
         observed.repository, source, prs, observed.live_refs, observed.desired,
         dissolve=obstructing_group,
     )
+
+
+def list_detached_associations(
+    state: TrackedState,
+    pull_requests: Sequence[GitHubPullRequest],
+) -> tuple[DetachedAssociationView, ...]:
+    """Join durable associations to canonical identity reads; never discover by name."""
+    by_identity: dict[PullRequestId, list[GitHubPullRequest]] = {}
+    for pull_request in pull_requests:
+        by_identity.setdefault(pull_request.identity, []).append(pull_request)
+    result = []
+    for association in state.detached_associations:
+        matches = by_identity.get(association.pr, [])
+        if len(matches) != 1:
+            result.append(DetachedAssociationView(association, None, "ambiguous-observation"))
+            continue
+        pull_request = matches[0]
+        exact = (
+            pull_request.head_repository == association.pr.repository
+            and f"refs/heads/{pull_request.head_branch}" == association.ref.full_name
+            and pull_request.head_oid == association.verified_commit_id
+        )
+        result.append(DetachedAssociationView(
+            association, pull_request, None if exact else "foreign-head"
+        ))
+    return tuple(result)
+
+
+def plan_detached_cleanup(
+    state: TrackedState,
+    pull_requests: Sequence[GitHubPullRequest],
+) -> DetachedCleanupPlan:
+    selected: list[DetachedAssociation] = []
+    retire: list[DetachedAssociation] = []
+    blocked: list[DetachedAssociationView] = []
+    for view in list_detached_associations(state, pull_requests):
+        if view.association.disposition is DetachedDisposition.KEEP:
+            continue
+        if view.blocker is not None or view.pull_request is None:
+            blocked.append(view)
+        elif view.pull_request.state is PullRequestState.OPEN:
+            selected.append(view.association)
+        else:
+            retire.append(view.association)
+    return DetachedCleanupPlan(tuple(selected), tuple(retire), tuple(blocked))
+
+
+def _replace_detached_state(
+    workspace: str | Path,
+    expected_oid: str | None,
+    expected: DetachedAssociation,
+    replacement: DetachedAssociation | None,
+) -> str:
+    oid, state = read_state(workspace)
+    if oid != expected_oid or sum(item == expected for item in state.detached_associations) != 1:
+        raise ConcurrentUpdate("detached association changed during compare-and-swap")
+    detached = tuple(
+        item for item in state.detached_associations if item != expected
+    ) + (() if replacement is None else (replacement,))
+    return cas_write_state(workspace, oid, replace(state, detached_associations=detached))
+
+
+def keep_detached_association(
+    workspace: str | Path, expected_oid: str | None, association: DetachedAssociation
+) -> str:
+    _journal_oid, journal = read_recovery(workspace)
+    if journal is not None and any(
+        entry.possibly_live
+        and isinstance(entry.attempt, DetachedCloseAttempt)
+        and entry.attempt.association.pr == association.pr
+        for entry in journal.entries
+    ):
+        raise Error("possibly-live close blocks keeping this association")
+    return _replace_detached_state(workspace, expected_oid, association,
+        replace(association, disposition=DetachedDisposition.KEEP))
+
+
+def forget_detached_association(
+    workspace: str | Path, expected_oid: str | None, association: DetachedAssociation
+) -> str:
+    _journal_oid, journal = read_recovery(workspace)
+    if journal is not None and any(
+        entry.possibly_live and isinstance(entry.attempt, DetachedCloseAttempt)
+        and entry.attempt.association.pr == association.pr for entry in journal.entries
+    ):
+        raise Error("possibly-live close blocks forgetting this association")
+    return _replace_detached_state(workspace, expected_oid, association, None)
 
 
 def _complete_selection(
@@ -4638,6 +4775,21 @@ def _classify_attempt(
             ):
                 return "foreign"
         return "applied"
+    if isinstance(attempt, DetachedCloseAttempt):
+        prs = github.pull_requests((attempt.association.pr,))
+        if len(prs) != 1:
+            return "foreign"
+        pr = prs[0]
+        if (
+            pr.head_repository != attempt.association.pr.repository
+            or f"refs/heads/{pr.head_branch}" != attempt.association.ref.full_name
+            or pr.head_oid != attempt.association.verified_commit_id
+        ):
+            return "foreign"
+        return "not-applied" if pr.state is attempt.expected_state else (
+            "applied" if pr.state in (PullRequestState.CLOSED, PullRequestState.MERGED)
+            else "foreign"
+        )
     assert isinstance(attempt, MetadataMutationAttempt)
     prs = github.pull_requests((attempt.update.pr_identity,))
     if len(prs) != 1:
@@ -4832,6 +4984,8 @@ def _attempt_conflicts_plan(entry: RecoveryEntry, plan: NoOp | Apply) -> bool:
     active_prs = {pr.identity for pr in plan.dependencies.prs}
     if isinstance(attempt, MetadataMutationAttempt):
         return attempt.update.pr_identity in active_prs
+    if isinstance(attempt, DetachedCloseAttempt):
+        return attempt.association.pr in active_prs
     active_refs = {
         item.ref
         for item in plan.dependencies.live_heads + plan.dependencies.live_bases
@@ -5303,6 +5457,8 @@ def _append_conflict(entry: RecoveryEntry, plan: StackAppendPlan) -> bool:
     members = set(plan.goal.old_members)
     attempt = entry.attempt
     repository = getattr(attempt, "repository", None)
+    if repository is None and isinstance(attempt, DetachedCloseAttempt):
+        repository = attempt.association.pr.repository
     if repository != plan.goal.repository:
         return False
     if isinstance(attempt, StackAppendAttempt):
@@ -5345,6 +5501,11 @@ def _append_conflict(entry: RecoveryEntry, plan: StackAppendPlan) -> bool:
         return attempt.update.pr_identity in members
     if isinstance(attempt, StackDissolutionAttempt):
         return attempt.stack == plan.goal.stack or bool(set(attempt.members) & members)
+    if isinstance(attempt, DetachedCloseAttempt):
+        return (
+            attempt.association.pr in members
+            or attempt.association.ref.full_name.removeprefix("refs/heads/") in names
+        )
     if isinstance(attempt, AdoptionAttempt):
         return any(
             boundary.pr_identity in members or boundary.branch in names
@@ -5536,6 +5697,69 @@ def apply_stack_append(
         except Error as exc:
             return Stopped("receipt", str(exc))
         return Verified(head_published=current != wanted, state_recorded=True)
+
+
+def apply_detached_cleanup(
+    plan: DetachedCleanupPlan,
+    workspace: str | Path,
+    github: GitHubClient,
+    *,
+    dry_run: bool = False,
+) -> ApplyResult:
+    """Close exact owned PRs once, retiring state before their journal facts."""
+    if dry_run:
+        return Verified()
+    with repository_lock(workspace):
+        _locked_oid, locked_journal = read_recovery(workspace)
+        targets = plan.retire + plan.selected
+        for association in targets:
+            try:
+                state_oid, state = read_state(workspace)
+                journal_oid, journal = read_recovery(workspace)
+                matching = tuple(entry for entry in (() if journal is None else journal.entries)
+                    if isinstance(entry.attempt, DetachedCloseAttempt)
+                    and entry.attempt.association == association)
+                if len(matching) > 1:
+                    return Stopped("recovery", "ambiguous detached close facts")
+                entry = matching[0] if matching else None
+                attempt = DetachedCloseAttempt(association)
+                classification = _classify_attempt(workspace, github, attempt)
+                if association not in state.detached_associations:
+                    if entry is not None and classification == "applied" and journal_oid is not None:
+                        _remove_recovery_entry(workspace, journal_oid, entry.identity)
+                        continue
+                    return Stopped("state", "detached association changed")
+                if classification == "foreign":
+                    return Stopped("pull-request", "detached association is foreign")
+                if classification == "not-applied":
+                    if entry is not None and entry.possibly_live:
+                        return Stopped("pull-request", "possibly-live close remains unresolved")
+                    if entry is None:
+                        journal_oid, entry = _append_recovery(workspace, attempt)
+                    assert journal_oid is not None and entry is not None
+                    live = replace(entry, possibly_live=True)
+                    journal_oid = _replace_recovery_entry(workspace, journal_oid, live)
+                    repository = github.resolve_repository(association.pr.repository)
+                    try:
+                        github.update_pull_request(repository, association.pr,
+                            state=PullRequestUpdateState.CLOSED)
+                    except GitHubTransportError:
+                        pass
+                    except GitHubHttpError:
+                        _remove_recovery_entry(workspace, journal_oid, entry.identity)
+                        return Stopped("pull-request", "close was rejected")
+                    classification = _classify_attempt(workspace, github, attempt)
+                    if classification != "applied":
+                        return Stopped("pull-request", f"close is {classification}")
+                # The association generation is retired before the journal generation.
+                _replace_detached_state(workspace, state_oid, association, None)
+                if entry is not None:
+                    if journal_oid is None:
+                        raise ConcurrentUpdate("detached close journal changed")
+                    _remove_recovery_entry(workspace, journal_oid, entry.identity)
+            except Error as exc:
+                return Stopped("cleanup", str(exc))
+    return Verified(state_recorded=bool(targets))
 
 
 def apply_retained_topology(

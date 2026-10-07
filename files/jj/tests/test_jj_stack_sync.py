@@ -4332,5 +4332,237 @@ def test_retained_topology_accepts_partial_survivor_and_rejects_foreign_head(
     assert sync._classify_attempt(jj_repo, github, facts[0].attempt) == "foreign"
 
 
+def detached_fixture(
+    *, state: sync.PullRequestState = sync.PullRequestState.OPEN
+) -> tuple[sync.GitHubRepository, sync.GitHubPullRequest, sync.DetachedAssociation]:
+    repository = sync.GitHubRepository(
+        sync.GitHubRepositoryId("github.com", "R_detached"), "o/r",
+        "https://github.com/o/r", "main")
+    identity = sync.PullRequestId(repository.identity, 7)
+    pr = sync.GitHubPullRequest(identity, "PR_7", state, False,
+        repository.identity, "topic", "a" * 40, "main", "b" * 40,
+        False, False, "Title", "Body", None)
+    association = sync.DetachedAssociation(identity,
+        sync.RemoteBranchRef(repository.identity, "refs/heads/topic"), "a" * 40)
+    return repository, pr, association
+
+
+def test_detached_listing_cleanup_keep_and_foreign_head_are_pure() -> None:
+    _repository, pr, association = detached_fixture()
+    state = sync.TrackedState((), (), (), (association,))
+    assert sync.plan_detached_cleanup(state, (pr,)).selected == (association,)
+    kept = dataclasses.replace(association, disposition=sync.DetachedDisposition.KEEP)
+    assert sync.plan_detached_cleanup(dataclasses.replace(
+        state, detached_associations=(kept,)), (pr,)).selected == ()
+    foreign = dataclasses.replace(pr, head_oid="f" * 40)
+    plan = sync.plan_detached_cleanup(state, (foreign,))
+    assert plan.selected == () and plan.blocked[0].blocker == "foreign-head"
+
+
+def test_detached_keep_and_forget_are_local_only_and_generation_safe(
+    jj_repo: Path,
+) -> None:
+    _repository, _pr, association = detached_fixture()
+    oid = sync.cas_write_state(jj_repo, None,
+        sync.TrackedState((), (), (), (association,)))
+    kept_oid = sync.keep_detached_association(jj_repo, oid, association)
+    kept = dataclasses.replace(association, disposition=sync.DetachedDisposition.KEEP)
+    assert sync.read_state(jj_repo)[1].detached_associations == (kept,)
+    with pytest.raises(sync.ConcurrentUpdate):
+        sync.forget_detached_association(jj_repo, oid, association)
+    sync.forget_detached_association(jj_repo, kept_oid, kept)
+    assert sync.read_state(jj_repo)[1].detached_associations == ()
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_detached_cleanup_closes_once_and_already_closed_only_retires(
+    jj_repo: Path,
+) -> None:
+    repository, pr, association = detached_fixture()
+    server = FakeGitHubServer()
+    server.seed_repository(repository)
+    server.seed_pull_request(pr)
+    github = FakeGitHubClient(server)
+    sync.cas_write_state(jj_repo, None, sync.TrackedState((), (), (), (association,)))
+    plan = sync.plan_detached_cleanup(sync.read_state(jj_repo)[1], (pr,))
+    assert isinstance(sync.apply_detached_cleanup(plan, jj_repo, github), sync.Verified)
+    assert server.read_pull_requests((pr.identity,))[0].state is sync.PullRequestState.CLOSED
+    assert sync.read_state(jj_repo)[1].detached_associations == ()
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+    closed = dataclasses.replace(pr, state=sync.PullRequestState.CLOSED)
+    second = dataclasses.replace(association, pr=sync.PullRequestId(repository.identity, 8))
+    closed = dataclasses.replace(closed, identity=second.pr, node_id="PR_8")
+    server.seed_pull_request(closed)
+    oid = sync.read_state(jj_repo)[0]
+    sync.cas_write_state(jj_repo, oid, sync.TrackedState((), (), (), (second,)))
+    plan = sync.plan_detached_cleanup(sync.read_state(jj_repo)[1], (closed,))
+    assert plan.selected == () and plan.retire == (second,)
+    assert isinstance(sync.apply_detached_cleanup(plan, jj_repo, github), sync.Verified)
+
+
+def test_possibly_live_detached_close_blocks_forget_and_is_not_resent(
+    jj_repo: Path,
+) -> None:
+    repository, pr, association = detached_fixture()
+    server = FakeGitHubServer()
+    server.seed_repository(repository)
+    server.seed_pull_request(pr)
+    github = FakeGitHubClient(server)
+    oid = sync.cas_write_state(jj_repo, None, sync.TrackedState((), (), (), (association,)))
+    entry = sync.RecoveryEntry("close", sync.DetachedCloseAttempt(association), True)
+    sync.cas_write_recovery(jj_repo, None, sync.RecoveryJournal((entry,)))
+    with pytest.raises(sync.Error, match="possibly-live"):
+        sync.forget_detached_association(jj_repo, oid, association)
+    plan = sync.DetachedCleanupPlan((association,), (), ())
+    result = sync.apply_detached_cleanup(plan, jj_repo, github)
+    assert isinstance(result, sync.Stopped)
+    assert server.read_pull_requests((pr.identity,))[0].state is sync.PullRequestState.OPEN
+
+
+def test_detached_cleanup_lost_response_retires_without_duplicate_close(
+    jj_repo: Path,
+) -> None:
+    repository, pr, association = detached_fixture()
+    server = FakeGitHubServer()
+    server.seed_repository(repository)
+    server.seed_pull_request(pr)
+    github = FakeGitHubClient(server)
+    sync.cas_write_state(
+        jj_repo, None, sync.TrackedState((), (), (), (association,))
+    )
+    plan = sync.DetachedCleanupPlan((association,), (), ())
+
+    with github.lose_response(sync.GitHubClient.update_pull_request, pr=pr.identity):
+        result = sync.apply_detached_cleanup(plan, jj_repo, github)
+
+    assert isinstance(result, sync.Verified)
+    assert server.read_pull_requests((pr.identity,))[0].state is sync.PullRequestState.CLOSED
+    assert sync.read_state(jj_repo)[1].detached_associations == ()
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_detached_cleanup_held_close_requires_release_and_blocks_local_lifecycle(
+    jj_repo: Path,
+) -> None:
+    repository, pr, association = detached_fixture()
+    server = FakeGitHubServer()
+    server.seed_repository(repository)
+    server.seed_pull_request(pr)
+    github = FakeGitHubClient(server)
+    state_oid = sync.cas_write_state(
+        jj_repo, None, sync.TrackedState((), (), (), (association,))
+    )
+    plan = sync.DetachedCleanupPlan((association,), (), ())
+
+    with github.hold_next(
+        sync.GitHubClient.update_pull_request, pr=pr.identity
+    ) as pending:
+        stopped = sync.apply_detached_cleanup(plan, jj_repo, github)
+
+    assert isinstance(stopped, sync.Stopped)
+    assert stopped.stage == "pull-request"
+    with pytest.raises(sync.Error, match="possibly-live"):
+        sync.keep_detached_association(jj_repo, state_oid, association)
+    with pytest.raises(sync.Error, match="possibly-live"):
+        sync.forget_detached_association(jj_repo, state_oid, association)
+    assert server.read_pull_requests((pr.identity,))[0].state is sync.PullRequestState.OPEN
+
+    pending.release()
+    assert isinstance(sync.apply_detached_cleanup(plan, jj_repo, github), sync.Verified)
+    assert sync.read_state(jj_repo)[1].detached_associations == ()
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_detached_cleanup_fail_before_remains_conservatively_unresolved(
+    jj_repo: Path,
+) -> None:
+    repository, pr, association = detached_fixture()
+    server = FakeGitHubServer()
+    server.seed_repository(repository)
+    server.seed_pull_request(pr)
+    github = FakeGitHubClient(server)
+    sync.cas_write_state(
+        jj_repo, None, sync.TrackedState((), (), (), (association,))
+    )
+    plan = sync.DetachedCleanupPlan((association,), (), ())
+
+    with github.fail_before(sync.GitHubClient.update_pull_request, pr=pr.identity):
+        stopped = sync.apply_detached_cleanup(plan, jj_repo, github)
+
+    assert isinstance(stopped, sync.Stopped)
+    retry = sync.apply_detached_cleanup(plan, jj_repo, github)
+    assert isinstance(retry, sync.Stopped)
+    assert retry.stage == "pull-request"
+    assert server.read_pull_requests((pr.identity,))[0].state is sync.PullRequestState.OPEN
+    assert sync.read_state(jj_repo)[1].detached_associations == (association,)
+
+
+def test_detached_cleanup_state_handoff_precedes_exact_journal_retirement(
+    jj_repo: Path, monkeypatch
+) -> None:
+    repository, pr, association = detached_fixture()
+    server = FakeGitHubServer()
+    server.seed_repository(repository)
+    server.seed_pull_request(pr)
+    github = FakeGitHubClient(server)
+    sync.cas_write_state(
+        jj_repo, None, sync.TrackedState((), (), (), (association,))
+    )
+    plan = sync.DetachedCleanupPlan((association,), (), ())
+    replace_state = sync._replace_detached_state
+    monkeypatch.setattr(
+        sync,
+        "_replace_detached_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sync.ConcurrentUpdate("stale association")
+        ),
+    )
+
+    stopped = sync.apply_detached_cleanup(plan, jj_repo, github)
+
+    assert isinstance(stopped, sync.Stopped)
+    assert stopped.stage == "cleanup"
+    assert server.read_pull_requests((pr.identity,))[0].state is sync.PullRequestState.CLOSED
+    assert sync.read_state(jj_repo)[1].detached_associations == (association,)
+    journal = sync.read_recovery(jj_repo)[1]
+    assert journal is not None and len(journal.entries) == 1
+
+    monkeypatch.setattr(sync, "_replace_detached_state", replace_state)
+    assert isinstance(sync.apply_detached_cleanup(plan, jj_repo, github), sync.Verified)
+    assert sync.read_state(jj_repo)[1].detached_associations == ()
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_detached_cleanup_preserves_unrelated_recovery_fact(jj_repo: Path) -> None:
+    repository, pr, association = detached_fixture()
+    server = FakeGitHubServer()
+    server.seed_repository(repository)
+    server.seed_pull_request(pr)
+    github = FakeGitHubClient(server)
+    sync.cas_write_state(
+        jj_repo, None, sync.TrackedState((), (), (), (association,))
+    )
+    other = sync.GitHubRepositoryId("github.com", "R_other")
+    unrelated = sync.RecoveryEntry(
+        "unrelated",
+        sync.MetadataMutationAttempt(
+            other,
+            sync.PRMetadataUpdate(sync.PullRequestId(other, 1), "New", ""),
+            "Old",
+            "",
+        ),
+        possibly_live=True,
+    )
+    sync.cas_write_recovery(jj_repo, None, sync.RecoveryJournal((unrelated,)))
+
+    result = sync.apply_detached_cleanup(
+        sync.DetachedCleanupPlan((association,), (), ()), jj_repo, github
+    )
+
+    assert isinstance(result, sync.Verified)
+    assert sync.read_recovery(jj_repo)[1] == sync.RecoveryJournal((unrelated,))
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
