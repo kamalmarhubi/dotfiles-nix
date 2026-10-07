@@ -566,6 +566,14 @@ class ExistingPRAssignment:
 
 
 @dataclass(frozen=True)
+class LocalWinsPRAssignment:
+    """Invocation-local authority for one exact in-place PR head replacement."""
+
+    pr_identity: PullRequestId
+    commit_id: str
+
+
+@dataclass(frozen=True)
 class StackSelection:
     base_branch: str
     ordered: tuple[ExistingPRAssignment, ...]
@@ -609,6 +617,7 @@ class ReplacementPRAssignment:
 
 MembershipAssignment = (
     ExistingPRAssignment
+    | LocalWinsPRAssignment
     | NewPRAssignment
     | ReplacementPRAssignment
 )
@@ -834,8 +843,13 @@ class MatchesLastAdoption:
     adoption: LastAdoptedHead
 
 
+@dataclass(frozen=True)
+class ExplicitLocalWins:
+    """One-shot authority for the exact old-to-new update in its plan."""
+
+
 Authority = (
-    FastForward | MatchesLastPublication | MatchesLastAdoption
+    FastForward | MatchesLastPublication | MatchesLastAdoption | ExplicitLocalWins
 )
 
 
@@ -1088,6 +1102,7 @@ class StackDissolutionAttempt:
     live_refs: tuple[LiveRemoteRef, ...]
     tracking: TrackedStack
     ownership: tuple[LastPublishedHead | LastAdoptedHead, ...]
+    invocation_local_authority: tuple[PullRequestId, ...] = ()
 
     def __post_init__(self) -> None:
         expected_summary = GitHubStackSummary(
@@ -1113,6 +1128,11 @@ class StackDissolutionAttempt:
             (item.pr, item.ref.full_name, item.verified_commit_id)
             for item in self.ownership
         }
+        local_heads = {
+            (pr.identity, f"refs/heads/{pr.head_branch}", pr.head_oid)
+            for pr in self.pull_requests
+            if pr.identity in self.invocation_local_authority
+        }
         if (
             self.stack.repository != self.repository
             or not isinstance(self.stack_node_id, str)
@@ -1130,7 +1150,10 @@ class StackDissolutionAttempt:
                 for pr in self.pull_requests
             )
             or observed_heads != expected_live_refs
-            or owned_heads != expected_heads
+            or owned_heads | local_heads != expected_heads
+            or owned_heads.intersection(local_heads)
+            or len(set(self.invocation_local_authority)) != len(self.invocation_local_authority)
+            or not set(self.invocation_local_authority).issubset(self.members)
             or self.tracking.repository != self.repository
             or self.tracking.base_branch != self.base_branch
             or self.tracking.ordered_prs != self.members
@@ -3132,7 +3155,16 @@ def _recovery_entry_to_dict(entry: RecoveryEntry) -> dict[str, object]:
             "repository": asdict(attempt.repository),
             "push_url": attempt.push_url,
             "updates": [
-                {'ref': update.ref.full_name, 'old': update.expected_old_commit_id, 'new': update.new_commit_id, **{}}
+                {
+                    "ref": update.ref.full_name,
+                    "old": update.expected_old_commit_id,
+                    "new": update.new_commit_id,
+                    **(
+                        {"explicit_local_wins": True}
+                        if isinstance(update.authority, ExplicitLocalWins)
+                        else {}
+                    ),
+                }
                 for update in attempt.updates
             ],
             "tracking": {
@@ -3245,6 +3277,9 @@ def _recovery_entry_to_dict(entry: RecoveryEntry) -> dict[str, object]:
                  "commit": item.verified_commit_id}
                 for item in attempt.ownership
             ],
+            "invocation_local_authority": [
+                pr.number for pr in attempt.invocation_local_authority
+            ],
         }
     else:
         assert isinstance(attempt, DetachedCloseAttempt)
@@ -3323,7 +3358,7 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
         if kind == "append-stack"
         else common_fields | {
             "stack", "stack_node_id", "base_branch", "members", "pull_requests",
-            "live_refs", "ownership"
+            "live_refs", "ownership", "invocation_local_authority"
         }
         if kind == "unstack"
         else common_fields | {'pr', 'ref', 'commit', 'disposition', 'expected_state'}
@@ -3374,7 +3409,9 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
                 RemoteBranchRef(repository, item["ref"]),
                 item["old"],
                 item["new"],
-                FastForward(),
+                ExplicitLocalWins()
+                if item.get("explicit_local_wins") is True
+                else FastForward(),
             )
             for item in updates_raw
             if isinstance(item, dict)
@@ -3537,6 +3574,8 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
             repository, GitHubStackId(repository, raw["stack"]), raw["stack_node_id"],
             raw["base_branch"], members, prs, refs,
             TrackedStack(repository, raw["base_branch"], members), tuple(ownership),
+            tuple(PullRequestId(repository, number) for number in
+                  raw.get("invocation_local_authority", [])),
         )
     else:
         attempt = DetachedCloseAttempt(DetachedAssociation(
@@ -3931,13 +3970,18 @@ def plan_mixed_membership(
     ):
         return _block("source-inactive", "stack", "source PRs must be open, local, inactive, and match live refs")
 
+    local_wins_ids = {
+        item.pr_identity
+        for item in observed.ordered
+        if isinstance(item, LocalWinsPRAssignment)
+    }
     authority = observed.tracked_state.last_published_heads + observed.tracked_state.last_adopted_heads
     if any(not any(
         item.pr == pr.identity
         and item.ref == RemoteBranchRef(observed.repository, f"refs/heads/{pr.head_branch}")
         and item.verified_commit_id == pr.head_oid
         for item in authority
-    ) for pr in observed.pull_requests):
+    ) and pr.identity not in local_wins_ids for pr in observed.pull_requests):
         return _block("untracked-source", "stack", "every source identity needs exact head ownership")
     tracked_memberships = tuple(stack for stack in observed.tracked_state.stacks
         if stack.repository == observed.repository and stack.base_branch == observed.base_branch
@@ -4027,7 +4071,7 @@ def plan_mixed_membership(
     }
     existing = [
         item for item in observed.ordered
-        if isinstance(item, (ExistingPRAssignment,))
+        if isinstance(item, (ExistingPRAssignment, LocalWinsPRAssignment))
         and item.pr_identity not in recovered_replacement_ids
     ]
     existing_ids = tuple(item.pr_identity for item in existing)
@@ -4112,7 +4156,7 @@ def plan_mixed_membership(
             else None
         )
         if isinstance(
-            assignment, (ExistingPRAssignment,)
+            assignment, (ExistingPRAssignment, LocalWinsPRAssignment)
         ) and recovered_replacement is None:
             ordered.append(assignment.pr_identity)
             pr = next(pr for pr in observed.pull_requests if pr.identity == assignment.pr_identity)
@@ -4945,6 +4989,8 @@ def _plan_publication(
     snapshot: Snapshot,
     wanted: DesiredExistingPR,
     head: LiveRemoteRef,
+    *,
+    explicit_local_wins: bool = False,
 ) -> tuple[PlannedHeadUpdate, ...] | Blocked:
     assert head.commit_id is not None
     if wanted.desired_commit_id == head.commit_id:
@@ -4956,6 +5002,15 @@ def _plan_publication(
                 head.commit_id,
                 wanted.desired_commit_id,
                 FastForward(),
+            ),
+        )
+    if explicit_local_wins:
+        return (
+            PlannedHeadUpdate(
+                head.ref,
+                head.commit_id,
+                wanted.desired_commit_id,
+                ExplicitLocalWins(),
             ),
         )
     publications = tuple(
@@ -5162,12 +5217,22 @@ def _linear_segment(git_dir: str | Path, base: str, head: str) -> tuple[str, ...
 def plan_sync(
     snapshot: Snapshot,
     desired: DesiredStack | Blocked,
+    *,
+    local_wins: Collection[PullRequestId] = (),
 ) -> SyncPlan:
     if isinstance(desired, Blocked):
         return desired
     prs = _validate_plan_scope(snapshot, desired)
     if isinstance(prs, Blocked):
         return prs
+    approved = set(local_wins)
+    selected = {item.pr_identity for item in desired.active}
+    if not approved <= selected:
+        return _block(
+            "local-wins-not-applicable",
+            "stack",
+            "local-wins authority must name only PRs in the current selection",
+        )
     pr_dependencies = _validate_pr_dependencies(snapshot, desired, prs)
     if isinstance(pr_dependencies, Blocked):
         return pr_dependencies
@@ -5179,6 +5244,7 @@ def plan_sync(
             snapshot,
             wanted,
             head,
+            explicit_local_wins=wanted.pr_identity in approved,
         )
         if isinstance(head_updates, Blocked):
             return head_updates
@@ -5297,7 +5363,10 @@ def render(plan: SyncPlan) -> str:
     consequences = [
         *(
             (
-                f"publish {item.new_commit_id} to {item.ref.full_name}"
+                f"force local-wins {item.expected_old_commit_id} -> "
+                f"{item.new_commit_id} on {item.ref.full_name}"
+                if isinstance(item.authority, ExplicitLocalWins)
+                else f"publish {item.new_commit_id} to {item.ref.full_name}"
             )
             for item in plan.head_updates
         ),
@@ -7413,6 +7482,12 @@ def apply_mixed_membership(
                     )
                     and item.verified_commit_id == source_by_id[item.pr].head_oid
                 )
+                invocation_local_authority = tuple(
+                    item.pr_identity for item in plan.assignments
+                    if isinstance(item, LocalWinsPRAssignment)
+                    and item.pr_identity in members
+                    and not any(receipt.pr == item.pr_identity for receipt in ownership)
+                )
                 required_refs = {
                     f"refs/heads/{plan.source_stack.base_branch}",
                     *(f"refs/heads/{pr.head_branch}" for pr in plan.source_pull_requests),
@@ -7434,6 +7509,7 @@ def apply_mixed_membership(
                         plan.source_stack.pull_requests,
                     ),
                     ownership,
+                    invocation_local_authority,
                 )
                 if _classify_attempt(workspace, github, attempt, git) != "not-applied":
                     return Stopped("stack", "source topology is foreign")
@@ -7541,7 +7617,12 @@ def apply_mixed_membership(
         desired_existing = {
             item.pr_identity: item.commit_id
             for item in plan.assignments
-            if isinstance(item, (ExistingPRAssignment,))
+            if isinstance(item, (ExistingPRAssignment, LocalWinsPRAssignment))
+        }
+        local_wins = {
+            item.pr_identity
+            for item in plan.assignments
+            if isinstance(item, LocalWinsPRAssignment)
         }
         for identity in identities:
             if identity not in source:
@@ -7555,7 +7636,9 @@ def apply_mixed_membership(
                     ref,
                     old.head_oid,
                     wanted,
-                    FastForward(),
+                    ExplicitLocalWins()
+                    if identity in local_wins
+                    else FastForward(),
                 ))
                 publications.append(LastPublishedHead(identity, ref, wanted))
         if updates:

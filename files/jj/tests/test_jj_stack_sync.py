@@ -1978,6 +1978,35 @@ def test_pure_planner_distinguishes_fast_forward_from_tracking_equality() -> Non
     assert blocked.reasons[0].code == "replacement-unauthorized"
 
 
+def test_explicit_local_wins_authorizes_only_one_exact_selected_update() -> None:
+    old, new, parent = "1" * 40, "2" * 40, "3" * 40
+    observed, pr = snapshot(desired=new, live=old, parent=parent)
+    desired = sync.derive_desired(observed, selection(observed, pr))
+
+    blocked = sync.plan_sync(observed, desired)
+    approved = sync.plan_sync(observed, desired, local_wins=(pr,))
+    wrong = sync.plan_sync(
+        observed,
+        desired,
+        local_wins=(sync.PullRequestId(observed.repository, pr.number + 1),),
+    )
+
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "replacement-unauthorized"
+    assert isinstance(approved, sync.Apply)
+    assert approved.head_updates == (
+        sync.PlannedHeadUpdate(
+            sync.RemoteBranchRef(observed.repository, "refs/heads/topic"),
+            old,
+            new,
+            sync.ExplicitLocalWins(),
+        ),
+    )
+    assert f"force local-wins {old} -> {new}" in sync.render(approved)
+    assert isinstance(wrong, sync.Blocked)
+    assert wrong.reasons[0].code == "local-wins-not-applicable"
+
+
 def test_planner_produces_noop_metadata_only_and_head_plus_metadata_effects() -> None:
     commit_id = "1" * 40
     observed, pr = snapshot(desired=commit_id, live=commit_id, parent="0" * 40)
@@ -2921,6 +2950,63 @@ def test_apply_resolves_lost_git_push_response_by_authoritative_readback(
         (plan.head_updates[0].ref.full_name,),
     )[0].commit_id == plan.head_updates[0].new_commit_id
     assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_local_wins_readback_failure_preserves_exact_authority_and_blocks_replay(
+    jj_repo: Path, monkeypatch
+) -> None:
+    old, new, parent = "1" * 40, "2" * 40, "3" * 40
+    observed, pr = snapshot(desired=new, live=old, parent=parent)
+    plan = sync.plan_sync(
+        observed,
+        sync.derive_desired(observed, selection(observed, pr)),
+        local_wins=(pr,),
+    )
+    assert isinstance(plan, sync.Apply)
+    _server, github = fake_github(observed)
+    monkeypatch.setattr(
+        sync.SubprocessGitTransport,
+        "push_exact_head_updates",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+
+    def unavailable(*_args, **_kwargs):
+        raise sync.SourceUnavailable("injected readback failure")
+
+    monkeypatch.setattr(sync.SubprocessGitTransport, "observe_live_refs", unavailable)
+    stopped = sync.apply(plan, jj_repo, github)
+
+    assert isinstance(stopped, sync.Stopped)
+    assert stopped.stage == "heads"
+    journal = sync.read_recovery(jj_repo)[1]
+    assert journal is not None and len(journal.entries) == 1
+    update = journal.entries[0].attempt.updates[0]
+    assert (update.expected_old_commit_id, update.new_commit_id) == (old, new)
+    assert isinstance(update.authority, sync.ExplicitLocalWins)
+    retry = sync.apply(plan, jj_repo, github)
+    assert isinstance(retry, sync.Stopped)
+    assert retry.stage == "recovery"
+
+    final_refs = tuple(
+        dataclasses.replace(item, commit_id=new)
+        if item.ref.full_name == "refs/heads/topic"
+        else item
+        for item in plan.dependencies.live_heads
+    )
+    monkeypatch.setattr(
+        sync.SubprocessGitTransport,
+        "observe_live_refs",
+        lambda *_args, **_kwargs: final_refs,
+    )
+    assert sync.settle_recovery(jj_repo, github) == ()
+    assert sync.read_recovery(jj_repo) == (None, None)
+    assert sync.read_state(jj_repo)[1].last_published_heads == (
+        sync.LastPublishedHead(
+            pr,
+            sync.RemoteBranchRef(observed.repository, "refs/heads/topic"),
+            new,
+        ),
+    )
 
 
 def test_atomic_head_push_uses_every_exact_observed_lease(monkeypatch) -> None:
@@ -5006,6 +5092,88 @@ def test_mixed_recovery_attempts_round_trip_exactly() -> None:
     ))
 
     assert sync.parse_recovery(sync.recovery_to_json(journal)) == journal
+
+
+def test_explicit_local_wins_authority_round_trips_with_exact_candidate() -> None:
+    repository = sync.GitHubRepositoryId("github.com", "R_local_wins")
+    pr = sync.PullRequestId(repository, 1)
+    ref = sync.RemoteBranchRef(repository, "refs/heads/topic")
+    old, new = "1" * 40, "2" * 40
+    update = sync.PlannedHeadUpdate(ref, old, new, sync.ExplicitLocalWins())
+    attempt = sync.HeadMutationAttempt(
+        repository,
+        "push",
+        (update,),
+        sync.TrackedStack(repository, "main", (pr,)),
+        (sync.LastPublishedHead(pr, ref, new),),
+    )
+    journal = sync.RecoveryJournal((
+        sync.RecoveryEntry("local-wins", attempt, possibly_live=True),
+    ))
+
+    encoded = sync.recovery_to_json(journal)
+
+    assert '"explicit_local_wins":true' in encoded
+    assert sync.parse_recovery(encoded) == journal
+
+
+def test_mixed_local_wins_is_distinct_from_identity_replacement(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, _append, server, _github = stack_append_case(jj_repo, monkeypatch)
+    repository = observed.publication.repository
+    first_id, second_id = observed.stack.pull_requests
+    base, second, replacement = (value * 40 for value in "024")
+    source = server.read_pull_requests((first_id, second_id))
+    local = dataclasses.replace(
+        observed.publication.local,
+        commits=(
+            sync.ObservedCommit(
+                replacement, (base,), "cr", "Replacement", False, False
+            ),
+            sync.ObservedCommit(
+                second, (replacement,), "c2", "Two", False, False
+            ),
+        ),
+    )
+    state = dataclasses.replace(
+        observed.tracked_state,
+        last_published_heads=tuple(
+            item for item in observed.tracked_state.last_published_heads
+            if item.pr != first_id
+        ),
+    )
+    ordinary = sync.MixedMembershipInput(
+        repository,
+        "main",
+        observed.stack,
+        source,
+        (
+            sync.ExistingPRAssignment(first_id, replacement),
+            sync.ExistingPRAssignment(second_id, second),
+        ),
+        local,
+        observed.publication.destinations,
+        state,
+    )
+    forced = dataclasses.replace(
+        ordinary,
+        ordered=(
+            sync.LocalWinsPRAssignment(first_id, replacement),
+            sync.ExistingPRAssignment(second_id, second),
+        ),
+    )
+
+    blocked = sync.plan_mixed_membership(ordinary)
+    plan = sync.plan_mixed_membership(forced)
+
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "untracked-source"
+    assert isinstance(plan, sync.MixedMembershipPlan)
+    assert plan.goal.ordered == (first_id, second_id)
+    assert plan.replacements == ()
+    assert plan.new_goals == ()
+    assert isinstance(plan.assignments[0], sync.LocalWinsPRAssignment)
 
 
 def mixed_membership_case(jj_repo: Path, monkeypatch, position: str):
