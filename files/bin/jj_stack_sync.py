@@ -587,6 +587,40 @@ class PublicationAssignment:
 
 
 @dataclass(frozen=True)
+class NewPRAssignment:
+    """A selected commit which has no pull-request identity yet."""
+
+    commit_id: str
+    branch_name: str
+
+
+MembershipAssignment = (
+    ExistingPRAssignment
+    | NewPRAssignment
+)
+
+
+@dataclass(frozen=True)
+class MixedMembershipInput:
+    """Complete facts for deriving a stack containing old and new members.
+
+    ``source_stack`` is absent for a standalone source PR.  The ordered
+    selection is current intent, rather than a persisted recovery target.
+    """
+
+    repository: GitHubRepositoryId
+    base_branch: str
+    source_stack: GitHubStack | None
+    pull_requests: tuple[GitHubPullRequest, ...]
+    ordered: tuple[MembershipAssignment, ...]
+    local: LocalObservation
+    live_refs: tuple[LiveRemoteRef, ...]
+    tracked_state: TrackedState
+    historical_pull_requests: tuple[GitHubPullRequest, ...] = ()
+    recovery_facts: tuple[RecoveryEntry, ...] = ()
+
+
+@dataclass(frozen=True)
 class FirstPublicationInput:
     """Complete, already-read evidence for planning a first publication."""
 
@@ -628,6 +662,29 @@ class NewPullRequestGoal:
             or not self.title
         ):
             raise ValueError("new pull request goal fields must be nonempty")
+
+
+@dataclass(frozen=True)
+class MixedMembershipGoal:
+    repository: GitHubRepositoryId
+    base_branch: str
+    ordered: tuple[PullRequestId | NewPullRequestGoal, ...]
+    removed: tuple[PullRequestId, ...]
+
+
+@dataclass(frozen=True)
+class MixedMembershipPlan:
+    """A pure current goal plus the observations used to derive it."""
+
+    goal: MixedMembershipGoal
+    source_stack: GitHubStack | None
+    source_pull_requests: tuple[GitHubPullRequest, ...]
+    live_refs: tuple[LiveRemoteRef, ...]
+    assignments: tuple[MembershipAssignment, ...]
+    metadata: tuple[tuple[str, str], ...]
+    new_goals: tuple[NewPullRequestGoal, ...]
+    acquired_publications: tuple[tuple[PullRequestId, NewPullRequestGoal], ...] = ()
+    abandoned_publications: tuple[tuple[PullRequestId, NewPullRequestGoal], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -886,6 +943,38 @@ class MetadataMutationAttempt:
 
 
 @dataclass(frozen=True)
+class ExactPullRequestMutationAttempt:
+    """One exact base/title/body transition for mixed-membership repair."""
+
+    repository: GitHubRepositoryId
+    pull_request: PullRequestId
+    expected_base: str
+    expected_title: str
+    expected_body: str
+    base: str
+    title: str
+    body: str
+
+    def __post_init__(self) -> None:
+        if self.pull_request.repository != self.repository or not self.expected_base or not self.base:
+            raise ValueError("exact pull request mutation is malformed")
+
+
+@dataclass(frozen=True)
+class MixedGroupingAttempt:
+    """Best-effort grouping request; core correctness never depends on it."""
+
+    repository: GitHubRepositoryId
+    base_branch: str
+    pull_requests: tuple[PullRequestId, ...]
+
+    def __post_init__(self) -> None:
+        if (len(self.pull_requests) < 2 or len(set(self.pull_requests)) != len(self.pull_requests)
+                or any(pr.repository != self.repository for pr in self.pull_requests)):
+            raise ValueError("mixed grouping members are malformed")
+
+
+@dataclass(frozen=True)
 class BranchCreationAttempt:
     """One atomic absent-to-OID publication, before PR identities exist."""
 
@@ -1056,6 +1145,8 @@ MutationAttempt = (
     HeadMutationAttempt
     | MetadataMutationAttempt
     | AdoptionAttempt
+    | ExactPullRequestMutationAttempt
+    | MixedGroupingAttempt
     | BranchCreationAttempt
     | PullRequestCreationAttempt
     | StackCreationAttempt
@@ -1086,6 +1177,17 @@ def _attempt_resources(attempt: MutationAttempt) -> _MutationResources:
     if isinstance(attempt, MetadataMutationAttempt):
         return _MutationResources(
             attempt.repository, frozenset((attempt.update.pr_identity,))
+        )
+    if isinstance(attempt, ExactPullRequestMutationAttempt):
+        return _MutationResources(
+            attempt.repository,
+            frozenset((attempt.pull_request,)),
+            base_mutations=frozenset((attempt.pull_request,)),
+        )
+    if isinstance(attempt, MixedGroupingAttempt):
+        members = frozenset(attempt.pull_requests)
+        return _MutationResources(
+            attempt.repository, members, base_mutations=members
         )
     if isinstance(attempt, BranchCreationAttempt):
         return _MutationResources(
@@ -1158,29 +1260,87 @@ def _resources_conflict(
     )
 
 
-def _plan_resources(plan: NoOp | Apply | FirstPublicationPlan | StackAppendPlan | RetainedTopologyPlan | DetachedCleanupPlan) -> _MutationResources | None:
+def _plan_resources(
+    plan: NoOp | Apply | FirstPublicationPlan | StackAppendPlan
+        | RetainedTopologyPlan | MixedMembershipPlan | DetachedCleanupPlan,
+) -> _MutationResources | None:
     if isinstance(plan, (NoOp, Apply)):
         repository = plan.desired.repository
-        prs = frozenset((pr.identity for pr in plan.dependencies.prs))
-        refs = frozenset({*(item.ref for item in plan.dependencies.live_heads), *(item.ref for item in plan.dependencies.live_bases), *(RemoteBranchRef(repository, f'refs/heads/{pr.head_branch}') for pr in plan.dependencies.prs)})
-        base_mutations = frozenset((update.pr_identity for update in plan.metadata_updates)) if isinstance(plan, Apply) else frozenset()
-        return _MutationResources(repository, prs, refs, base_mutations=base_mutations)
+        prs = frozenset(pr.identity for pr in plan.dependencies.prs)
+        refs = frozenset({
+            *(item.ref for item in plan.dependencies.live_heads),
+            *(item.ref for item in plan.dependencies.live_bases),
+            *(RemoteBranchRef(repository, f"refs/heads/{pr.head_branch}")
+              for pr in plan.dependencies.prs),
+        })
+        base_mutations = frozenset(
+            update.pr_identity for update in plan.metadata_updates
+        ) if isinstance(plan, Apply) else frozenset()
+        return _MutationResources(repository, prs, refs,
+                                  base_mutations=base_mutations)
     if isinstance(plan, FirstPublicationPlan):
         repository = plan.goal.repository
-        return _MutationResources(repository, frozenset((pr.identity for pr in plan.historical_pull_requests)), frozenset((RemoteBranchRef(repository, f'refs/heads/{goal.branch_name}') for goal in plan.goal.pull_requests)))
+        return _MutationResources(
+            repository,
+            frozenset(pr.identity for pr in plan.historical_pull_requests),
+            frozenset(RemoteBranchRef(
+                repository, f"refs/heads/{goal.branch_name}"
+            ) for goal in plan.goal.pull_requests),
+        )
     if isinstance(plan, StackAppendPlan):
         repository = plan.goal.repository
-        members = frozenset({*plan.goal.old_members, *(pr.identity for pr in plan.existing_pull_requests)})
-        return _MutationResources(repository, members, frozenset((RemoteBranchRef(repository, f'refs/heads/{goal.branch_name}') for goal in plan.goal.pull_requests)), frozenset((plan.goal.stack,)), members)
+        members = frozenset({
+            *plan.goal.old_members,
+            *(pr.identity for pr in plan.existing_pull_requests),
+        })
+        return _MutationResources(
+            repository, members,
+            frozenset(RemoteBranchRef(
+                repository, f"refs/heads/{goal.branch_name}"
+            ) for goal in plan.goal.pull_requests),
+            frozenset((plan.goal.stack,)), members,
+        )
     if isinstance(plan, RetainedTopologyPlan):
         members = frozenset(plan.source_stack.pull_requests)
-        return _MutationResources(plan.repository, members, frozenset((item.ref for item in plan.live_refs)), frozenset((plan.source_stack.identity,)), members if plan.dissolve else frozenset())
-    repositories = {item.pr.repository for item in plan.selected + plan.retire}
+        return _MutationResources(
+            plan.repository, members,
+            frozenset(item.ref for item in plan.live_refs),
+            frozenset((plan.source_stack.identity,)),
+            members if plan.dissolve else frozenset(),
+        )
+    if isinstance(plan, MixedMembershipPlan):
+        repository = plan.goal.repository
+        prs = frozenset({
+            *(pr.identity for pr in plan.source_pull_requests),
+            *(item for item in plan.goal.ordered if isinstance(item, PullRequestId)),
+            *plan.goal.removed,
+            *(pr for pr, _goal in plan.acquired_publications),
+            *(pr for pr, _goal in plan.abandoned_publications),
+        })
+        refs = frozenset({
+            *(item.ref for item in plan.live_refs),
+            *(RemoteBranchRef(repository, f"refs/heads/{goal.branch_name}")
+              for goal in plan.new_goals),
+        })
+        return _MutationResources(
+            repository, prs, refs,
+            frozenset(() if plan.source_stack is None
+                      else (plan.source_stack.identity,)),
+            prs,
+        )
+    repositories = {
+        item.pr.repository for item in plan.selected + plan.retire
+    }
     if len(repositories) != 1:
         return None
     repository = next(iter(repositories))
     associations = plan.selected + plan.retire
-    return _MutationResources(repository, frozenset((item.pr for item in associations)), frozenset((item.ref for item in associations)))
+    return _MutationResources(
+        repository,
+        frozenset(item.pr for item in associations),
+        frozenset(item.ref for item in associations),
+    )
+
 
 @dataclass(frozen=True)
 class RecoveryEntry:
@@ -2991,6 +3151,22 @@ def _recovery_entry_to_dict(entry: RecoveryEntry) -> dict[str, object]:
             "boundaries": [{"pr": x.pr_identity.number, "branch": x.branch,
                 "old_seam": x.old_seam_commit_id, "new_seam": x.new_seam_commit_id,
                 "old": x.old_commit_id, "new": x.remote_commit_id} for x in attempt.boundaries]}
+    elif isinstance(attempt, ExactPullRequestMutationAttempt):
+        payload = {
+            "kind": "exact-pr", "identity": entry.identity,
+            "possibly_live": entry.possibly_live,
+            "repository": asdict(attempt.repository), "pr": attempt.pull_request.number,
+            "expected_base": attempt.expected_base,
+            "expected_title": attempt.expected_title, "expected_body": attempt.expected_body,
+            "base": attempt.base, "title": attempt.title, "body": attempt.body,
+        }
+    elif isinstance(attempt, MixedGroupingAttempt):
+        payload = {
+            "kind": "mixed-group", "identity": entry.identity,
+            "possibly_live": entry.possibly_live,
+            "repository": asdict(attempt.repository), "base_branch": attempt.base_branch,
+            "pull_requests": [pr.number for pr in attempt.pull_requests],
+        }
     elif isinstance(attempt, BranchCreationAttempt):
         payload = {
             "kind": "create-branches", "identity": entry.identity,
@@ -3105,16 +3281,25 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
         if kind == "metadata"
         else common_fields | {"remote", "state_blob_oid", "boundaries"}
         if kind == "adoption"
-        else common_fields | {'push_url', 'goals'}
-        if kind == 'create-branches'
-        else common_fields | {'goal', 'pull_request'}
-        if kind == 'create-pr'
-        else common_fields | {'base_branch', 'pull_requests', 'goals'}
-        if kind == 'create-stack'
-        else common_fields | {'stack', 'stack_node_id', 'base_branch', 'old_members', 'additions', 'goals'}
-        if kind == 'append-stack'
-        else common_fields | {'stack', 'stack_node_id', 'base_branch', 'members', 'pull_requests', 'live_refs', 'ownership'}
-        if kind == 'unstack'
+        else common_fields | {"pr", "expected_base", "expected_title", "expected_body", "base", "title", "body"}
+        if kind == "exact-pr"
+        else common_fields | {"base_branch", "pull_requests"}
+        if kind == "mixed-group"
+        else common_fields | {"push_url", "goals"}
+        if kind == "create-branches"
+        else common_fields | {"goal", "pull_request"}
+        if kind == "create-pr"
+        else common_fields | {"base_branch", "pull_requests", "goals"}
+        if kind == "create-stack"
+        else common_fields | {
+            "stack", "stack_node_id", "base_branch", "old_members", "additions", "goals"
+        }
+        if kind == "append-stack"
+        else common_fields | {
+            "stack", "stack_node_id", "base_branch", "members", "pull_requests",
+            "live_refs", "ownership"
+        }
+        if kind == "unstack"
         else common_fields | {'pr', 'ref', 'commit', 'disposition', 'expected_state'}
         if kind == 'close-detached'
         else None
@@ -3229,6 +3414,17 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
             raw["expected_title"],
             raw["expected_body"],
         )
+    elif kind == "exact-pr":
+        attempt = ExactPullRequestMutationAttempt(
+            repository, PullRequestId(repository, raw["pr"]), raw["expected_base"],
+            raw["expected_title"], raw["expected_body"], raw["base"], raw["title"], raw["body"],
+        )
+    elif kind == "mixed-group":
+        numbers = raw["pull_requests"]
+        if not isinstance(numbers, list):
+            raise ValueError("mixed grouping members must be an array")
+        attempt = MixedGroupingAttempt(repository, raw["base_branch"],
+            tuple(PullRequestId(repository, number) for number in numbers))
     elif kind == "create-branches":
         goals = raw["goals"]
         if not isinstance(goals, list):
@@ -3658,6 +3854,241 @@ def resolve_publication_assignments(
                     "branch has historical same-repository pull request use",
                 )
     return assignments
+
+
+def plan_mixed_membership(
+    observed: MixedMembershipInput,
+) -> MixedMembershipPlan | Blocked:
+    """Derive mixed membership; only an explicit assignment is replacement."""
+    if not observed.ordered:
+        return _block("empty-selection", "stack", "desired membership is empty")
+    source_ids = tuple(pr.identity for pr in observed.pull_requests)
+    expected_source = (
+        observed.source_stack.pull_requests
+        if observed.source_stack is not None
+        else source_ids
+    )
+    if (
+        tuple(source_ids) != tuple(expected_source)
+        or len(source_ids) != len(set(source_ids))
+        or any(pr.identity.repository != observed.repository for pr in observed.pull_requests)
+        or observed.source_stack is not None
+        and observed.source_stack.identity.repository != observed.repository
+    ):
+        return _block("incomplete-membership", "stack", "complete repository-local source membership is required")
+    refs: dict[str, str | None] = {}
+    for item in observed.live_refs:
+        if item.ref.repository != observed.repository or item.ref.full_name in refs:
+            return _block("ambiguous-live-ref", item.ref.full_name, "live refs must be unique and repository-local")
+        refs[item.ref.full_name] = item.commit_id
+    if any(
+        pr.head_repository != observed.repository
+        or pr.head_oid is None
+        or refs.get(f"refs/heads/{pr.head_branch}") != pr.head_oid
+        or pr.state is not PullRequestState.OPEN
+        or pr.auto_merge_enabled
+        or pr.in_merge_queue
+        for pr in observed.pull_requests
+    ):
+        return _block("source-inactive", "stack", "source PRs must be open, local, inactive, and match live refs")
+
+    authority = observed.tracked_state.last_published_heads + observed.tracked_state.last_adopted_heads
+    if any(not any(
+        item.pr == pr.identity
+        and item.ref == RemoteBranchRef(observed.repository, f"refs/heads/{pr.head_branch}")
+        and item.verified_commit_id == pr.head_oid
+        for item in authority
+    ) for pr in observed.pull_requests):
+        return _block("untracked-source", "stack", "every source identity needs exact head ownership")
+    tracked_memberships = tuple(stack for stack in observed.tracked_state.stacks
+        if stack.repository == observed.repository and stack.base_branch == observed.base_branch
+        and stack.ordered_prs == source_ids)
+    detached_singleton = (
+        observed.source_stack is None
+        and len(source_ids) == 1
+        and any(item.pr == source_ids[0] for item in observed.tracked_state.detached_associations)
+    )
+    if len(tracked_memberships) != 1 and not detached_singleton:
+        return _block("untracked-membership", "stack", "exact source membership is not tracked")
+    if observed.source_stack is not None:
+        summary = GitHubStackSummary(observed.source_stack.identity,
+            observed.source_stack.node_id, observed.source_stack.base_branch)
+        dissolution = tuple(
+            entry.attempt for entry in observed.recovery_facts
+            if isinstance(entry.attempt, StackDissolutionAttempt)
+            and entry.attempt.stack == observed.source_stack.identity
+            and entry.attempt.members == source_ids
+            and entry.possibly_live
+        )
+        if len(dissolution) > 1:
+            return _block("ambiguous-provenance", "stack", "multiple dissolution facts overlap")
+        live = all(pr.stack == summary for pr in observed.pull_requests)
+        partial = bool(dissolution) and all(
+            pr.stack in (None, summary) for pr in observed.pull_requests
+        )
+        if not (live or partial):
+            return _block("foreign-topology", "stack", "source membership is neither live nor exactly dissolved")
+        if live:
+            expected_branch = observed.source_stack.base_branch
+            expected_oid = refs.get(f"refs/heads/{expected_branch}")
+            for pr in observed.pull_requests:
+                if pr.base_branch != expected_branch or pr.base_oid != expected_oid:
+                    return _block(
+                        "foreign-base", f"PR #{pr.number}",
+                        "live source base topology does not match its exact predecessor",
+                    )
+                expected_branch = pr.head_branch
+                expected_oid = pr.head_oid
+        else:
+            original = {
+                pr.identity: pr for pr in dissolution[0].pull_requests
+            }
+            explained = {
+                attempt.pull_request: {attempt.expected_base, attempt.base}
+                for entry in observed.recovery_facts
+                if isinstance((attempt := entry.attempt), ExactPullRequestMutationAttempt)
+                and attempt.repository == observed.repository
+            }
+            for pr in observed.pull_requests:
+                old = original.get(pr.identity)
+                allowed = set() if old is None else {old.base_branch}
+                allowed.update(explained.get(pr.identity, set()))
+                if pr.base_branch not in allowed:
+                    return _block(
+                        "foreign-base", f"PR #{pr.number}",
+                        "detached source base is not explained by recovery provenance",
+                    )
+
+    existing = [
+        item for item in observed.ordered
+        if isinstance(item, (ExistingPRAssignment,))
+    ]
+    existing_ids = tuple(item.pr_identity for item in existing)
+    if len(existing_ids) != len(set(existing_ids)) or not set(existing_ids) <= set(source_ids):
+        return _block("foreign-identity", "stack", "existing selections must be unique source identities")
+    new = [item for item in observed.ordered if isinstance(item, NewPRAssignment)]
+    new_names = tuple(item.branch_name for item in new)
+    if len(new_names) != len(set(new_names)) or any(not name or f"refs/heads/{name}" not in refs for name in new_names):
+        return _block("invalid-publication-branch", "stack", "new publication branches must be unique and observed")
+    source_branches = {pr.head_branch for pr in observed.pull_requests}
+    source_heads = {pr.head_oid for pr in observed.pull_requests}
+    if source_branches.intersection(new_names) or any(item.commit_id in source_heads for item in new):
+        return _block("replacement-ambiguity", "stack", "new slots must not alias an existing identity or head")
+
+    commits = {commit.commit_id: commit for commit in observed.local.commits}
+    if len(commits) != len(observed.local.commits):
+        return _block("ambiguous-commit", "stack", "a selected commit was observed twice")
+    base_oid = refs.get(f"refs/heads/{observed.base_branch}")
+    if base_oid is None:
+        return _block("base-unavailable", observed.base_branch, "live base is absent")
+    predecessor = base_oid
+    predecessor_branch = observed.base_branch
+    ordered: list[PullRequestId | NewPullRequestGoal] = []
+    desired_metadata: list[tuple[str, str]] = []
+    new_goals: list[NewPullRequestGoal] = []
+    historical_names = {
+        name
+        for pr in (*observed.pull_requests, *observed.historical_pull_requests)
+        for name in (
+            pr.base_branch,
+            pr.head_branch if pr.head_repository == observed.repository else "",
+        )
+        if name
+    }
+
+    for assignment in observed.ordered:
+        commit = commits.get(assignment.commit_id)
+        if commit is None or commit.is_hidden or commit.has_conflicts or commit.parent_commit_ids != (predecessor,):
+            return _block("invalid-publication-commit", assignment.commit_id, "selection must be one complete visible linear chain")
+        metadata = _metadata(commit.description)
+        if metadata is None:
+            return _block("title-missing", assignment.commit_id, "selected commit has no title")
+        if isinstance(assignment, (ExistingPRAssignment,)):
+            ordered.append(assignment.pr_identity)
+            pr = next(pr for pr in observed.pull_requests if pr.identity == assignment.pr_identity)
+            predecessor_branch = pr.head_branch
+        else:
+            branch_name = assignment.branch_name
+            destination = refs[f"refs/heads/{branch_name}"]
+            owned = any(
+                isinstance(entry.attempt, BranchCreationAttempt)
+                and entry.attempt.repository == observed.repository
+                and any(goal.branch_name == branch_name and goal.commit_id == assignment.commit_id for goal in entry.attempt.goals)
+                for entry in observed.recovery_facts
+            )
+            if destination is not None and (destination != assignment.commit_id or not owned):
+                return _block("remote-publication-collision", branch_name, "new destination is occupied without exact recovery ownership")
+            title, body = metadata
+            goal = NewPullRequestGoal(
+                assignment.commit_id, branch_name, predecessor_branch, title, body,
+            )
+            new_goals.append(goal)
+            recovered = tuple(
+                entry.attempt.pull_request for entry in observed.recovery_facts
+                if isinstance(entry.attempt, PullRequestCreationAttempt)
+                and entry.attempt.repository == observed.repository
+                and entry.attempt.goal == goal and entry.attempt.pull_request is not None
+            )
+            if len(set(recovered)) > 1:
+                return _block("foreign-identity", branch_name, "recovery binds multiple PR identities")
+            ordered.append(recovered[0] if recovered else goal)
+            predecessor_branch = branch_name
+        desired_metadata.append(metadata)
+        predecessor = assignment.commit_id
+    removed = tuple(identity for identity in source_ids if identity not in existing_ids)
+    acquired: dict[PullRequestId, NewPullRequestGoal] = {}
+    for entry in observed.recovery_facts:
+        attempt = entry.attempt
+        if (
+            isinstance(attempt, PullRequestCreationAttempt)
+            and attempt.repository == observed.repository
+            and attempt.pull_request is not None
+        ):
+            previous = acquired.get(attempt.pull_request)
+            if previous is not None and previous != attempt.goal:
+                return _block(
+                    "foreign-identity",
+                    f"PR #{attempt.pull_request.number}",
+                    "an acquired identity is bound to multiple publication goals",
+                )
+            acquired[attempt.pull_request] = attempt.goal
+    history = {pr.identity: pr for pr in observed.historical_pull_requests}
+    for identity, goal in acquired.items():
+        pr = history.get(identity)
+        owns_branch = any(
+            isinstance(entry.attempt, BranchCreationAttempt)
+            and entry.attempt.repository == observed.repository
+            and goal in entry.attempt.goals
+            for entry in observed.recovery_facts
+        )
+        if (
+            pr is None
+            or not owns_branch
+            or pr.head_repository != observed.repository
+            or pr.head_branch != goal.branch_name
+            or pr.head_oid != goal.commit_id
+            or pr.base_branch != goal.base_branch
+            or pr.title != goal.title
+            or pr.body != goal.body
+        ):
+            return _block(
+                "foreign-acquired-publication",
+                f"PR #{identity.number}",
+                "an acquired identity no longer matches its exact publication receipt",
+            )
+    active_acquired = tuple(
+        (identity, goal) for identity, goal in acquired.items()
+        if identity in ordered
+    )
+    abandoned_acquired = tuple(
+        (identity, goal) for identity, goal in acquired.items()
+        if identity not in ordered
+    )
+    return MixedMembershipPlan(
+        MixedMembershipGoal(observed.repository, observed.base_branch, tuple(ordered), removed),
+        observed.source_stack, observed.pull_requests, observed.live_refs, observed.ordered,
+        tuple(desired_metadata), tuple(new_goals), active_acquired, abandoned_acquired,
+    )
 
 
 def plan_first_publication(
@@ -4790,6 +5221,27 @@ def _classify_attempt(
             "applied" if pr.state in (PullRequestState.CLOSED, PullRequestState.MERGED)
             else "foreign"
         )
+    if isinstance(attempt, ExactPullRequestMutationAttempt):
+        prs = github.pull_requests((attempt.pull_request,))
+        if len(prs) != 1:
+            return "foreign"
+        actual = (prs[0].base_branch, prs[0].title, prs[0].body)
+        wanted = (attempt.base, attempt.title, attempt.body)
+        old = (attempt.expected_base, attempt.expected_title, attempt.expected_body)
+        return "applied" if actual == wanted else "not-applied" if actual == old else "foreign"
+    if isinstance(attempt, MixedGroupingAttempt):
+        prs = github.pull_requests(attempt.pull_requests)
+        summaries = {pr.stack for pr in prs}
+        if summaries == {None}:
+            return "not-applied"
+        if len(summaries) != 1 or None in summaries:
+            return "foreign"
+        summary = next(iter(summaries))
+        assert summary is not None
+        repository = github.resolve_repository(attempt.repository)
+        stack = github.stack(repository, summary.identity)
+        return "applied" if (stack is not None and stack.base_branch == attempt.base_branch
+            and stack.pull_requests == attempt.pull_requests) else "foreign"
     assert isinstance(attempt, MetadataMutationAttempt)
     prs = github.pull_requests((attempt.update.pr_identity,))
     if len(prs) != 1:
@@ -4900,6 +5352,10 @@ def settle_recovery(
             ))
         elif isinstance(entry.attempt, BranchCreationAttempt):
             remaining.append(entry)
+        elif isinstance(entry.attempt, ExactPullRequestMutationAttempt):
+            # The exact server result is provenance until mixed membership has
+            # handed it to a state receipt.
+            remaining.append(entry)
     if not dry_run:
         for attempt in applied_heads:
             _state_oid, current = read_state(workspace)
@@ -4984,8 +5440,12 @@ def _attempt_conflicts_plan(entry: RecoveryEntry, plan: NoOp | Apply) -> bool:
     active_prs = {pr.identity for pr in plan.dependencies.prs}
     if isinstance(attempt, MetadataMutationAttempt):
         return attempt.update.pr_identity in active_prs
+    if isinstance(attempt, ExactPullRequestMutationAttempt):
+        return attempt.pull_request in active_prs
     if isinstance(attempt, DetachedCloseAttempt):
         return attempt.association.pr in active_prs
+    if isinstance(attempt, MixedGroupingAttempt):
+        return bool(active_prs.intersection(attempt.pull_requests))
     active_refs = {
         item.ref
         for item in plan.dependencies.live_heads + plan.dependencies.live_bases
@@ -5437,7 +5897,16 @@ def _retire_first_publication_facts(
     entries = tuple(
         entry for entry in journal.entries
         if not (
-            isinstance(entry.attempt, StackCreationAttempt) and entry.attempt == attempt or (isinstance(entry.attempt, BranchCreationAttempt) and entry.attempt.repository == attempt.repository and (set(entry.attempt.goals) == goals)) or (isinstance(entry.attempt, PullRequestCreationAttempt) and entry.attempt.goal in goals and (entry.attempt.pull_request in members))
+            isinstance(entry.attempt, StackCreationAttempt)
+            and entry.attempt == attempt
+            or isinstance(entry.attempt, BranchCreationAttempt)
+            and entry.attempt.repository == attempt.repository
+            and set(entry.attempt.goals) == goals
+            or isinstance(entry.attempt, PullRequestCreationAttempt)
+            and entry.attempt.goal in goals
+            and entry.attempt.pull_request in members
+            or isinstance(entry.attempt, ExactPullRequestMutationAttempt)
+            and entry.attempt.pull_request in members
         )
     )
     cas_write_recovery(
@@ -5499,6 +5968,10 @@ def _append_conflict(entry: RecoveryEntry, plan: StackAppendPlan) -> bool:
         )
     if isinstance(attempt, MetadataMutationAttempt):
         return attempt.update.pr_identity in members
+    if isinstance(attempt, ExactPullRequestMutationAttempt):
+        return attempt.pull_request in members
+    if isinstance(attempt, MixedGroupingAttempt):
+        return bool(set(attempt.pull_requests) & members)
     if isinstance(attempt, StackDissolutionAttempt):
         return attempt.stack == plan.goal.stack or bool(set(attempt.members) & members)
     if isinstance(attempt, DetachedCloseAttempt):
@@ -6234,6 +6707,636 @@ def execute_first_publication(
     if confirm is not None and not confirm(plan):
         return plan, Stopped("confirmation", "publication was not confirmed")
     return plan, apply_first_publication(
+        plan,
+        workspace,
+        github,
+        push_url,
+        dry_run=dry_run,
+        git_transport=git_transport,
+    )
+
+
+def _mixed_conflict(entry: RecoveryEntry, plan: MixedMembershipPlan) -> bool:
+    attempt = entry.attempt
+    repository = (attempt.association.pr.repository
+        if isinstance(attempt, DetachedCloseAttempt) else attempt.repository)
+    if repository != plan.goal.repository:
+        return False
+    identities = {
+        *(pr.identity for pr in plan.source_pull_requests),
+        *(item for item in plan.goal.ordered if isinstance(item, PullRequestId)),
+        *plan.goal.removed,
+        *(identity for identity, _goal in plan.acquired_publications),
+        *(identity for identity, _goal in plan.abandoned_publications),
+    }
+    branches = {
+        *(item.branch_name for item in plan.new_goals),
+        *(goal.branch_name for _identity, goal in plan.acquired_publications),
+        *(goal.branch_name for _identity, goal in plan.abandoned_publications),
+    }
+    refs = {
+        RemoteBranchRef(plan.goal.repository, f"refs/heads/{plan.goal.base_branch}"),
+        *(RemoteBranchRef(plan.goal.repository, f"refs/heads/{pr.head_branch}")
+          for pr in plan.source_pull_requests),
+        *(RemoteBranchRef(plan.goal.repository, f"refs/heads/{branch}")
+          for branch in branches),
+    }
+    if isinstance(attempt, AdoptionAttempt):
+        return bool(
+            identities.intersection(boundary.pr_identity for boundary in attempt.boundaries)
+            or refs.intersection(
+                RemoteBranchRef(attempt.repository, f"refs/heads/{boundary.branch}")
+                for boundary in attempt.boundaries
+            )
+        )
+    if isinstance(attempt, MetadataMutationAttempt):
+        return attempt.update.pr_identity in identities
+    if isinstance(attempt, DetachedCloseAttempt):
+        return attempt.association.pr in identities or attempt.association.ref in refs
+    if isinstance(attempt, ExactPullRequestMutationAttempt):
+        if attempt.pull_request not in identities:
+            return False
+        if attempt.pull_request not in plan.goal.ordered:
+            return True
+        index = tuple(plan.goal.ordered).index(attempt.pull_request)
+        predecessor = (plan.goal.base_branch if index == 0 else
+            plan.source_pull_requests[0].head_branch)
+        previous = plan.goal.ordered[index - 1] if index else None
+        if isinstance(previous, NewPullRequestGoal):
+            predecessor = previous.branch_name
+        elif isinstance(previous, PullRequestId):
+            predecessor_by_identity = {
+                **{pr.identity: pr.head_branch for pr in plan.source_pull_requests},
+                **{identity: goal.branch_name
+                   for identity, goal in plan.acquired_publications},
+                **{identity: goal.branch_name
+                   for identity, goal in plan.abandoned_publications},
+            }
+            predecessor = predecessor_by_identity[previous]
+        return (attempt.base, attempt.title, attempt.body) != (
+            predecessor, *plan.metadata[index])
+    if isinstance(attempt, MixedGroupingAttempt):
+        return bool(identities.intersection(attempt.pull_requests))
+    if isinstance(attempt, PullRequestCreationAttempt):
+        if (attempt.pull_request, attempt.goal) in plan.acquired_publications:
+            return False
+        if (attempt.pull_request, attempt.goal) in plan.abandoned_publications:
+            return False
+        return attempt.goal.branch_name in branches and (
+            attempt.pull_request is None
+            or all(item != attempt.goal for item in plan.goal.ordered)
+        )
+    if isinstance(attempt, BranchCreationAttempt):
+        absorbed_goals = plan.new_goals + tuple(
+            goal for _identity, goal in plan.abandoned_publications
+            if goal not in plan.new_goals
+        )
+        return (
+            any(goal.branch_name in branches for goal in attempt.goals)
+            and (
+                attempt.goals != absorbed_goals
+            )
+        )
+    if isinstance(attempt, HeadMutationAttempt):
+        return any(update.ref in refs for update in attempt.updates)
+    if isinstance(attempt, StackDissolutionAttempt):
+        if (plan.source_stack is not None
+                and attempt.stack == plan.source_stack.identity
+                and attempt.members == plan.source_stack.pull_requests):
+            return False
+        return bool(identities.intersection(attempt.members))
+    if isinstance(attempt, StackCreationAttempt):
+        members = attempt.pull_requests
+        return bool(identities.intersection(members))
+    if isinstance(attempt, StackAppendAttempt):
+        return bool(identities.intersection(attempt.old_members + attempt.additions))
+    return False
+
+
+def _best_effort_group(
+    workspace: str | Path,
+    github: GitHubClient,
+    repository: GitHubRepository,
+    base_branch: str,
+    identities: tuple[PullRequestId, ...],
+    git_transport: GitTransport,
+) -> None:
+    """Try optional grouping once, retaining uncertainty as recovery evidence."""
+    if len(identities) < 2:
+        return
+    attempt = MixedGroupingAttempt(
+        repository.identity, base_branch, identities
+    )
+    try:
+        oid, entry = _append_recovery(workspace, attempt)
+        live = replace(entry, possibly_live=True)
+        oid = _replace_recovery_entry(workspace, oid, live)
+        try:
+            github.create_stack(repository, pull_requests=identities)
+        except GitHubTransportError:
+            return
+        except GitHubHttpError as exc:
+            if exc.response.status < 500:
+                _remove_recovery_entry(workspace, oid, entry.identity)
+            return
+        try:
+            if _classify_attempt(workspace, github, attempt, git_transport) == "applied":
+                _remove_recovery_entry(workspace, oid, entry.identity)
+        except Error:
+            return
+    except Error:
+        # Grouping is optional. Admission can reject it when another durable
+        # action already owns any member, without affecting core completion.
+        return
+
+
+def apply_mixed_membership(
+    plan: MixedMembershipPlan, workspace: str | Path, github: GitHubClient,
+    push_url: str, *, dry_run: bool = False,
+    git_transport: GitTransport | None = None,
+) -> ApplyResult:
+    """Repair exact mixed members; grouping is a recoverable best-effort epilogue."""
+    git = git_transport or SubprocessGitTransport(workspace)
+    _oid, journal = read_recovery(workspace)
+    if dry_run:
+        try:
+            facts = settle_recovery(
+                workspace, github, dry_run=True, git_transport=git
+            )
+        except Error as exc:
+            return Stopped("recovery", str(exc))
+        return (Stopped("recovery", "a conflicting mixed mutation remains unresolved")
+            if any(_mixed_conflict(entry, plan) for entry in facts) else Verified())
+    with repository_lock(workspace):
+        _locked_oid, locked_journal = read_recovery(workspace)
+        try:
+            facts = settle_recovery(workspace, github, git_transport=git)
+            repository = github.resolve_repository(plan.goal.repository)
+        except Error as exc:
+            return Stopped("recovery", str(exc))
+        # A creation receipt binds an identity to one exact publication goal,
+        # but does not authorize later drift.  Freeze active acquired identities
+        # again under the mutation lock; only a verified owned exact edit may
+        # explain a change from their creation shape.
+        if plan.acquired_publications:
+            acquired_ids = tuple(identity for identity, _goal in plan.acquired_publications)
+            try:
+                acquired = github.pull_requests(acquired_ids)
+            except Error as exc:
+                return Stopped("pull-request", f"acquired identity readback is unresolved: {exc}")
+            if len(acquired) != len(acquired_ids):
+                return Stopped("pull-request", "an acquired identity disappeared")
+            by_identity = {pr.identity: pr for pr in acquired}
+            for identity, goal in plan.acquired_publications:
+                expected = (goal.base_branch, goal.title, goal.body)
+                for entry in facts:
+                    attempt = entry.attempt
+                actual = by_identity.get(identity)
+                if (
+                    actual is None
+                    or actual.head_repository != plan.goal.repository
+                    or actual.head_branch != goal.branch_name
+                    or actual.head_oid != goal.commit_id
+                    or actual.state is not PullRequestState.OPEN
+                    or actual.draft
+                    or actual.stack is not None
+                    or (actual.base_branch, actual.title, actual.body) != expected
+                ):
+                    return Stopped(
+                        "pull-request", "an acquired identity no longer matches its exact goal"
+                    )
+        # An old-looking read never authorizes replay of a request which may
+        # still land. Applied exact PR edits may continue to their state handoff.
+        for entry in facts:
+            if isinstance(entry.attempt, ExactPullRequestMutationAttempt):
+                relevant = {
+                    pr.identity for pr in plan.source_pull_requests
+                } | {
+                    item
+                    for item in plan.goal.ordered
+                    if isinstance(item, PullRequestId)
+                }
+                if (
+                    entry.attempt.pull_request in relevant
+                    and _classify_attempt(workspace, github, entry.attempt, git)
+                    != "applied"
+                ):
+                    return Stopped("recovery", "an exact PR mutation remains unresolved")
+            elif (
+                isinstance(entry.attempt, BranchCreationAttempt)
+                and entry.attempt.repository == plan.goal.repository
+                and entry.attempt.goals == plan.new_goals
+                and _classify_attempt(workspace, github, entry.attempt, git)
+                != "applied"
+            ):
+                return Stopped("recovery", "a branch publication remains unresolved")
+            elif _mixed_conflict(entry, plan):
+                return Stopped("recovery", "a conflicting mixed mutation remains unresolved")
+        _state_oid, recorded_state = read_state(workspace)
+        recorded_identities: list[PullRequestId] = []
+        for item in plan.goal.ordered:
+            if isinstance(item, PullRequestId):
+                recorded_identities.append(item)
+                continue
+            matches = tuple(
+                receipt.pr for receipt in recorded_state.last_published_heads
+                if receipt.ref == RemoteBranchRef(
+                    plan.goal.repository, f"refs/heads/{item.branch_name}"
+                )
+                and receipt.verified_commit_id == item.commit_id
+            )
+            if len(matches) != 1:
+                break
+            recorded_identities.append(matches[0])
+        recorded_tracking = TrackedStack(
+            plan.goal.repository, plan.goal.base_branch, tuple(recorded_identities)
+        )
+        if (
+            len(recorded_identities) == len(plan.goal.ordered)
+            and recorded_tracking in recorded_state.stacks
+            and set(plan.goal.removed).issubset(
+                item.pr for item in recorded_state.detached_associations
+            )
+            and {
+                identity for identity, _goal in plan.abandoned_publications
+            }.issubset(item.pr for item in recorded_state.detached_associations)
+        ):
+            try:
+                recorded_prs = github.pull_requests(tuple(recorded_identities))
+            except Error as exc:
+                return Stopped("receipt", f"recorded membership readback is unresolved: {exc}")
+            previous = plan.goal.base_branch
+            exact = True
+            for index, pr in enumerate(recorded_prs):
+                title, body = plan.metadata[index]
+                assignment = plan.assignments[index]
+                wanted_oid = assignment.commit_id
+                if (
+                    pr.identity != recorded_identities[index]
+                    or pr.head_repository != plan.goal.repository
+                    or pr.head_oid != wanted_oid
+                    or (pr.base_branch, pr.title, pr.body) != (previous, title, body)
+                ):
+                    exact = False
+                    break
+                previous = pr.head_branch
+            if exact:
+                return Verified(state_recorded=True)
+        source = {pr.identity: pr for pr in plan.source_pull_requests}
+        if plan.source_stack is not None:
+            dissolution = tuple(
+                entry for entry in facts
+                if isinstance(entry.attempt, StackDissolutionAttempt)
+                and entry.attempt.stack == plan.source_stack.identity
+                and entry.attempt.members == plan.source_stack.pull_requests
+            )
+            if len(dissolution) > 1:
+                return Stopped("recovery", "multiple source dissolution facts overlap")
+            try:
+                stack = github.stack(repository, plan.source_stack.identity)
+            except Error as exc:
+                return Stopped("stack", f"source topology readback is unresolved: {exc}")
+            if stack is not None:
+                if dissolution:
+                    return Stopped("recovery", "source dissolution remains unresolved")
+                state_oid, state = read_state(workspace)
+                del state_oid
+                members = set(plan.source_stack.pull_requests)
+                source_by_id = {pr.identity: pr for pr in plan.source_pull_requests}
+                ownership = tuple(
+                    item for item in state.last_published_heads + state.last_adopted_heads
+                    if item.pr in members
+                    and item.pr in source_by_id
+                    and item.ref == RemoteBranchRef(
+                        plan.goal.repository,
+                        f"refs/heads/{source_by_id[item.pr].head_branch}",
+                    )
+                    and item.verified_commit_id == source_by_id[item.pr].head_oid
+                )
+                required_refs = {
+                    f"refs/heads/{plan.source_stack.base_branch}",
+                    *(f"refs/heads/{pr.head_branch}" for pr in plan.source_pull_requests),
+                }
+                live_refs = tuple(
+                    item for item in plan.live_refs if item.ref.full_name in required_refs
+                )
+                attempt = StackDissolutionAttempt(
+                    plan.goal.repository,
+                    plan.source_stack.identity,
+                    plan.source_stack.node_id,
+                    plan.source_stack.base_branch,
+                    plan.source_stack.pull_requests,
+                    plan.source_pull_requests,
+                    live_refs,
+                    TrackedStack(
+                        plan.goal.repository,
+                        plan.source_stack.base_branch,
+                        plan.source_stack.pull_requests,
+                    ),
+                    ownership,
+                )
+                if _classify_attempt(workspace, github, attempt, git) != "not-applied":
+                    return Stopped("stack", "source topology is foreign")
+                oid, entry = _append_recovery(workspace, attempt)
+                live = replace(entry, possibly_live=True)
+                _replace_recovery_entry(workspace, oid, live)
+                try:
+                    github.unstack(repository, plan.source_stack.identity)
+                except GitHubTransportError:
+                    pass
+                except GitHubHttpError:
+                    current_oid, _journal = read_recovery(workspace)
+                    assert current_oid is not None
+                    _remove_recovery_entry(workspace, current_oid, entry.identity)
+                    return Stopped("stack", "source dissolution was rejected")
+                try:
+                    classification = _classify_attempt(
+                        workspace, github, attempt, git
+                    )
+                except Error as exc:
+                    return Stopped("stack", f"source dissolution readback is unresolved: {exc}")
+                if classification != "applied":
+                    return Stopped("stack", f"source dissolution is {classification}")
+                facts += (live,)
+            elif not dissolution:
+                return Stopped("stack", "source stack disappeared without exact provenance")
+        goals = plan.new_goals
+        refs = {item.ref.full_name: item.commit_id for item in plan.live_refs}
+        head_published = False
+        if goals:
+            wanted = tuple(goal.commit_id for goal in goals)
+            current = tuple(refs.get(f"refs/heads/{goal.branch_name}") for goal in goals)
+            owned = any(isinstance(entry.attempt, BranchCreationAttempt)
+                and entry.attempt.repository == plan.goal.repository
+                and entry.attempt.goals == goals
+                for entry in facts)
+            if current != wanted:
+                if any(value is not None for value in current):
+                    return Stopped("heads", "a new publication destination changed")
+                attempt = BranchCreationAttempt(
+                    plan.goal.repository, push_url, goals
+                )
+                oid, entry = _append_recovery(workspace, attempt)
+                live = replace(entry, possibly_live=True)
+                oid = _replace_recovery_entry(workspace, oid, live)
+                try:
+                    git.push_absent_heads(push_url, plan.goal.repository, goals)
+                except GitPushError:
+                    pass
+                if _classify_attempt(workspace, github, attempt, git) != "applied":
+                    return Stopped("heads", "new head publication is unresolved")
+                facts += (live,)
+                head_published = True
+            elif not owned:
+                return Stopped("heads", "occupied new destinations are not owned")
+
+        identities: list[PullRequestId] = []
+        goal_by_identity: dict[PullRequestId, NewPullRequestGoal] = {}
+        for item in plan.goal.ordered:
+            if isinstance(item, PullRequestId):
+                identities.append(item)
+                continue
+            matches = github.find_pull_requests(plan.goal.repository,
+                head_branches=(item.branch_name,), states=tuple(PullRequestState))
+            creation_base = item.base_branch
+            exact = tuple(pr for pr in matches if pr.head_repository == plan.goal.repository
+                and pr.head_oid == item.commit_id and pr.base_branch == creation_base
+                and pr.title == item.title and pr.body == item.body and not pr.draft)
+            owned = tuple(entry for entry in facts if isinstance(entry.attempt, PullRequestCreationAttempt)
+                and entry.attempt.goal == item and entry.attempt.pull_request is not None)
+            if len(matches) == len(exact) == 1 and owned and owned[0].attempt.pull_request == exact[0].identity:
+                identity = exact[0].identity
+            elif matches:
+                return Stopped("pull-request", f"branch {item.branch_name} has a foreign PR")
+            else:
+                attempt = PullRequestCreationAttempt(plan.goal.repository, item)
+                oid, entry = _append_recovery(workspace, attempt)
+                live = replace(entry, possibly_live=True)
+                oid = _replace_recovery_entry(workspace, oid, live)
+                try:
+                    github.create_pull_request(repository, head_branch=item.branch_name,
+                        base_branch=creation_base, title=item.title, body=item.body, draft=False)
+                except GitHubTransportError:
+                    pass
+                except GitHubHttpError:
+                    _remove_recovery_entry(workspace, oid, entry.identity)
+                    return Stopped("pull-request", "pull request creation was rejected")
+                if _classify_attempt(
+                    workspace, github, live.attempt, git
+                ) != "applied":
+                    return Stopped("pull-request", "pull request creation is unresolved")
+                exact = github.find_pull_requests(plan.goal.repository,
+                    head_branches=(item.branch_name,), states=tuple(PullRequestState))
+                identity = exact[0].identity
+                live = replace(live, attempt=replace(attempt, pull_request=identity))
+                _replace_recovery_entry(workspace, oid, live)
+                facts += (live,)
+            identities.append(identity)
+            goal_by_identity[identity] = item
+
+        # Publish changed existing heads with exact leases.
+        updates: list[PlannedHeadUpdate] = []
+        publications: list[LastPublishedHead] = []
+        desired_existing = {
+            item.pr_identity: item.commit_id
+            for item in plan.assignments
+            if isinstance(item, (ExistingPRAssignment,))
+        }
+        for identity in identities:
+            if identity not in source:
+                continue
+            old = source[identity]
+            wanted = desired_existing.get(identity, old.head_oid)
+            assert wanted is not None and old.head_oid is not None
+            if wanted != old.head_oid:
+                ref = RemoteBranchRef(plan.goal.repository, f"refs/heads/{old.head_branch}")
+                updates.append(PlannedHeadUpdate(
+                    ref,
+                    old.head_oid,
+                    wanted,
+                    FastForward(),
+                ))
+                publications.append(LastPublishedHead(identity, ref, wanted))
+        if updates:
+            # Head readback hands off only head ownership. Logical membership
+            # remains the source membership until the mixed core transaction
+            # commits its final state below.
+            tracking = TrackedStack(
+                plan.goal.repository,
+                plan.goal.base_branch,
+                tuple(pr.identity for pr in plan.source_pull_requests),
+            )
+            attempt = HeadMutationAttempt(plan.goal.repository, push_url, tuple(updates), tracking,
+                tuple(publications))
+            oid, entry = _append_recovery(workspace, attempt)
+            live = replace(entry, possibly_live=True)
+            oid = _replace_recovery_entry(workspace, oid, live)
+            try:
+                git.push_exact_head_updates(push_url, tuple(updates))
+            except GitPushError:
+                pass
+            if _classify_attempt(workspace, github, attempt, git) != "applied":
+                return Stopped("heads", "existing head publication is unresolved")
+            head_published = True
+
+        current_prs = {pr.identity: pr for pr in github.pull_requests(tuple(identities))}
+        for identity, pr in current_prs.items():
+            matching_goal = next((goal for goal in goals if goal.branch_name == pr.head_branch), None)
+            if matching_goal is not None:
+                goal_by_identity[identity] = matching_goal
+        previous = plan.goal.base_branch
+        metadata_updated = False
+        for index, identity in enumerate(identities):
+            pr = current_prs[identity]
+            title, body = plan.metadata[index]
+            wanted = (previous, title, body)
+            if (pr.base_branch, pr.title, pr.body) != wanted:
+                attempt = ExactPullRequestMutationAttempt(plan.goal.repository, identity,
+                    pr.base_branch, pr.title, pr.body, *wanted)
+                oid, entry = _append_recovery(workspace, attempt)
+                live = replace(entry, possibly_live=True)
+                oid = _replace_recovery_entry(workspace, oid, live)
+                try:
+                    github.update_pull_request(repository, identity, base_branch=previous,
+                        title=title, body=body)
+                except GitHubTransportError:
+                    pass
+                except GitHubHttpError:
+                    _remove_recovery_entry(workspace, oid, entry.identity)
+                    return Stopped("pull-request", "exact PR repair was rejected")
+                if _classify_attempt(workspace, github, attempt, git) != "applied":
+                    return Stopped("pull-request", "exact PR repair is unresolved")
+                metadata_updated = True
+            previous = pr.head_branch
+
+        # State is the core receipt and is written before temporary facts are retired.
+        state_oid, state = read_state(workspace)
+        removed = set(plan.goal.removed)
+        authority = state.last_published_heads + state.last_adopted_heads
+        detached = {item.pr: item for item in state.detached_associations}
+        for item in authority:
+            if item.pr in removed:
+                detached[item.pr] = DetachedAssociation(item.pr, item.ref, item.verified_commit_id)
+        for identity, goal in plan.abandoned_publications:
+            detached[identity] = DetachedAssociation(
+                identity,
+                RemoteBranchRef(
+                    plan.goal.repository, f"refs/heads/{goal.branch_name}"
+                ),
+                goal.commit_id,
+            )
+        if set(detached).intersection(identities):
+            for identity in identities:
+                detached.pop(identity, None)
+        source_tracking = TrackedStack(plan.goal.repository, plan.goal.base_branch,
+            tuple(pr.identity for pr in plan.source_pull_requests))
+        tracking = TrackedStack(plan.goal.repository, plan.goal.base_branch, tuple(identities))
+        pubs = tuple(item for item in state.last_published_heads if item.pr not in removed)
+        pubs_by_pr = {item.pr: item for item in pubs}
+        written_existing = {item.pr for item in publications}
+        for identity in identities:
+            pr = current_prs[identity]
+            # Equality is not ownership. Preserve an existing receipt for an
+            # unchanged retained identity; mint only after this invocation's
+            # verified branch creation or exact head write.
+            if identity not in goal_by_identity and identity not in written_existing:
+                continue
+            oid_value = (
+                goal_by_identity[identity].commit_id
+                if identity in goal_by_identity
+                else desired_existing.get(identity, pr.head_oid)
+            )
+            assert oid_value is not None
+            pubs_by_pr[identity] = LastPublishedHead(identity,
+                RemoteBranchRef(plan.goal.repository, f"refs/heads/{pr.head_branch}"), oid_value)
+        superseded_adoptions = written_existing | set(goal_by_identity)
+        new_state = TrackedState(tuple(item for item in state.stacks
+            if item not in (source_tracking, tracking)) + (tracking,), tuple(pubs_by_pr.values()),
+            tuple(item for item in state.last_adopted_heads if item.pr not in removed
+                and item.pr not in superseded_adoptions), tuple(detached.values()),
+            state.last_published_boundaries)
+        try:
+            cas_write_state(workspace, state_oid, new_state)
+        except Error as exc:
+            return Stopped("receipt", str(exc))
+
+        # CAS handoff: only now retire exact temporary ownership/provenance.
+        journal_oid, journal = read_recovery(workspace)
+        if journal_oid is not None and journal is not None:
+            abandoned_identities = {
+                identity for identity, _goal in plan.abandoned_publications
+            }
+            member_set = set(identities) | removed | abandoned_identities
+            goal_set = set(goals) | {
+                goal for _identity, goal in plan.abandoned_publications
+            }
+            absorbed_goals = plan.new_goals + tuple(
+                goal for _identity, goal in plan.abandoned_publications
+                if goal not in plan.new_goals
+            )
+            exact_head_publications = set(publications)
+            retained = tuple(entry for entry in journal.entries if not (
+                isinstance(entry.attempt, ExactPullRequestMutationAttempt)
+                and entry.attempt.repository == plan.goal.repository
+                and entry.attempt.pull_request in member_set
+                or isinstance(entry.attempt, BranchCreationAttempt)
+                and entry.attempt.repository == plan.goal.repository
+                and entry.attempt.goals == absorbed_goals
+                or isinstance(entry.attempt, PullRequestCreationAttempt)
+                and entry.attempt.repository == plan.goal.repository
+                and entry.attempt.goal in goal_set
+                and entry.attempt.pull_request in member_set
+                or isinstance(entry.attempt, StackDissolutionAttempt)
+                and entry.attempt.repository == plan.goal.repository
+                and set(entry.attempt.members).intersection(member_set)
+                or isinstance(entry.attempt, HeadMutationAttempt)
+                and entry.attempt.repository == plan.goal.repository
+                and bool(entry.attempt.publications)
+                and set(entry.attempt.publications) == exact_head_publications
+                and _classify_attempt(workspace, github, entry.attempt, git)
+                == "applied"
+            ))
+            if retained != journal.entries:
+                cas_write_recovery(workspace, journal_oid,
+                    RecoveryJournal(retained)
+                    if retained else None)
+
+        # Group only after core completion. Its request remains independently recoverable.
+        if len(identities) > 1 and {pr.stack for pr in current_prs.values()} == {None}:
+            _best_effort_group(
+                workspace, github, repository, plan.goal.base_branch,
+                tuple(identities), git,
+            )
+        return Verified(head_published, metadata_updated, True)
+
+
+def execute_mixed_membership(
+    workspace: str | Path, github: GitHubClient, push_url: str,
+    recompute: Callable[[tuple[RecoveryEntry, ...]], MixedMembershipPlan | Blocked], *,
+    confirm: Callable[[MixedMembershipPlan], bool] | None = None,
+    dry_run: bool = False,
+    git_transport: GitTransport | None = None,
+) -> tuple[MixedMembershipPlan | Blocked | None, ApplyResult]:
+    """Settle, recompute current intent, confirm it, then apply mixed membership."""
+    try:
+        with repository_lock(workspace):
+            facts = settle_recovery(
+                workspace,
+                github,
+                dry_run=dry_run,
+                git_transport=git_transport,
+            )
+    except Error as exc:
+        return None, Stopped("recovery", str(exc))
+    try:
+        plan = recompute(facts)
+    except Error as exc:
+        return None, Stopped("observe", str(exc))
+    if isinstance(plan, Blocked):
+        return plan, Stopped("plan", "a blocked mixed-membership plan cannot be applied")
+    if confirm is not None and not confirm(plan):
+        return plan, Stopped("confirmation", "mixed membership was not confirmed")
+    return plan, apply_mixed_membership(
         plan,
         workspace,
         github,
