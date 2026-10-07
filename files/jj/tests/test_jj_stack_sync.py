@@ -3234,5 +3234,477 @@ def test_first_publication_blocks_bad_evidence(change: str, code: str) -> None:
     assert blocked.reasons[0].code == code
 
 
+def test_first_publication_executes_multi_pr_goal_and_records_receipts(
+    jj_repo: Path,
+) -> None:
+    repository_id = sync.GitHubRepositoryId("github.com", "R_repo")
+    repository = sync.GitHubRepository(
+        repository_id, "owner/repo", "https://github.com/owner/repo", "main"
+    )
+    base, first, second = (value * 40 for value in "012")
+    goals = (
+        sync.NewPullRequestGoal(first, "one", "main", "One", "body one"),
+        sync.NewPullRequestGoal(second, "two", "one", "Two", "body two"),
+    )
+    local = sync.LocalObservation(
+        str(jj_repo), "op", (), (), (), (), (), (), str(jj_repo / ".git")
+    )
+    plan = sync.FirstPublicationPlan(
+        sync.FirstPublicationGoal(repository_id, "main", base, goals), local, (), ()
+    )
+    push_url = "ssh://github.com/owner/repo.git"
+    server = FakeGitHubServer()
+    server.seed_repository(repository, aliases=(push_url,))
+    server.seed_branch(repository_id, "main", base)
+    github = FakeGitHubClient(server)
+    git = FakeGitTransport(server)
+
+    result = sync.apply_first_publication(
+        plan, jj_repo, github, push_url, git_transport=git
+    )
+
+    assert result == sync.Verified(head_published=True, state_recorded=True)
+    assert tuple(
+        item.commit_id
+        for item in git.observe_live_refs(
+            push_url,
+            repository_id,
+            tuple(f"refs/heads/{goal.branch_name}" for goal in goals),
+        )
+    ) == (first, second)
+    pull_requests = github.find_pull_requests(
+        repository_id, head_branches=("one", "two")
+    )
+    assert tuple((pr.head_branch, pr.base_branch) for pr in pull_requests) == (
+        ("one", "main"),
+        ("two", "one"),
+    )
+    state = sync.read_state(jj_repo)[1]
+    assert state.stacks[0].ordered_prs == tuple(pr.identity for pr in pull_requests)
+    assert tuple(item.verified_commit_id for item in state.last_published_heads) == (
+        first,
+        second,
+    )
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_atomic_first_publication_push_leases_every_destination_absence(
+    monkeypatch,
+) -> None:
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    goals = (
+        sync.NewPullRequestGoal("1" * 40, "one", "main", "One", ""),
+        sync.NewPullRequestGoal("2" * 40, "two", "one", "Two", ""),
+    )
+    commands: list[list[str]] = []
+    monkeypatch.setattr(sync, "git_common_dir", lambda _workspace: Path("/git"))
+    monkeypatch.setattr(
+        sync.subprocess,
+        "run",
+        lambda command, **_kwargs: (
+            commands.append(command) or subprocess.CompletedProcess(command, 0, "", "")
+        ),
+    )
+
+    sync.push_absent_heads("/workspace", goals, "ssh://example/repo")
+
+    command = commands[0]
+    assert "--atomic" in command
+    assert "--force-with-lease=refs/heads/one:" in command
+    assert "--force-with-lease=refs/heads/two:" in command
+    assert f"{'1' * 40}:refs/heads/one" in command
+    assert f"{'2' * 40}:refs/heads/two" in command
+
+
+def first_publication_recovery_case(
+    jj_repo: Path, monkeypatch, *, goal_count: int = 1
+):
+    repository_id = sync.GitHubRepositoryId("github.com", "R_repo")
+    repository = sync.GitHubRepository(
+        repository_id, "owner/repo", "https://github.com/owner/repo", "main"
+    )
+    base, first, second = (value * 40 for value in "012")
+    goals = (
+        sync.NewPullRequestGoal(first, "topic", "main", "Title", "Body"),
+        sync.NewPullRequestGoal(second, "second", "topic", "Second", "Body 2"),
+    )[:goal_count]
+    commits = (
+        sync.ObservedCommit(first, (base,), "c1", "Title\n\nBody", False, False),
+        sync.ObservedCommit(
+            second, (first,), "c2", "Second\n\nBody 2", False, False
+        ),
+    )[:goal_count]
+    local = sync.LocalObservation(
+        str(jj_repo),
+        "op",
+        (),
+        (),
+        (),
+        (),
+        (),
+        commits,
+        str(jj_repo / ".git"),
+    )
+    destinations = (
+        sync.LiveRemoteRef(
+            sync.RemoteBranchRef(repository_id, "refs/heads/main"), base
+        ),
+        *(
+            sync.LiveRemoteRef(
+                sync.RemoteBranchRef(
+                    repository_id, f"refs/heads/{goal.branch_name}"
+                ),
+                goal.commit_id,
+            )
+            for goal in goals
+        ),
+    )
+    plan = sync.FirstPublicationPlan(
+        sync.FirstPublicationGoal(repository_id, "main", base, goals),
+        local,
+        destinations,
+        (),
+    )
+    server = FakeGitHubServer()
+    server.seed_repository(repository)
+    server.seed_branch(repository_id, "main", base)
+    for goal in goals:
+        server.seed_branch(repository_id, goal.branch_name, goal.commit_id)
+    github = FakeGitHubClient(server)
+    monkeypatch.setattr(
+        sync.SubprocessGitTransport,
+        "observe_live_refs",
+        lambda *_args, **_kwargs: destinations[1:],
+    )
+    branch_entry = sync.RecoveryEntry(
+        "branches",
+        sync.BranchCreationAttempt(
+            repository_id, "ssh://github.com/owner/repo.git", goals
+        ),
+        possibly_live=True,
+    )
+    sync.cas_write_recovery(jj_repo, None, sync.RecoveryJournal((branch_entry,)))
+    return repository_id, goals, plan, server, github
+
+
+def test_first_publication_lost_pr_response_binds_once_and_completes(
+    jj_repo: Path, monkeypatch
+) -> None:
+    repository, _goals, plan, server, github = first_publication_recovery_case(
+        jj_repo, monkeypatch
+    )
+
+    with github.lose_response(sync.GitHubClient.create_pull_request):
+        result = sync.apply_first_publication(plan, jj_repo, github, "push")
+
+    assert isinstance(result, sync.Verified)
+    pull_requests = server.read_find_pull_requests(
+        repository, head_branches=("topic",)
+    )
+    assert len(pull_requests) == 1
+    assert pull_requests[0].stack is None
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_first_publication_held_pr_waits_for_explicit_release(
+    jj_repo: Path, monkeypatch
+) -> None:
+    repository, _goals, plan, server, github = first_publication_recovery_case(
+        jj_repo, monkeypatch
+    )
+
+    with github.hold_next(sync.GitHubClient.create_pull_request) as pending:
+        stopped = sync.apply_first_publication(plan, jj_repo, github, "push")
+
+    assert isinstance(stopped, sync.Stopped)
+    assert stopped.stage == "pull-request"
+    assert server.read_find_pull_requests(repository, head_branches=("topic",)) == ()
+    assert any(
+        isinstance(entry.attempt, sync.PullRequestCreationAttempt)
+        and entry.attempt.pull_request is None
+        for entry in sync.settle_recovery(jj_repo, github)
+    )
+
+    pending.release()
+    resumed = sync.apply_first_publication(plan, jj_repo, github, "push")
+    assert isinstance(resumed, sync.Verified)
+    assert len(server.read_find_pull_requests(repository, head_branches=("topic",))) == 1
+
+
+def test_first_publication_fail_before_pr_remains_unresolved(
+    jj_repo: Path, monkeypatch
+) -> None:
+    repository, _goals, plan, server, github = first_publication_recovery_case(
+        jj_repo, monkeypatch
+    )
+
+    with github.fail_before(sync.GitHubClient.create_pull_request):
+        stopped = sync.apply_first_publication(plan, jj_repo, github, "push")
+
+    assert isinstance(stopped, sync.Stopped)
+    assert stopped.stage == "pull-request"
+    retry = sync.apply_first_publication(plan, jj_repo, github, "push")
+    assert isinstance(retry, sync.Stopped)
+    assert retry.stage == "recovery"
+    assert server.read_find_pull_requests(repository, head_branches=("topic",)) == ()
+
+
+@pytest.mark.parametrize("fault", ("lose_response", "fail_before"))
+def test_first_publication_stack_creation_faults_are_recovered_or_preserved(
+    jj_repo: Path, monkeypatch, fault: str
+) -> None:
+    repository, _goals, plan, server, github = first_publication_recovery_case(
+        jj_repo, monkeypatch, goal_count=2
+    )
+
+    with getattr(github, fault)(sync.GitHubClient.create_stack):
+        result = sync.apply_first_publication(plan, jj_repo, github, "push")
+
+    pull_requests = server.read_find_pull_requests(
+        repository, head_branches=("topic", "second")
+    )
+    if fault == "lose_response":
+        assert isinstance(result, sync.Verified)
+        assert all(pull_request.stack is not None for pull_request in pull_requests)
+        assert sync.read_recovery(jj_repo) == (None, None)
+    else:
+        assert isinstance(result, sync.Stopped)
+        assert result.stage == "stack"
+        assert all(pull_request.stack is None for pull_request in pull_requests)
+        retry = sync.apply_first_publication(plan, jj_repo, github, "push")
+        assert isinstance(retry, sync.Stopped)
+        assert retry.stage == "recovery"
+
+
+def test_first_publication_held_stack_hands_off_receipts_after_release(
+    jj_repo: Path, monkeypatch
+) -> None:
+    _repository, _goals, plan, _server, github = first_publication_recovery_case(
+        jj_repo, monkeypatch, goal_count=2
+    )
+
+    with github.hold_next(sync.GitHubClient.create_stack) as pending:
+        stopped = sync.apply_first_publication(plan, jj_repo, github, "push")
+
+    assert isinstance(stopped, sync.Stopped)
+    assert stopped.stage == "stack"
+    assert sync.read_state(jj_repo)[1] == sync.EMPTY_STATE
+    pending.release()
+    resumed = sync.apply_first_publication(plan, jj_repo, github, "push")
+    assert isinstance(resumed, sync.Verified)
+    assert len(sync.read_state(jj_repo)[1].stacks) == 1
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_first_publication_state_receipt_precedes_recovery_retirement(
+    jj_repo: Path, monkeypatch
+) -> None:
+    _repository, _goals, plan, _server, github = first_publication_recovery_case(
+        jj_repo, monkeypatch, goal_count=2
+    )
+    record = sync._record_verified_state
+    monkeypatch.setattr(
+        sync,
+        "_record_verified_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(sync.ConcurrentUpdate("stale")),
+    )
+
+    stopped = sync.apply_first_publication(plan, jj_repo, github, "push")
+
+    assert isinstance(stopped, sync.Stopped)
+    assert stopped.stage == "receipt"
+    assert any(
+        isinstance(entry.attempt, sync.StackCreationAttempt)
+        for entry in sync.read_recovery(jj_repo)[1].entries
+    )
+    monkeypatch.setattr(sync, "_record_verified_state", record)
+    assert sync.settle_recovery(jj_repo, github) == ()
+    assert len(sync.read_state(jj_repo)[1].stacks) == 1
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_first_publication_planner_uses_exact_recovery_ownership() -> None:
+    repository = sync.GitHubRepositoryId("github.com", "repo")
+    base, old, new = (value * 40 for value in "012")
+    old_goal = sync.NewPullRequestGoal(old, "topic", "main", "Old", "")
+    branch_recovery = sync.RecoveryEntry(
+        "old",
+        sync.BranchCreationAttempt(repository, "push", (old_goal,)),
+        possibly_live=True,
+    )
+    owned_observed = sync.FirstPublicationInput(
+        repository,
+        "main",
+        (old,),
+        sync.LocalObservation(
+            "/repo",
+            "op",
+            (),
+            (),
+            (),
+            (),
+            (),
+            (sync.ObservedCommit(old, (base,), "c1", "Old", False, False),),
+            "/git",
+        ),
+        (sync.PublicationAssignment(old, "topic"),),
+        (),
+        (),
+        (
+            sync.LiveRemoteRef(
+                sync.RemoteBranchRef(repository, "refs/heads/main"), base
+            ),
+            sync.LiveRemoteRef(
+                sync.RemoteBranchRef(repository, "refs/heads/topic"), old
+            ),
+        ),
+        (),
+        (branch_recovery,),
+    )
+    assert isinstance(
+        sync.plan_first_publication(owned_observed), sync.FirstPublicationPlan
+    )
+
+    pr = sync.GitHubPullRequest(
+        sync.PullRequestId(repository, 1),
+        "PR_node",
+        sync.PullRequestState.OPEN,
+        False,
+        repository,
+        "topic",
+        old,
+        "main",
+        base,
+        False,
+        False,
+        "Old",
+        "",
+        None,
+    )
+    pr_recovery = sync.RecoveryEntry(
+        "pr",
+        sync.PullRequestCreationAttempt(repository, old_goal, pr.identity),
+        possibly_live=True,
+    )
+    assert isinstance(
+        sync.plan_first_publication(
+            dataclasses.replace(
+                owned_observed,
+                historical_pull_requests=(pr,),
+                recovery_facts=(branch_recovery, pr_recovery),
+            )
+        ),
+        sync.FirstPublicationPlan,
+    )
+
+    local = sync.LocalObservation(
+        "/repo",
+        "op",
+        (),
+        (),
+        (),
+        (),
+        (),
+        (sync.ObservedCommit(new, (base,), "c2", "New", False, False),),
+        "/git",
+    )
+    observed = sync.FirstPublicationInput(
+        repository,
+        "main",
+        (new,),
+        local,
+        (sync.PublicationAssignment(new, "topic"),),
+        (),
+        (),
+        (
+            sync.LiveRemoteRef(
+                sync.RemoteBranchRef(repository, "refs/heads/main"), base
+            ),
+            sync.LiveRemoteRef(
+                sync.RemoteBranchRef(repository, "refs/heads/topic"), None
+            ),
+        ),
+        (),
+        (branch_recovery,),
+    )
+
+    blocked = sync.plan_first_publication(observed)
+
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "publication-attempt-unresolved"
+
+
+def test_first_publication_dry_run_and_unrelated_recovery_do_not_write(
+    jj_repo: Path, monkeypatch
+) -> None:
+    repository, goals, plan, server, github = first_publication_recovery_case(
+        jj_repo, monkeypatch
+    )
+    unrelated = sync.RecoveryEntry(
+        "unrelated",
+        sync.PullRequestCreationAttempt(
+            repository,
+            sync.NewPullRequestGoal("9" * 40, "other", "main", "Other", ""),
+        ),
+        possibly_live=True,
+    )
+    oid, journal = sync.read_recovery(jj_repo)
+    assert oid is not None and journal is not None
+    sync.cas_write_recovery(
+        jj_repo, oid, sync.RecoveryJournal(journal.entries + (unrelated,))
+    )
+    before_recovery = sync.read_recovery(jj_repo)
+
+    assert sync.apply_first_publication(
+        plan, jj_repo, github, "push", dry_run=True
+    ) == sync.Verified()
+
+    assert server.read_find_pull_requests(
+        repository, head_branches=(goals[0].branch_name,)
+    ) == ()
+    assert sync.read_state(jj_repo) == (None, sync.EMPTY_STATE)
+    assert sync.read_recovery(jj_repo) == before_recovery
+
+
+def test_first_publication_receipt_handoff_rejects_stale_journal_generation(
+    jj_repo: Path,
+) -> None:
+    repository = sync.GitHubRepositoryId("github.com", "repo")
+    goal = sync.NewPullRequestGoal("1" * 40, "topic", "main", "Title", "")
+    pr = sync.PullRequestId(repository, 1)
+    stack = sync.StackCreationAttempt(repository, "main", (pr,), (goal,))
+    entries = (
+        sync.RecoveryEntry(
+            "branches",
+            sync.BranchCreationAttempt(repository, "push", (goal,)),
+            True,
+        ),
+        sync.RecoveryEntry(
+            "pr", sync.PullRequestCreationAttempt(repository, goal, pr), True
+        ),
+        sync.RecoveryEntry("stack", stack, True),
+    )
+    old_oid = sync.cas_write_recovery(
+        jj_repo, None, sync.RecoveryJournal(entries)
+    )
+    assert old_oid is not None
+    newer = sync.RecoveryEntry(
+        "newer",
+        sync.PullRequestCreationAttempt(
+            repository,
+            sync.NewPullRequestGoal("2" * 40, "other", "main", "Other", ""),
+        ),
+        True,
+    )
+    sync.cas_write_recovery(
+        jj_repo, old_oid, sync.RecoveryJournal(entries + (newer,))
+    )
+
+    with pytest.raises(sync.ConcurrentUpdate):
+        sync._retire_first_publication_facts(jj_repo, old_oid, stack)
+
+    assert sync.read_recovery(jj_repo)[1].entries == entries + (newer,)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

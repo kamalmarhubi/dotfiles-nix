@@ -820,6 +820,56 @@ class MetadataMutationAttempt:
 
 
 @dataclass(frozen=True)
+class BranchCreationAttempt:
+    """One atomic absent-to-OID publication, before PR identities exist."""
+
+    repository: GitHubRepositoryId
+    push_url: str
+    goals: tuple[NewPullRequestGoal, ...]
+
+    def __post_init__(self) -> None:
+        names = tuple(goal.branch_name for goal in self.goals)
+        if (
+            not isinstance(self.push_url, str)
+            or not self.push_url
+            or not self.goals
+            or len(set(names)) != len(names)
+        ):
+            raise ValueError("branch creation requires a push URL and goals")
+
+
+@dataclass(frozen=True)
+class PullRequestCreationAttempt:
+    repository: GitHubRepositoryId
+    goal: NewPullRequestGoal
+    pull_request: PullRequestId | None = None
+
+    def __post_init__(self) -> None:
+        if self.pull_request is not None and self.pull_request.repository != self.repository:
+            raise ValueError("created pull request belongs to another repository")
+
+
+@dataclass(frozen=True)
+class StackCreationAttempt:
+    repository: GitHubRepositoryId
+    base_branch: str
+    pull_requests: tuple[PullRequestId, ...]
+    goals: tuple[NewPullRequestGoal, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not self.pull_requests
+            or len(set(self.pull_requests)) != len(self.pull_requests)
+            or len(self.pull_requests) != len(self.goals)
+            or len({goal.branch_name for goal in self.goals}) != len(self.goals)
+            or any(
+                pr.repository != self.repository for pr in self.pull_requests
+            )
+        ):
+            raise ValueError("stack creation members must belong to its repository")
+
+
+@dataclass(frozen=True)
 class AdoptionAttempt:
     repository: GitHubRepositoryId
     remote: str
@@ -835,6 +885,9 @@ MutationAttempt = (
     HeadMutationAttempt
     | MetadataMutationAttempt
     | AdoptionAttempt
+    | BranchCreationAttempt
+    | PullRequestCreationAttempt
+    | StackCreationAttempt
 )
 
 
@@ -2647,6 +2700,31 @@ def _recovery_entry_to_dict(entry: RecoveryEntry) -> dict[str, object]:
             "boundaries": [{"pr": x.pr_identity.number, "branch": x.branch,
                 "old_seam": x.old_seam_commit_id, "new_seam": x.new_seam_commit_id,
                 "old": x.old_commit_id, "new": x.remote_commit_id} for x in attempt.boundaries]}
+    elif isinstance(attempt, BranchCreationAttempt):
+        payload = {
+            "kind": "create-branches", "identity": entry.identity,
+            "possibly_live": entry.possibly_live,
+            "repository": asdict(attempt.repository), "push_url": attempt.push_url,
+            "goals": [asdict(goal) for goal in attempt.goals],
+        }
+    elif isinstance(attempt, PullRequestCreationAttempt):
+        payload = {
+            "kind": "create-pr", "identity": entry.identity,
+            "possibly_live": entry.possibly_live,
+            "repository": asdict(attempt.repository), "goal": asdict(attempt.goal),
+            "pull_request": (
+                None if attempt.pull_request is None else attempt.pull_request.number
+            ),
+        }
+    elif isinstance(attempt, StackCreationAttempt):
+        payload = {
+            "kind": "create-stack", "identity": entry.identity,
+            "possibly_live": entry.possibly_live,
+            "repository": asdict(attempt.repository),
+            "base_branch": attempt.base_branch,
+            "pull_requests": [pr.number for pr in attempt.pull_requests],
+            "goals": [asdict(goal) for goal in attempt.goals],
+        }
     else:
         raise ValueError("unknown recovery attempt")
     return payload
@@ -2677,6 +2755,12 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
         if kind == "metadata"
         else common_fields | {"remote", "state_blob_oid", "boundaries"}
         if kind == "adoption"
+        else common_fields | {'push_url', 'goals'}
+        if kind == 'create-branches'
+        else common_fields | {'goal', 'pull_request'}
+        if kind == 'create-pr'
+        else common_fields | {'base_branch', 'pull_requests', 'goals'}
+        if kind == 'create-stack'
         else None
     )
     if expected_fields is None or set(raw) != expected_fields:
@@ -2788,6 +2872,37 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
             ),
             raw["expected_title"],
             raw["expected_body"],
+        )
+    elif kind == "create-branches":
+        goals = raw["goals"]
+        if not isinstance(goals, list):
+            raise ValueError("branch creation goals must be an array")
+        parsed_goals = tuple(NewPullRequestGoal(**goal) for goal in goals)
+        attempt = BranchCreationAttempt(
+            repository, raw["push_url"], parsed_goals
+        )
+    elif kind == "create-pr":
+        goal = raw["goal"]
+        if not isinstance(goal, dict) or set(goal) != {
+            "commit_id", "branch_name", "base_branch", "title", "body"
+        }:
+            raise ValueError("pull request creation goal is malformed")
+        number = raw["pull_request"]
+        if number is not None and not isinstance(number, int):
+            raise ValueError("created pull request identity is malformed")
+        attempt = PullRequestCreationAttempt(
+            repository, NewPullRequestGoal(**goal),
+            None if number is None else PullRequestId(repository, number),
+        )
+    elif kind == "create-stack":
+        numbers = raw["pull_requests"]
+        goals = raw["goals"]
+        if not isinstance(numbers, list) or not isinstance(goals, list):
+            raise ValueError("stack creation members must be an array")
+        attempt = StackCreationAttempt(
+            repository, raw["base_branch"],
+            tuple(PullRequestId(repository, number) for number in numbers),
+            tuple(NewPullRequestGoal(**goal) for goal in goals),
         )
     else:
         raise ValueError("unknown recovery attempt")
@@ -3070,8 +3185,22 @@ def resolve_publication_assignments(
                 "ambiguous-destination", name, "destination was observed twice"
             )
         destinations[name] = destination
-    owned_branches = {}
-    owned_prs = {}
+    owned_branches = {
+        goal.branch_name: goal.commit_id
+        for entry in observed.recovery_facts
+        if entry.possibly_live
+        and isinstance(entry.attempt, BranchCreationAttempt)
+        and entry.attempt.repository == observed.repository
+        for goal in entry.attempt.goals
+    }
+    owned_prs = {
+        entry.attempt.pull_request: entry.attempt.goal
+        for entry in observed.recovery_facts
+        if entry.possibly_live
+        and isinstance(entry.attempt, PullRequestCreationAttempt)
+        and entry.attempt.repository == observed.repository
+        and entry.attempt.pull_request is not None
+    }
     for assignment in assignments:
         name = assignment.branch_name
         destination = destinations.get(name)
@@ -3858,6 +3987,57 @@ def _classify_attempt(
         if actual == old:
             return "not-applied"
         return "foreign"
+    if isinstance(attempt, BranchCreationAttempt):
+        observed = git.observe_live_refs(
+            attempt.push_url, attempt.repository,
+            tuple(f"refs/heads/{goal.branch_name}" for goal in attempt.goals),
+        )
+        actual = tuple(item.commit_id for item in observed)
+        wanted = tuple(goal.commit_id for goal in attempt.goals)
+        if actual == wanted:
+            return "applied"
+        if actual == (None,) * len(wanted):
+            return "not-applied"
+        return "foreign"
+    if isinstance(attempt, PullRequestCreationAttempt):
+        goal = attempt.goal
+        matches = github.find_pull_requests(
+            attempt.repository,
+            head_branches=(goal.branch_name,),
+            states=tuple(PullRequestState),
+        )
+        exact = tuple(
+            pr for pr in matches
+            if pr.head_repository == attempt.repository
+            and pr.head_branch == goal.branch_name
+            and pr.head_oid == goal.commit_id
+            and pr.base_branch == goal.base_branch
+            and pr.title == goal.title and pr.body == goal.body and not pr.draft
+        )
+        if (
+            len(exact) == 1 and len(matches) == 1
+            and (attempt.pull_request is None or exact[0].identity == attempt.pull_request)
+        ):
+            return "applied"
+        return "not-applied" if not matches else "foreign"
+    if isinstance(attempt, StackCreationAttempt):
+        prs = github.pull_requests(attempt.pull_requests)
+        summaries = {pr.stack for pr in prs}
+        if summaries == {None}:
+            return "not-applied"
+        if len(summaries) != 1 or None in summaries:
+            return "foreign"
+        summary = next(iter(summaries))
+        assert summary is not None
+        repository = github.resolve_repository(attempt.repository)
+        stack = github.stack(repository, summary.identity)
+        return (
+            "applied"
+            if stack is not None
+            and stack.base_branch == attempt.base_branch
+            and stack.pull_requests == attempt.pull_requests
+            else "foreign"
+        )
     assert isinstance(attempt, MetadataMutationAttempt)
     prs = github.pull_requests((attempt.update.pr_identity,))
     if len(prs) != 1:
@@ -3883,6 +4063,7 @@ def settle_recovery(
         return ()
     remaining: list[RecoveryEntry] = []
     applied_heads: list[HeadMutationAttempt] = []
+    applied_stacks: list[StackCreationAttempt] = []
     for entry in journal.entries:
         # Obligation effects are durable facts until the core receipt handoff.
         # The generic driver, not legacy settlement, reconciles or retires them.
@@ -3945,6 +4126,21 @@ def settle_recovery(
             continue
         if isinstance(entry.attempt, HeadMutationAttempt):
             applied_heads.append(entry.attempt)
+        elif isinstance(entry.attempt, StackCreationAttempt):
+            applied_stacks.append(entry.attempt)
+        elif isinstance(entry.attempt, PullRequestCreationAttempt):
+            goal = entry.attempt.goal
+            matches = github.find_pull_requests(
+                entry.attempt.repository, head_branches=(goal.branch_name,),
+                states=tuple(PullRequestState),
+            )
+            # Classification established that this is the sole exact match.
+            remaining.append(replace(
+                entry,
+                attempt=replace(entry.attempt, pull_request=matches[0].identity),
+            ))
+        elif isinstance(entry.attempt, BranchCreationAttempt):
+            remaining.append(entry)
     if not dry_run:
         for attempt in applied_heads:
             _state_oid, current = read_state(workspace)
@@ -3963,6 +4159,32 @@ def settle_recovery(
                 attempt.publications,
                 attempt.boundaries,
             )
+        for attempt in applied_stacks:
+            _record_verified_state(
+                workspace,
+                TrackedStack(attempt.repository, attempt.base_branch, attempt.pull_requests),
+                tuple(
+                    LastPublishedHead(
+                        pr, RemoteBranchRef(attempt.repository, f"refs/heads/{goal.branch_name}"),
+                        goal.commit_id,
+                    )
+                    for pr, goal in zip(attempt.pull_requests, attempt.goals, strict=True)
+                ),
+            )
+            goals = set(attempt.goals)
+            members = set(attempt.pull_requests)
+            remaining = [
+                entry for entry in remaining
+                if not (
+                    isinstance(entry.attempt, BranchCreationAttempt)
+                    and entry.attempt.repository == attempt.repository
+                    and set(entry.attempt.goals) == goals
+                    or isinstance(entry.attempt, PullRequestCreationAttempt)
+                    and entry.attempt.repository == attempt.repository
+                    and entry.attempt.goal in goals
+                    and entry.attempt.pull_request in members
+                )
+            ]
         updated = tuple(remaining)
         if updated != journal.entries:
             cas_write_recovery(
@@ -3998,7 +4220,24 @@ def _attempt_conflicts_plan(entry: RecoveryEntry, plan: NoOp | Apply) -> bool:
                     or active_refs.intersection(adoption_refs))
     if isinstance(attempt, HeadMutationAttempt):
         return bool(active_refs.intersection(update.ref for update in attempt.updates))
-    raise AssertionError(f"unhandled recovery attempt: {type(attempt).__name__}")
+    if isinstance(attempt, BranchCreationAttempt):
+        refs = {
+            RemoteBranchRef(
+                attempt.repository, f"refs/heads/{goal.branch_name}"
+            )
+            for goal in attempt.goals
+        }
+        return bool(active_refs.intersection(refs))
+    if isinstance(attempt, PullRequestCreationAttempt):
+        ref = RemoteBranchRef(
+            attempt.repository, f"refs/heads/{attempt.goal.branch_name}"
+        )
+        return ref in active_refs or attempt.pull_request in active_prs
+    if isinstance(attempt, StackCreationAttempt):
+        members = attempt.pull_requests
+    else:
+        raise AssertionError(f"unhandled recovery attempt: {type(attempt).__name__}")
+    return bool(active_prs.intersection(members))
 
 
 def _plan_tracking(plan: NoOp | Apply) -> TrackedStack:
@@ -4337,6 +4576,383 @@ def adopt_remote_restack(
             return AdoptionVerified(receipts)
         except Error as exc:
             return Stopped("adoption", str(exc))
+
+
+def push_absent_heads(
+    workspace: str | Path,
+    goals: Sequence[NewPullRequestGoal],
+    push_url: str,
+) -> None:
+    """Compatibility entry point for direct adapter conformance tests."""
+    repository = GitHubRepositoryId("compatibility.invalid", "compatibility")
+    SubprocessGitTransport(workspace).push_absent_heads(
+        push_url, repository, goals
+    )
+
+
+def _first_publication_conflict(
+    entry: RecoveryEntry, plan: FirstPublicationPlan
+) -> bool:
+    names = {goal.branch_name for goal in plan.goal.pull_requests}
+    attempt = entry.attempt
+    if isinstance(attempt, PullRequestCreationAttempt):
+        return (
+            attempt.repository == plan.goal.repository
+            and attempt.goal.branch_name in names
+            and attempt.pull_request is None
+        )
+    if isinstance(attempt, StackCreationAttempt):
+        return (
+            attempt.repository == plan.goal.repository
+            and any(goal.branch_name in names for goal in attempt.goals)
+        )
+    if isinstance(attempt, HeadMutationAttempt):
+        return attempt.repository == plan.goal.repository and any(
+            update.ref.full_name.removeprefix("refs/heads/") in names
+            for update in attempt.updates
+        )
+    if isinstance(attempt, BranchCreationAttempt):
+        if attempt.repository != plan.goal.repository:
+            return False
+        observed = {item.ref.full_name: item.commit_id for item in plan.destinations}
+        return any(
+            goal.branch_name in names
+            and observed.get(f"refs/heads/{goal.branch_name}") != goal.commit_id
+            for goal in attempt.goals
+        )
+    return False
+
+
+def _finish_creation_attempt(
+    workspace: str | Path,
+    github: GitHubClient,
+    entry: RecoveryEntry,
+) -> str:
+    classification = _classify_attempt(workspace, github, entry.attempt)
+    if classification == "applied":
+        return "applied"
+    # A negative read cannot prove that a request which lost its response will
+    # not arrive later. Only a conclusive HTTP rejection is retired by callers.
+    return classification
+
+
+def _retire_first_publication_facts(
+    workspace: str | Path,
+    expected_oid: str,
+    attempt: StackCreationAttempt,
+) -> None:
+    """Hand exact temporary ownership facts to an already-written state receipt."""
+    oid, journal = read_recovery(workspace)
+    if oid != expected_oid or journal is None:
+        raise ConcurrentUpdate("recovery journal changed during receipt handoff")
+    goals = set(attempt.goals)
+    members = set(attempt.pull_requests)
+    entries = tuple(
+        entry for entry in journal.entries
+        if not (
+            isinstance(entry.attempt, StackCreationAttempt) and entry.attempt == attempt or (isinstance(entry.attempt, BranchCreationAttempt) and entry.attempt.repository == attempt.repository and (set(entry.attempt.goals) == goals)) or (isinstance(entry.attempt, PullRequestCreationAttempt) and entry.attempt.goal in goals and (entry.attempt.pull_request in members))
+        )
+    )
+    cas_write_recovery(
+        workspace, expected_oid,
+        RecoveryJournal(entries)
+        if entries else None,
+    )
+
+
+def apply_first_publication(
+    plan: FirstPublicationPlan,
+    workspace: str | Path,
+    github: GitHubClient,
+    push_url: str,
+    *,
+    dry_run: bool = False,
+    git_transport: GitTransport | None = None,
+) -> ApplyResult:
+    """Publish a fully planned new stack, recovering uncertain creations first."""
+    git = git_transport or SubprocessGitTransport(workspace)
+    _oid, journal = read_recovery(workspace)
+    if dry_run:
+        try:
+            unresolved = settle_recovery(
+                workspace, github, dry_run=True, git_transport=git
+            )
+        except Error as exc:
+            return Stopped("recovery", str(exc))
+        if any(_first_publication_conflict(entry, plan) for entry in unresolved):
+            return Stopped("recovery", "a conflicting mutation remains unresolved")
+        return Verified()
+    with repository_lock(workspace):
+        _locked_oid, locked_journal = read_recovery(workspace)
+        try:
+            unresolved = settle_recovery(
+                workspace, github, git_transport=git
+            )
+            repository = github.resolve_repository(plan.goal.repository)
+            goals = plan.goal.pull_requests
+            refs = git.observe_live_refs(
+                push_url, plan.goal.repository,
+                tuple(f"refs/heads/{goal.branch_name}" for goal in goals),
+            )
+        except Error as exc:
+            return Stopped("observe", str(exc))
+        if any(_first_publication_conflict(entry, plan) for entry in unresolved):
+            return Stopped("recovery", "a conflicting mutation remains unresolved")
+        current = tuple(item.commit_id for item in refs)
+        wanted = tuple(goal.commit_id for goal in goals)
+        head_published = False
+        owns_temporary_heads = any(
+            isinstance(entry.attempt, BranchCreationAttempt)
+            and entry.attempt.repository == plan.goal.repository
+            and entry.attempt.goals == goals
+            for entry in unresolved
+        )
+        _state_oid, state = read_state(workspace)
+        recorded_heads = {
+            (item.ref.full_name, item.verified_commit_id): item.pr
+            for item in state.last_published_heads
+            if item.ref.repository == plan.goal.repository
+        }
+        owns_recorded_heads = all(
+            (f"refs/heads/{goal.branch_name}", goal.commit_id) in recorded_heads
+            for goal in goals
+        )
+        owns_heads = owns_temporary_heads or owns_recorded_heads
+        if current == wanted and not owns_heads:
+            return Stopped("heads", "occupied publication destinations are not owned")
+        if current != wanted:
+            if any(value is not None for value in current):
+                return Stopped("heads", "a publication destination changed")
+            attempt = BranchCreationAttempt(plan.goal.repository, push_url, goals)
+            oid, entry = _append_recovery(workspace, attempt)
+            live = replace(entry, possibly_live=True)
+            oid = _replace_recovery_entry(workspace, oid, live)
+            try:
+                git.push_absent_heads(push_url, plan.goal.repository, goals)
+            except GitPushError:
+                pass
+            try:
+                refs = git.observe_live_refs(
+                    push_url, plan.goal.repository,
+                    tuple(item.ref.full_name for item in refs),
+                )
+            except Error as exc:
+                return Stopped("heads", f"publication readback is unresolved: {exc}")
+            if tuple(item.commit_id for item in refs) != wanted:
+                return Stopped(
+                    "heads", "atomic branch publication remains unresolved",
+                )
+            head_published = True
+
+        identities: list[PullRequestId] = []
+        for goal in goals:
+            attempt = PullRequestCreationAttempt(plan.goal.repository, goal)
+            matches = github.find_pull_requests(
+                plan.goal.repository, head_branches=(goal.branch_name,),
+                states=tuple(PullRequestState),
+            )
+            exact = tuple(pr for pr in matches if
+                pr.head_repository == plan.goal.repository
+                and pr.head_oid == goal.commit_id and pr.base_branch == goal.base_branch
+                and pr.title == goal.title and pr.body == goal.body and not pr.draft)
+            if len(exact) == 1 and len(matches) == 1:
+                owned = any(
+                    isinstance(item.attempt, PullRequestCreationAttempt)
+                    and item.attempt.goal == goal
+                    and item.attempt.pull_request == exact[0].identity
+                    for item in unresolved
+                ) or recorded_heads.get(
+                    (f"refs/heads/{goal.branch_name}", goal.commit_id)
+                ) == exact[0].identity
+                if not owned:
+                    return Stopped("pull-request", f"branch {goal.branch_name} has a foreign PR")
+                identities.append(exact[0].identity)
+                continue
+            if matches:
+                return Stopped("pull-request", f"branch {goal.branch_name} has a foreign PR")
+            oid, entry = _append_recovery(workspace, attempt)
+            live = RecoveryEntry(entry.identity, attempt, True)
+            oid = _replace_recovery_entry(workspace, oid, live)
+            try:
+                github.create_pull_request(
+                    repository, head_branch=goal.branch_name,
+                    base_branch=goal.base_branch, title=goal.title,
+                    body=goal.body, draft=False,
+                )
+            except GitHubTransportError:
+                pass
+            except GitHubHttpError:
+                _remove_recovery_entry(workspace, oid, entry.identity)
+                return Stopped("pull-request", "pull request creation was rejected")
+            try:
+                result = _finish_creation_attempt(workspace, github, live)
+            except Error as exc:
+                return Stopped("pull-request", f"creation readback is unresolved: {exc}")
+            if result != "applied":
+                return Stopped("pull-request", f"pull request creation is {result}")
+            match = github.find_pull_requests(
+                plan.goal.repository, head_branches=(goal.branch_name,),
+                states=tuple(PullRequestState),
+            )
+            identities.append(match[0].identity)
+            _replace_recovery_entry(
+                workspace, oid,
+                replace(live, attempt=replace(attempt, pull_request=match[0].identity)),
+            )
+
+        members = tuple(identities)
+
+        if len(members) == 1:
+            publication = LastPublishedHead(
+                members[0],
+                RemoteBranchRef(
+                    plan.goal.repository, f"refs/heads/{goals[0].branch_name}"
+                ),
+                goals[0].commit_id,
+            )
+            receipt_oid, receipt_journal = read_recovery(workspace)
+            if receipt_oid is None or receipt_journal is None:
+                if owns_recorded_heads and TrackedStack(
+                    plan.goal.repository, plan.goal.base_branch, members
+                ) in state.stacks:
+                    return Verified()
+                return Stopped(
+                    "receipt", "temporary publication ownership is unavailable"
+                )
+            handoff = StackCreationAttempt(
+                plan.goal.repository, plan.goal.base_branch, members, goals
+            )
+            try:
+                changed = _record_verified_state(
+                    workspace,
+                    TrackedStack(plan.goal.repository, plan.goal.base_branch, members),
+                    (publication,),
+                )
+                _retire_first_publication_facts(workspace, receipt_oid, handoff)
+            except Error as exc:
+                return Stopped("receipt", str(exc))
+            return Verified(head_published, False, changed)
+        if any(
+            isinstance(entry.attempt, StackCreationAttempt)
+            and entry.attempt.repository == plan.goal.repository
+            and set(entry.attempt.pull_requests).intersection(members)
+            for entry in unresolved
+        ):
+            return Stopped("recovery", "a conflicting stack creation remains unresolved")
+        prs = github.pull_requests(members)
+        summaries = {pr.stack for pr in prs}
+        if summaries == {None}:
+            attempt = StackCreationAttempt(
+                plan.goal.repository, plan.goal.base_branch, members, goals
+            )
+            oid, entry = _append_recovery(workspace, attempt)
+            live = RecoveryEntry(entry.identity, attempt, True)
+            oid = _replace_recovery_entry(workspace, oid, live)
+            try:
+                github.create_stack(repository, pull_requests=members)
+            except GitHubTransportError:
+                pass
+            except GitHubHttpError:
+                _remove_recovery_entry(workspace, oid, entry.identity)
+                return Stopped("stack", "stack creation was rejected")
+            try:
+                result = _finish_creation_attempt(workspace, github, live)
+            except Error as exc:
+                return Stopped("stack", f"creation readback is unresolved: {exc}")
+            if result != "applied":
+                return Stopped("stack", f"stack creation is {result}")
+            try:
+                changed = _record_verified_state(
+                    workspace,
+                    TrackedStack(plan.goal.repository, plan.goal.base_branch, members),
+                    tuple(
+                        LastPublishedHead(pr, RemoteBranchRef(plan.goal.repository,
+                            f"refs/heads/{goal.branch_name}"), goal.commit_id)
+                        for pr, goal in zip(members, goals, strict=True)
+                    ),
+                )
+            except Error as exc:
+                return Stopped("receipt", str(exc))
+            try:
+                _retire_first_publication_facts(workspace, oid, attempt)
+            except Error as exc:
+                return Stopped("receipt", str(exc))
+            return Verified(head_published, False, changed)
+        if len(summaries) != 1 or None in summaries:
+            return Stopped("stack", "pull requests have foreign stack membership")
+        # Partial-progress recovery: verify the existing stack before handing off receipts.
+        summary = next(iter(summaries))
+        assert summary is not None
+        stack = github.stack(repository, summary.identity)
+        if stack is None or stack.pull_requests != members or stack.base_branch != plan.goal.base_branch:
+            return Stopped("stack", "existing stack does not match the goal")
+        publications = tuple(
+            LastPublishedHead(pr, RemoteBranchRef(plan.goal.repository,
+                f"refs/heads/{goal.branch_name}"), goal.commit_id)
+            for pr, goal in zip(members, goals, strict=True)
+        )
+        receipt_oid, receipt_journal = read_recovery(workspace)
+        if receipt_oid is None or receipt_journal is None:
+            if owns_recorded_heads and TrackedStack(
+                plan.goal.repository, plan.goal.base_branch, members
+            ) in state.stacks:
+                return Verified()
+            return Stopped("receipt", "temporary publication ownership is unavailable")
+        try:
+            changed = _record_verified_state(
+                workspace,
+                TrackedStack(plan.goal.repository, plan.goal.base_branch, members),
+                publications,
+            )
+            _retire_first_publication_facts(
+                workspace,
+                receipt_oid,
+                StackCreationAttempt(
+                    plan.goal.repository, plan.goal.base_branch, members, goals
+                ),
+            )
+        except Error as exc:
+            return Stopped("receipt", str(exc))
+        return Verified(state_recorded=changed)
+
+
+def execute_first_publication(
+    workspace: str | Path,
+    github: GitHubClient,
+    push_url: str,
+    recompute: Callable[[tuple[RecoveryEntry, ...]], FirstPublicationPlan | Blocked],
+    *,
+    confirm: Callable[[FirstPublicationPlan], bool] | None = None,
+    dry_run: bool = False,
+    git_transport: GitTransport | None = None,
+) -> tuple[FirstPublicationPlan | Blocked | None, ApplyResult]:
+    """Settle recovery facts, recompute the current goal, confirm, then publish."""
+    try:
+        with repository_lock(workspace):
+            facts = settle_recovery(
+                workspace,
+                github,
+                dry_run=dry_run,
+                git_transport=git_transport,
+            )
+    except Error as exc:
+        return None, Stopped("recovery", str(exc))
+    try:
+        plan = recompute(facts)
+    except Error as exc:
+        return None, Stopped("observe", str(exc))
+    if isinstance(plan, Blocked):
+        return plan, Stopped("plan", "a blocked plan cannot be applied")
+    if confirm is not None and not confirm(plan):
+        return plan, Stopped("confirmation", "publication was not confirmed")
+    return plan, apply_first_publication(
+        plan,
+        workspace,
+        github,
+        push_url,
+        dry_run=dry_run,
+        git_transport=git_transport,
+    )
 
 
 def apply(
