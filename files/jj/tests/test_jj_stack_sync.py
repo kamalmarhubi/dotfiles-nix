@@ -1584,6 +1584,144 @@ def test_multi_pr_planner_aggregates_multiple_head_updates() -> None:
     )
 
 
+def test_merged_selector_requires_distinct_boundary_ownership() -> None:
+    observed, selected = stacked_snapshot(count=3, merged_prefix=1)
+
+    desired = sync.derive_desired(observed, selected)
+    plan = sync.plan_sync(observed, desired)
+
+    assert isinstance(desired, sync.DesiredStack)
+    assert tuple(item.pr_identity.number for item in desired.active) == (2, 3)
+    assert observed.membership.selected_pr.number == 1
+    assert isinstance(plan, sync.Blocked)
+    assert plan.reasons[0].code == "boundary-unowned"
+
+
+def merged_boundary_snapshot(
+    *, integration: str = "b" * 40, changed_heads: bool = False
+) -> tuple[sync.Snapshot, sync.StackSelection, sync.TrackedState]:
+    observed, selected = stacked_snapshot(count=3, merged_prefix=1)
+    merged, first_open, second_open = observed.pull_requests
+    boundary_ref = sync.RemoteBranchRef(
+        observed.repository, f"refs/heads/{merged.head_branch}"
+    )
+    publications = tuple(
+        sync.LastPublishedHead(
+            pr.identity,
+            sync.RemoteBranchRef(
+                observed.repository, f"refs/heads/{pr.head_branch}"
+            ),
+            pr.head_oid,
+        )
+        for pr in observed.pull_requests
+    )
+    state = sync.TrackedState(
+        (
+            sync.TrackedStack(
+                observed.repository,
+                "main",
+                tuple(pr.identity for pr in observed.pull_requests),
+            ),
+        ),
+        publications,
+    )
+    first_wanted = "4" * 40 if changed_heads else first_open.head_oid
+    second_wanted = "5" * 40 if changed_heads else second_open.head_oid
+    local = dataclasses.replace(
+        observed.local,
+        commits=(
+            sync.ObservedCommit(
+                first_wanted, (integration,), "change-2", "Title 2\n\nBody 2",
+                False, False,
+            ),
+            sync.ObservedCommit(
+                second_wanted, (first_wanted,), "change-3", "Title 3\n\nBody 3",
+                False, False,
+            ),
+        ),
+    )
+    live_refs = tuple(
+        dataclasses.replace(item, commit_id=integration)
+        if item.ref.full_name == "refs/heads/main"
+        else item
+        for item in observed.live_refs
+    )
+    observed = dataclasses.replace(
+        observed,
+        local=local,
+        live_refs=live_refs,
+        tool_state=sync.ToolStateRead(None, state, None),
+    )
+    selected = sync.StackSelection(
+        "main",
+        (
+            sync.ExistingPRAssignment(first_open.identity, first_wanted),
+            sync.ExistingPRAssignment(second_open.identity, second_wanted),
+        ),
+    )
+    assert boundary_ref == publications[0].ref
+    return observed, selected, state
+
+
+def test_merged_boundary_inherits_exact_head_receipt_and_retires_head_authority(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, selected, state = merged_boundary_snapshot(integration="1" * 40)
+    state_oid = sync.cas_write_state(jj_repo, None, state)
+    observed = dataclasses.replace(
+        observed,
+        tool_state=dataclasses.replace(
+            observed.tool_state, state_blob_oid=state_oid
+        ),
+    )
+    desired = sync.derive_desired(observed, selected)
+    plan = sync.plan_sync(observed, desired)
+    assert isinstance(plan, sync.NoOp)
+    assert plan.boundary_receipts == (
+        sync.LastPublishedBoundary(
+            observed.pull_requests[0].identity,
+            sync.RemoteBranchRef(observed.repository, "refs/heads/topic-1"),
+            "1" * 40,
+        ),
+    )
+    _server, github = fake_github(observed)
+    monkeypatch.setattr(
+        sync.SubprocessGitTransport,
+        "observe_live_refs",
+        lambda *_args, **_kwargs: (
+            plan.dependencies.live_heads + plan.dependencies.live_bases
+        ),
+    )
+    result = sync.apply(plan, jj_repo, github)
+
+    assert isinstance(result, sync.Verified)
+    recorded = sync.read_state(jj_repo)[1]
+    assert recorded.last_published_boundaries == plan.boundary_receipts
+    assert all(
+        item.pr != observed.pull_requests[0].identity
+        for item in recorded.last_published_heads
+    )
+
+
+def test_merged_boundary_and_open_heads_form_one_atomic_write_set() -> None:
+    observed, selected, _state = merged_boundary_snapshot(changed_heads=True)
+    desired = sync.derive_desired(observed, selected)
+
+    plan = sync.plan_sync(observed, desired)
+
+    assert isinstance(plan, sync.Apply)
+    updates = {
+        item.ref.full_name: (item.expected_old_commit_id, item.new_commit_id)
+        for item in plan.head_updates
+    }
+    assert updates == {
+        "refs/heads/topic-1": ("1" * 40, "b" * 40),
+        "refs/heads/topic-2": ("2" * 40, "4" * 40),
+        "refs/heads/topic-3": ("3" * 40, "5" * 40),
+    }
+    assert plan.boundary_receipts[0].verified_commit_id == "b" * 40
+
+
 def test_tracked_and_explicit_selection_have_distinct_membership_policy() -> None:
     observed, selected = stacked_snapshot(count=2)
 
@@ -3937,6 +4075,297 @@ def test_stack_append_publishes_and_records_complete_membership(
         sync.TrackedStack(plan.goal.repository, "main", stack.pull_requests),
     )
     assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def completed_stack_append_case(jj_repo: Path, monkeypatch):
+    observed, _plan, server, github = stack_append_case(jj_repo, monkeypatch)
+    integration = "a" * 40
+    completed = tuple(
+        dataclasses.replace(pr, state=sync.PullRequestState.MERGED)
+        for pr in observed.pull_requests
+    )
+    for pr in completed:
+        server.merge_pull_request(pr.identity)
+    tip = completed[-1]
+    boundary_ref = sync.RemoteBranchRef(
+        observed.publication.repository, f"refs/heads/{tip.head_branch}"
+    )
+    server.move_branch(observed.publication.repository, tip.head_branch, integration)
+    destinations = tuple(
+        dataclasses.replace(item, commit_id=integration)
+        if item.ref == boundary_ref or item.ref.full_name == "refs/heads/main"
+        else item
+        for item in observed.publication.destinations
+    )
+    publication = dataclasses.replace(
+        observed.publication,
+        local=dataclasses.replace(
+            observed.publication.local,
+            commits=(dataclasses.replace(
+                observed.publication.local.commits[0], parent_commit_ids=(integration,)
+            ),),
+        ),
+        destinations=destinations,
+    )
+    state = dataclasses.replace(
+        observed.tracked_state,
+        last_published_heads=observed.tracked_state.last_published_heads[:-1],
+        last_published_boundaries=(
+            sync.LastPublishedBoundary(tip.identity, boundary_ref, integration),
+        ),
+    )
+    current_oid, _old = sync.read_state(jj_repo)
+    sync.cas_write_state(jj_repo, current_oid, state)
+    observed = sync.StackAppendInput(publication, observed.stack, completed, state)
+    return observed, server, github
+
+
+def test_completed_stack_appends_from_exact_owned_boundary(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, server, github = completed_stack_append_case(jj_repo, monkeypatch)
+    plan = sync.plan_stack_append(observed)
+    assert isinstance(plan, sync.StackAppendPlan)
+    assert plan.goal.pull_requests[0].base_branch == "two"
+    assert plan.completed_boundary == observed.tracked_state.last_published_boundaries[0]
+
+    result = sync.apply_stack_append(plan, jj_repo, github, "push")
+
+    assert isinstance(result, sync.Verified)
+    state = sync.read_state(jj_repo)[1]
+    assert state.stacks[0].ordered_prs[:2] == plan.goal.old_members
+    assert len(state.stacks[0].ordered_prs) == 3
+    assert state.last_published_boundaries == (
+        plan.completed_boundary,
+    )
+    assert all(
+        item.pr not in plan.goal.old_members
+        for item in state.last_published_heads + state.last_adopted_heads
+    )
+    stack = server.read_stack(server.read_repository(plan.goal.repository), plan.goal.stack)
+    assert stack is not None and len(stack.pull_requests) == 3
+
+
+def test_completed_stack_appends_multiple_new_members(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, server, github = completed_stack_append_case(jj_repo, monkeypatch)
+    first_new = observed.publication.local.commits[0]
+    second_oid = "4" * 40
+    second_branch = "new-two"
+    second_new = sync.ObservedCommit(
+        second_oid, (first_new.commit_id,), "c4", "New two\n\nBody", False, False
+    )
+    server.seed_branch(observed.publication.repository, second_branch, second_oid)
+    second_ref = sync.LiveRemoteRef(
+        sync.RemoteBranchRef(
+            observed.publication.repository, f"refs/heads/{second_branch}"
+        ),
+        None,
+    )
+    publication = dataclasses.replace(
+        observed.publication,
+        ordered_commit_ids=(first_new.commit_id, second_oid),
+        local=dataclasses.replace(
+            observed.publication.local, commits=(first_new, second_new)
+        ),
+        explicit_assignments=observed.publication.explicit_assignments
+        + (sync.PublicationAssignment(second_oid, second_branch),),
+        destinations=observed.publication.destinations + (second_ref,),
+    )
+    plan = sync.plan_stack_append(dataclasses.replace(observed, publication=publication))
+    assert isinstance(plan, sync.StackAppendPlan)
+    absent = tuple(
+        item for item in plan.destinations
+        if item.ref.full_name in ("refs/heads/new", "refs/heads/new-two")
+    )
+    present = tuple(
+        dataclasses.replace(item, commit_id=goal.commit_id)
+        for item, goal in zip(absent, plan.goal.pull_requests, strict=True)
+    )
+    reads = iter((absent, present))
+    monkeypatch.setattr(
+        sync.SubprocessGitTransport,
+        "observe_live_refs",
+        lambda *_args, **_kwargs: next(reads, present),
+    )
+
+    result = sync.apply_stack_append(plan, jj_repo, github, "push")
+
+    assert isinstance(result, sync.Verified)
+    state = sync.read_state(jj_repo)[1]
+    assert len(state.stacks[0].ordered_prs) == 4
+    additions = server.read_pull_requests(state.stacks[0].ordered_prs[-2:])
+    assert tuple(pr.base_branch for pr in additions) == ("two", "new")
+    assert tuple(item.verified_commit_id for item in state.last_published_heads) == (
+        first_new.commit_id,
+        second_oid,
+    )
+
+
+def test_completed_stack_does_not_require_historical_heads(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, _server, _github = completed_stack_append_case(jj_repo, monkeypatch)
+    historical = observed.pull_requests[0]
+    without_history = dataclasses.replace(
+        observed,
+        publication=dataclasses.replace(
+            observed.publication,
+            destinations=tuple(
+                dataclasses.replace(item, commit_id=None)
+                if item.ref.full_name == f"refs/heads/{historical.head_branch}"
+                else item
+                for item in observed.publication.destinations
+            ),
+        ),
+        tracked_state=dataclasses.replace(
+            observed.tracked_state,
+            last_published_heads=(),
+            last_adopted_heads=(),
+        ),
+    )
+
+    plan = sync.plan_stack_append(without_history)
+
+    assert isinstance(plan, sync.StackAppendPlan)
+    assert plan.completed_boundary is not None
+
+
+def test_completed_stack_requires_exact_boundary_and_recomputes_integration(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, _server, _github = completed_stack_append_case(jj_repo, monkeypatch)
+    missing = dataclasses.replace(
+        observed,
+        tracked_state=dataclasses.replace(
+            observed.tracked_state, last_published_boundaries=()
+        ),
+    )
+    blocked = sync.plan_stack_append(missing)
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "boundary-unowned"
+
+    foreign = dataclasses.replace(
+        observed,
+        publication=dataclasses.replace(
+            observed.publication,
+            destinations=tuple(
+                dataclasses.replace(item, commit_id="f" * 40)
+                if item.ref == observed.tracked_state.last_published_boundaries[0].ref
+                else item
+                for item in observed.publication.destinations
+            ),
+        ),
+    )
+    blocked = sync.plan_stack_append(foreign)
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "boundary-foreign"
+
+    moved = "c" * 40
+    boundary = dataclasses.replace(
+        observed.tracked_state.last_published_boundaries[0],
+        verified_commit_id=moved,
+    )
+    destinations = tuple(
+        dataclasses.replace(item, commit_id=moved)
+        if item.ref == boundary.ref or item.ref.full_name == "refs/heads/main"
+        else item
+        for item in observed.publication.destinations
+    )
+    publication = dataclasses.replace(
+        observed.publication,
+        destinations=destinations,
+        local=dataclasses.replace(
+            observed.publication.local,
+            commits=(dataclasses.replace(
+                observed.publication.local.commits[0], parent_commit_ids=(moved,)
+            ),),
+        ),
+    )
+    replanned = sync.plan_stack_append(dataclasses.replace(
+        observed,
+        publication=publication,
+        tracked_state=dataclasses.replace(
+            observed.tracked_state, last_published_boundaries=(boundary,)
+        ),
+    ))
+    assert isinstance(replanned, sync.StackAppendPlan)
+    assert replanned.completed_boundary == boundary
+
+
+def test_completed_stack_definite_grouping_rejection_is_idempotent(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, server, github = completed_stack_append_case(jj_repo, monkeypatch)
+    plan = sync.plan_stack_append(observed)
+    assert isinstance(plan, sync.StackAppendPlan)
+
+    def reject_grouping(*_args, **_kwargs):
+        raise sync.GitHubHttpError(
+            sync.GitHubHttpResponse(422, (), b"rejected"), "add stack members"
+        )
+
+    monkeypatch.setattr(github, "add_stack_members", reject_grouping)
+    result = sync.apply_stack_append(plan, jj_repo, github, "push")
+    retry = sync.apply_stack_append(plan, jj_repo, github, "push")
+
+    assert isinstance(result, sync.Verified)
+    assert isinstance(retry, sync.Verified)
+    assert sync.read_recovery(jj_repo) == (None, None)
+    stack = server.read_stack(server.read_repository(plan.goal.repository), plan.goal.stack)
+    assert stack is not None and stack.pull_requests == plan.goal.old_members
+
+
+def test_completed_stack_held_grouping_requires_explicit_release(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, _server, github = completed_stack_append_case(jj_repo, monkeypatch)
+    plan = sync.plan_stack_append(observed)
+    assert isinstance(plan, sync.StackAppendPlan)
+
+    with github.hold_next(sync.GitHubClient.add_stack_members) as pending:
+        result = sync.apply_stack_append(plan, jj_repo, github, "push")
+
+    assert isinstance(result, sync.Verified)
+    retry = sync.apply_stack_append(plan, jj_repo, github, "push")
+    assert isinstance(retry, sync.Stopped)
+    assert retry.stage == "recovery"
+    pending.release()
+    assert sync.settle_recovery(jj_repo, github) == ()
+    resumed = sync.apply_stack_append(plan, jj_repo, github, "push")
+    assert isinstance(resumed, sync.Verified)
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_completed_stack_state_failure_preserves_publication_facts(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, _server, github = completed_stack_append_case(jj_repo, monkeypatch)
+    plan = sync.plan_stack_append(observed)
+    assert isinstance(plan, sync.StackAppendPlan)
+
+    def fail_state(*_args, **_kwargs):
+        raise sync.ConcurrentUpdate("injected stale state")
+
+    monkeypatch.setattr(sync, "cas_write_state", fail_state)
+    stopped = sync.apply_stack_append(plan, jj_repo, github, "push")
+
+    assert isinstance(stopped, sync.Stopped)
+    assert stopped.stage == "receipt"
+    journal = sync.read_recovery(jj_repo)[1]
+    assert journal is not None
+    assert any(
+        isinstance(entry.attempt, sync.BranchCreationAttempt)
+        and entry.attempt.goals == plan.goal.pull_requests
+        for entry in journal.entries
+    )
+    assert any(
+        isinstance(entry.attempt, sync.PullRequestCreationAttempt)
+        and entry.attempt.goal == plan.goal.pull_requests[0]
+        and entry.attempt.pull_request is not None
+        for entry in journal.entries
+    )
 
 
 @pytest.mark.parametrize("fault", ("lose_response", "fail_before"))

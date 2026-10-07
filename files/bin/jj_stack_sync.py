@@ -747,6 +747,7 @@ class StackAppendPlan:
     destinations: tuple[LiveRemoteRef, ...]
     historical_pull_requests: tuple[GitHubPullRequest, ...]
     existing_pull_requests: tuple[GitHubPullRequest, ...]
+    completed_boundary: LastPublishedBoundary | None = None
 
 
 @dataclass(frozen=True)
@@ -4307,8 +4308,11 @@ def plan_stack_append(observed: StackAppendInput) -> StackAppendPlan | Blocked:
     if tuple(pr.identity for pr in observed.pull_requests) != members:
         return _block("incomplete-membership", "stack", "ordered members were not observed exactly")
     summary = GitHubStackSummary(stack.identity, stack.node_id, stack.base_branch)
+    completed = bool(observed.pull_requests) and all(
+        pr.state is PullRequestState.MERGED for pr in observed.pull_requests
+    )
     if any(
-        pr.state is not PullRequestState.OPEN
+        (pr.state is not PullRequestState.OPEN and not completed)
         or pr.stack != summary
         or pr.head_repository != publication.repository
         or pr.head_oid is None
@@ -4323,7 +4327,7 @@ def plan_stack_append(observed: StackAppendInput) -> StackAppendPlan | Blocked:
     if not members or len(base_reads) != 1 or base_reads[0].commit_id is None or any(
         pr.base_branch != (stack.base_branch if index == 0 else observed.pull_requests[index - 1].head_branch)
         or (index > 0 and pr.base_oid != observed.pull_requests[index - 1].head_oid)
-        or (index == 0 and pr.base_oid != base_reads[0].commit_id)
+        or (index == 0 and not completed and pr.base_oid != base_reads[0].commit_id)
         for index, pr in enumerate(observed.pull_requests)
     ):
         return _block("inconsistent-topology", "stack", "stack branch topology is incomplete or inconsistent")
@@ -4343,7 +4347,7 @@ def plan_stack_append(observed: StackAppendInput) -> StackAppendPlan | Blocked:
                 "stack refs must be observed exactly once in the target repository",
             )
         live_refs[item.ref.full_name] = item.commit_id
-    if any(
+    if not completed and any(
         live_refs.get(f"refs/heads/{pr.head_branch}") != pr.head_oid
         for pr in observed.pull_requests
     ):
@@ -4359,20 +4363,36 @@ def plan_stack_append(observed: StackAppendInput) -> StackAppendPlan | Blocked:
             + observed.tracked_state.last_adopted_heads
         )
     }
-    if any(
+    if not completed and any(
         (pr.identity, f"refs/heads/{pr.head_branch}", pr.head_oid) not in receipts
         for pr in observed.pull_requests
     ):
         return _block("untracked-head", "stack", "member heads are not exactly tracked")
     tip = observed.pull_requests[-1]
     assert tip.head_oid is not None
+    boundary: LastPublishedBoundary | None = None
+    suffix_oid = tip.head_oid
+    if completed:
+        boundary_ref = RemoteBranchRef(
+            publication.repository, f"refs/heads/{tip.head_branch}"
+        )
+        boundaries = tuple(item for item in observed.tracked_state.last_published_boundaries
+            if item.merged_pr == tip.identity and item.ref == boundary_ref)
+        if len(boundaries) != 1:
+            return _block("boundary-unowned", tip.head_branch,
+                "completed stack seam lacks one exact boundary receipt")
+        boundary = boundaries[0]
+        suffix_oid = boundary.verified_commit_id
+        if live_refs.get(boundary_ref.full_name) != suffix_oid:
+            return _block("boundary-foreign", tip.head_branch,
+                "completed stack seam differs from its boundary receipt")
     suffix = replace(
         publication,
         base_branch=tip.head_branch,
         destinations=publication.destinations + (
             LiveRemoteRef(
                 RemoteBranchRef(publication.repository, f"refs/heads/{tip.head_branch}"),
-                tip.head_oid,
+                suffix_oid,
             ),
         ) if not any(item.ref.full_name == f"refs/heads/{tip.head_branch}" for item in publication.destinations) else publication.destinations,
     )
@@ -4385,7 +4405,7 @@ def plan_stack_append(observed: StackAppendInput) -> StackAppendPlan | Blocked:
             members, planned.goal.pull_requests,
         ),
         planned.local, planned.destinations, planned.historical_pull_requests,
-        observed.pull_requests,
+        observed.pull_requests, boundary,
     )
 
 
@@ -4743,11 +4763,20 @@ def _validate_plan_scope(
         ordered_members = snapshot.membership.ordered_prs
         base_branch = snapshot.membership.base_branch
     if tuple(observed) != ordered_members:
-        return _block(
-            "incomplete-membership",
-            "stack",
-            "observed PRs do not exactly match complete ordered membership",
+        logical = tuple(
+            stack
+            for stack in snapshot.tool_state.state.stacks
+            if stack.repository == snapshot.repository
+            and stack.ordered_prs == tuple(observed)
         )
+        if len(logical) != 1:
+            return _block(
+                "incomplete-membership",
+                "stack",
+                "observed PRs do not exactly match complete ordered membership",
+            )
+        ordered_members = logical[0].ordered_prs
+        base_branch = logical[0].base_branch
     if desired.base_branch != base_branch:
         return _block(
             "target-mismatch",
@@ -4809,48 +4838,77 @@ def _validate_pr_dependencies(
             "authoritative stack base ref is absent or ambiguous",
         )
     all_heads: list[LiveRemoteRef] = []
-    all_bases: list[LiveRemoteRef] = []
+    all_bases: list[LiveRemoteRef] = [bases[0]]
     heads_by_pr: dict[PullRequestId, LiveRemoteRef] = {}
     previous_pr: GitHubPullRequest | None = None
+    boundary_receipt: LastPublishedBoundary | None = None
     for pr in snapshot.pull_requests:
         head_name = f"refs/heads/{pr.head_branch}"
         head_ref = RemoteBranchRef(snapshot.repository, head_name)
         heads = tuple(value for value in snapshot.live_refs if value.ref == head_ref)
-        if len(heads) != 1 or heads[0].commit_id != pr.head_oid:
+        if pr.state is PullRequestState.OPEN and (
+            len(heads) != 1 or heads[0].commit_id != pr.head_oid
+        ):
             return _block(
                 "head-disagrees",
                 head_name,
                 "GitHub PR head and authoritative live ref disagree",
             )
-        expected_base_branch = (
-            previous_pr.head_branch if previous_pr is not None else desired.base_branch
-        )
+        first_open = pr.state is PullRequestState.OPEN and previous_pr is not None \
+            and previous_pr.state is PullRequestState.MERGED
+        if first_open:
+            boundary_ref = RemoteBranchRef(snapshot.repository,
+                f"refs/heads/{pr.base_branch}")
+            receipts = tuple(item for item in
+                snapshot.tool_state.state.last_published_boundaries
+                if item.merged_pr == previous_pr.identity and item.ref == boundary_ref)
+            inherited = tuple(item for item in
+                snapshot.tool_state.state.last_published_heads
+                if item.pr == previous_pr.identity and item.ref == boundary_ref
+                and item.verified_commit_id == pr.base_oid)
+            if len(receipts) == 1:
+                boundary_receipt = receipts[0]
+            elif not receipts and len(inherited) == 1:
+                boundary_receipt = LastPublishedBoundary(
+                    previous_pr.identity, boundary_ref, inherited[0].verified_commit_id
+                )
+            else:
+                return _block("boundary-unowned", pr.base_branch,
+                    "the merged-prefix alias lacks one exact boundary receipt")
+            expected_base_branch = pr.base_branch
+        else:
+            expected_base_branch = (
+                previous_pr.head_branch if previous_pr is not None else desired.base_branch
+            )
         if pr.base_branch != expected_base_branch:
             return _block(
                 "topology-changed",
                 f"PR #{pr.number}",
                 "PR literal base does not match unchanged stack order",
             )
-        pr_base_name = f"refs/heads/{pr.base_branch}"
-        pr_base_ref = RemoteBranchRef(snapshot.repository, pr_base_name)
-        pr_bases = tuple(
-            value for value in snapshot.live_refs if value.ref == pr_base_ref
-        )
-        if len(pr_bases) != 1 or pr_bases[0].commit_id != pr.base_oid:
-            return _block(
-                "base-disagrees",
-                pr_base_name,
-                "GitHub PR base and authoritative live ref disagree",
+        if pr.state is PullRequestState.OPEN:
+            pr_base_name = f"refs/heads/{pr.base_branch}"
+            pr_base_ref = RemoteBranchRef(snapshot.repository, pr_base_name)
+            pr_bases = tuple(
+                value for value in snapshot.live_refs if value.ref == pr_base_ref
             )
-        all_heads.append(heads[0])
-        if pr_bases[0] not in all_bases:
-            all_bases.append(pr_bases[0])
-        heads_by_pr[pr.identity] = heads[0]
+            if len(pr_bases) != 1 or pr_bases[0].commit_id != pr.base_oid:
+                return _block(
+                    "base-disagrees",
+                    pr_base_name,
+                    "GitHub PR base and authoritative live ref disagree",
+                )
+            if first_open and pr_bases[0].commit_id != boundary_receipt.verified_commit_id:
+                return _block("boundary-foreign", pr.base_branch,
+                    "boundary is neither the receipt's recorded old value nor an explained candidate")
+            all_heads.append(heads[0])
+            if pr_bases[0] not in all_bases:
+                all_bases.append(pr_bases[0])
+            heads_by_pr[pr.identity] = heads[0]
         previous_pr = pr
-    merged = tuple(
-        pr for pr in snapshot.pull_requests if pr.state is PullRequestState.MERGED
-    )
-    comparison_base = merged[-1].head_oid if merged else bases[0].commit_id
+    # Open commits are always computed from the invocation-observed integration
+    # tip. The merged PR heads remain immutable historical evidence.
+    comparison_base = bases[0].commit_id
     active_heads: list[LiveRemoteRef] = []
     for pr, wanted in zip(prs, desired.active, strict=True):
         commits = tuple(
@@ -5117,16 +5175,100 @@ def plan_sync(
     planned_heads: list[PlannedHeadUpdate] = []
     planned_metadata: list[PRMetadataUpdate] = []
     for pr, wanted, head in zip(prs, desired.active, heads, strict=True):
-        head_updates = _plan_publication(snapshot, wanted, head)
+        head_updates = _plan_publication(
+            snapshot,
+            wanted,
+            head,
+        )
         if isinstance(head_updates, Blocked):
             return head_updates
         planned_heads.extend(head_updates)
         planned_metadata.extend(_metadata_updates(pr, wanted))
     head_updates = tuple(planned_heads)
+    boundary_receipts: tuple[LastPublishedBoundary, ...] = ()
+    merged = tuple(pr for pr in snapshot.pull_requests
+        if pr.state is PullRequestState.MERGED)
+    if merged and prs:
+        first_open = prs[0]
+        boundary_ref = RemoteBranchRef(snapshot.repository,
+            f"refs/heads/{first_open.base_branch}")
+        old_receipts = tuple(item for item in
+            snapshot.tool_state.state.last_published_boundaries
+            if item.merged_pr == merged[-1].identity and item.ref == boundary_ref)
+        inherited = tuple(item for item in
+            snapshot.tool_state.state.last_published_heads
+            if item.pr == merged[-1].identity and item.ref == boundary_ref
+            and item.verified_commit_id == first_open.base_oid)
+        assert len(old_receipts) == 1 or not old_receipts and len(inherited) == 1
+        old_boundary = (
+            old_receipts[0]
+            if old_receipts
+            else LastPublishedBoundary(
+                merged[-1].identity, boundary_ref, inherited[0].verified_commit_id
+            )
+        )
+        integration = next(item.commit_id for item in all_bases
+            if item.ref.full_name == f"refs/heads/{desired.base_branch}")
+        assert integration is not None
+        boundary_receipts = (LastPublishedBoundary(
+            merged[-1].identity, boundary_ref, integration),)
+        if old_boundary.verified_commit_id != integration:
+            planned_heads.append(PlannedHeadUpdate(boundary_ref,
+                old_boundary.verified_commit_id, integration,
+                MatchesLastPublication(LastPublishedHead(
+                    merged[-1].identity, boundary_ref,
+                    old_boundary.verified_commit_id))),)
+            head_updates = tuple(planned_heads)
+    elif merged and not prs:
+        tip = merged[-1]
+        boundary_ref = RemoteBranchRef(
+            snapshot.repository, f"refs/heads/{tip.head_branch}"
+        )
+        existing_boundaries = tuple(
+            item for item in snapshot.tool_state.state.last_published_boundaries
+            if item.merged_pr == tip.identity and item.ref == boundary_ref
+        )
+        inherited = tuple(
+            item for item in snapshot.tool_state.state.last_published_heads
+            if item.pr == tip.identity and item.ref == boundary_ref
+            and item.verified_commit_id == tip.head_oid
+        )
+        if len(existing_boundaries) == 1:
+            old_boundary = existing_boundaries[0]
+        elif not existing_boundaries and len(inherited) == 1:
+            old_boundary = LastPublishedBoundary(
+                tip.identity, boundary_ref, inherited[0].verified_commit_id
+            )
+        else:
+            return _block(
+                "boundary-unowned", tip.head_branch,
+                "completed stack seam lacks one exact ownership receipt",
+            )
+        integration = next(
+            item.commit_id for item in all_bases
+            if item.ref.full_name == f"refs/heads/{desired.base_branch}"
+        )
+        assert integration is not None
+        boundary_receipts = (
+            LastPublishedBoundary(tip.identity, boundary_ref, integration),
+        )
+        if old_boundary.verified_commit_id != integration:
+            planned_heads.append(
+                PlannedHeadUpdate(
+                    boundary_ref, old_boundary.verified_commit_id, integration,
+                    MatchesLastPublication(
+                        LastPublishedHead(
+                            tip.identity, boundary_ref,
+                            old_boundary.verified_commit_id,
+                        )
+                    ),
+                )
+            )
+            head_updates = tuple(planned_heads)
     metadata = tuple(planned_metadata)
     dependencies = _dependencies(snapshot, snapshot.pull_requests, all_heads, all_bases)
     if not head_updates and not metadata:
-        return NoOp(desired, dependencies)
+        return NoOp(desired, dependencies, boundary_receipts)
     for pr in prs:
         if pr.auto_merge_enabled or pr.in_merge_queue:
             return _block(
@@ -5139,6 +5281,7 @@ def plan_sync(
         head_updates,
         metadata,
         dependencies,
+        boundary_receipts,
     )
 
 
@@ -6171,6 +6314,44 @@ def apply_stack_append(
             if TrackedStack(
                 plan.goal.repository, plan.goal.base_branch, complete_members
             ) in state.stacks:
+                if plan.completed_boundary is not None:
+                    if plan.completed_boundary not in state.last_published_boundaries:
+                        return Stopped("boundary", "recorded completed-stack boundary changed")
+                    try:
+                        additions = github.pull_requests(tuple(recorded_additions))
+                    except Error as exc:
+                        return Stopped("pull-request", f"recorded append readback is unresolved: {exc}")
+                    exact = all(
+                        pr.identity == identity
+                        and pr.state is PullRequestState.OPEN
+                        and pr.head_repository == plan.goal.repository
+                        and pr.head_branch == goal.branch_name
+                        and pr.head_oid == goal.commit_id
+                        and pr.base_branch == goal.base_branch
+                        and pr.title == goal.title
+                        and pr.body == goal.body
+                        and not pr.draft
+                        for pr, identity, goal in zip(
+                            additions, recorded_additions, goals, strict=True
+                        )
+                    )
+                    if not exact:
+                        return Stopped("pull-request", "recorded append receipts are no longer exact")
+                    if all(pr.stack is None for pr in additions):
+                        return Verified()
+                    summary = GitHubStackSummary(
+                        plan.goal.stack, plan.goal.stack_node_id, plan.goal.base_branch
+                    )
+                    stack = github.stack(repository, plan.goal.stack)
+                    if (
+                        all(pr.stack == summary for pr in additions)
+                        and stack is not None
+                        and stack.node_id == plan.goal.stack_node_id
+                        and stack.base_branch == plan.goal.base_branch
+                        and stack.pull_requests == complete_members
+                    ):
+                        return Verified()
+                    return Stopped("stack", "recorded optional grouping is foreign or partial")
                 stack = github.stack(repository, plan.goal.stack)
                 if (
                     stack is not None
@@ -6269,6 +6450,89 @@ def apply_stack_append(
                     replace(live, attempt=replace(attempt, pull_request=match.identity)))
             except Error as exc:
                 return Stopped("pull-request", f"creation readback is unresolved: {exc}")
+
+        if plan.completed_boundary is not None:
+            # A completed stack's historical topology is immutable core state.
+            # Linking the new, open suffix back to GitHub's grouping is merely
+            # an epilogue: PR publication and its durable receipts do not depend
+            # on that optional server feature accepting merged predecessors.
+            state_oid, state = read_state(workspace)
+            old_tracking = TrackedStack(
+                plan.goal.repository, plan.goal.base_branch, plan.goal.old_members
+            )
+            complete_members = plan.goal.old_members + tuple(additions)
+            tracking = TrackedStack(
+                plan.goal.repository, plan.goal.base_branch, complete_members
+            )
+            old_members = set(plan.goal.old_members)
+            publications = [
+                item for item in state.last_published_heads
+                if item.pr not in old_members
+            ]
+            for identity, goal in zip(additions, goals, strict=True):
+                publications.append(LastPublishedHead(
+                    identity,
+                    RemoteBranchRef(plan.goal.repository,
+                        f"refs/heads/{goal.branch_name}"),
+                    goal.commit_id,
+                ))
+            new_state = TrackedState(
+                tuple(item for item in state.stacks
+                    if item not in (old_tracking, tracking)) + (tracking,),
+                tuple(publications),
+                tuple(item for item in state.last_adopted_heads
+                    if item.pr not in old_members),
+                state.detached_associations,
+                state.last_published_boundaries,
+            )
+            try:
+                cas_write_state(workspace, state_oid, new_state)
+            except Error as exc:
+                return Stopped("receipt", str(exc))
+
+            journal_oid, journal = read_recovery(workspace)
+            if journal_oid is not None and journal is not None:
+                goal_set = set(goals)
+                addition_set = set(additions)
+                retained = tuple(entry for entry in journal.entries if not (
+                    isinstance(entry.attempt, BranchCreationAttempt) and entry.attempt.repository == plan.goal.repository and (set(entry.attempt.goals) == goal_set) or (isinstance(entry.attempt, PullRequestCreationAttempt) and entry.attempt.repository == plan.goal.repository and (entry.attempt.goal in goal_set) and (entry.attempt.pull_request in addition_set))
+                ))
+                if retained != journal.entries:
+                    try:
+                        cas_write_recovery(
+                            workspace,
+                            journal_oid,
+                            RecoveryJournal(retained)
+                            if retained
+                            else None,
+                        )
+                    except Error as exc:
+                        return Stopped("recovery-retirement", str(exc))
+
+            attempt = StackAppendAttempt(
+                plan.goal.repository, plan.goal.stack, plan.goal.stack_node_id,
+                plan.goal.base_branch, plan.goal.old_members, tuple(additions), goals,
+            )
+            oid, entry = _append_recovery(workspace, attempt)
+            live = replace(entry, possibly_live=True)
+            oid = _replace_recovery_entry(workspace, oid, live)
+            try:
+                github.add_stack_members(
+                    repository, plan.goal.stack, pull_requests=tuple(additions)
+                )
+            except GitHubTransportError:
+                pass
+            except GitHubHttpError:
+                # Grouping is not part of core completion. A definite refusal
+                # therefore retires only this optional request.
+                _remove_recovery_entry(workspace, oid, entry.identity)
+            else:
+                try:
+                    if _classify_attempt(workspace, github, attempt) == "applied":
+                        _remove_recovery_entry(workspace, oid, entry.identity)
+                except Error:
+                    pass
+            return Verified(head_published=current != wanted, state_recorded=True)
 
         attempt = StackAppendAttempt(plan.goal.repository, plan.goal.stack,
             plan.goal.stack_node_id, plan.goal.base_branch, plan.goal.old_members,
