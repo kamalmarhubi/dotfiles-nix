@@ -4922,7 +4922,7 @@ def test_mixed_branch_creation_preflight_ignores_equal_other_repository_attempt(
     entry = sync.RecoveryEntry(
         "other-repository",
         sync.BranchCreationAttempt(
-            other, "push", plan.new_goals
+            other, "push", plan.new_goals, plan.replacements
         ),
         True,
     )
@@ -5031,6 +5031,300 @@ def test_mixed_membership_accepts_tracked_standalone_existing_source(
     assert isinstance(result, sync.Verified)
     assert len(sync.read_state(jj_repo)[1].stacks[0].ordered_prs) == 2
     assert sync.read_recovery(jj_repo) == (None, None)
+
+
+@pytest.mark.parametrize("lose_create_response", (False, True))
+def test_mixed_membership_explicit_replacement_creates_identity_and_detaches_old(
+    jj_repo: Path, monkeypatch, lose_create_response: bool
+) -> None:
+    observed, _append, server, github = stack_append_case(jj_repo, monkeypatch)
+    repository = observed.publication.repository
+    base, replacement, second = (value * 40 for value in "042")
+    first_id, second_id = observed.stack.pull_requests
+    first, second_pr = server.read_pull_requests((first_id, second_id))
+    branch = f"{first.head_branch}-replacement"
+    local = dataclasses.replace(
+        observed.publication.local,
+        commits=(
+            sync.ObservedCommit(replacement, (base,), "cr", "Replacement", False, False),
+            sync.ObservedCommit(second, (replacement,), "c2", "Two", False, False),
+        ),
+    )
+    refs = observed.publication.destinations + (
+        sync.LiveRemoteRef(
+            sync.RemoteBranchRef(repository, f"refs/heads/{branch}"), None
+        ),
+    )
+    mixed = sync.MixedMembershipInput(
+        repository,
+        "main",
+        observed.stack,
+        (first, second_pr),
+        (
+            sync.ReplacementPRAssignment(first_id, replacement),
+            sync.ExistingPRAssignment(second_id, second),
+        ),
+        local,
+        refs,
+        observed.tracked_state,
+    )
+
+    plan = sync.plan_mixed_membership(mixed)
+
+    assert isinstance(plan, sync.MixedMembershipPlan)
+    assert plan.replacements == ((first_id, plan.new_goals[0]),)
+    server.seed_branch(repository, branch, replacement)
+    monkeypatch.setattr(
+        sync.SubprocessGitTransport,
+        "observe_live_refs",
+        lambda *_args, **_kwargs: (
+            sync.LiveRemoteRef(
+                sync.RemoteBranchRef(repository, f"refs/heads/{branch}"), replacement
+            ),
+        ),
+    )
+    if lose_create_response:
+        with github.lose_response(sync.GitHubClient.create_pull_request):
+            result = sync.apply_mixed_membership(plan, jj_repo, github, "push")
+    else:
+        result = sync.apply_mixed_membership(plan, jj_repo, github, "push")
+
+    assert isinstance(result, sync.Verified)
+    state = sync.read_state(jj_repo)[1]
+    assert state.stacks[0].ordered_prs[0] != first_id
+    assert state.stacks[0].ordered_prs[1] == second_id
+    assert first_id in {item.pr for item in state.detached_associations}
+    created = server.read_find_pull_requests(repository, head_branches=(branch,))
+    assert len(created) == 1 and created[0].identity == state.stacks[0].ordered_prs[0]
+
+
+def test_mixed_membership_does_not_infer_adjacent_replacement(
+    jj_repo: Path, monkeypatch
+) -> None:
+    plan, _server, _github = mixed_membership_case(jj_repo, monkeypatch, "middle")
+    assert plan.replacements == ()
+    assert len(plan.goal.removed) == 0
+
+
+def test_started_replacement_recovers_without_fresh_explicit_authority(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, _append, server, github = stack_append_case(jj_repo, monkeypatch)
+    repository = observed.publication.repository
+    base, replacement, second = (value * 40 for value in "042")
+    first_id, second_id = observed.stack.pull_requests
+    first, second_pr = server.read_pull_requests((first_id, second_id))
+    branch = f"{first.head_branch}-replacement"
+    local = dataclasses.replace(
+        observed.publication.local,
+        commits=(
+            sync.ObservedCommit(replacement, (base,), "cr", "Replacement", False, False),
+            sync.ObservedCommit(second, (replacement,), "c2", "Two", False, False),
+        ),
+    )
+    absent_refs = observed.publication.destinations + (
+        sync.LiveRemoteRef(
+            sync.RemoteBranchRef(repository, f"refs/heads/{branch}"), None
+        ),
+    )
+    explicit = sync.plan_mixed_membership(sync.MixedMembershipInput(
+        repository,
+        "main",
+        observed.stack,
+        (first, second_pr),
+        (
+            sync.ReplacementPRAssignment(first_id, replacement),
+            sync.ExistingPRAssignment(second_id, second),
+        ),
+        local,
+        absent_refs,
+        observed.tracked_state,
+    ))
+    assert isinstance(explicit, sync.MixedMembershipPlan)
+    publication = sync.RecoveryEntry(
+        "replacement-publication",
+        sync.BranchCreationAttempt(
+            repository, "push", explicit.new_goals, explicit.replacements
+        ),
+        True,
+    )
+    sync.cas_write_recovery(
+        jj_repo, None, sync.RecoveryJournal((publication,))
+    )
+    server.seed_branch(repository, branch, replacement)
+    present_refs = tuple(
+        dataclasses.replace(item, commit_id=replacement)
+        if item.ref.full_name == f"refs/heads/{branch}"
+        else item
+        for item in absent_refs
+    )
+    monkeypatch.setattr(
+        sync.SubprocessGitTransport,
+        "observe_live_refs",
+        lambda *_args, **_kwargs: (
+            sync.LiveRemoteRef(
+                sync.RemoteBranchRef(repository, f"refs/heads/{branch}"), replacement
+            ),
+        ),
+    )
+    facts = sync.settle_recovery(jj_repo, github)
+    recovered = sync.plan_mixed_membership(sync.MixedMembershipInput(
+        repository,
+        "main",
+        observed.stack,
+        (first, second_pr),
+        (
+            sync.ExistingPRAssignment(first_id, replacement),
+            sync.ExistingPRAssignment(second_id, second),
+        ),
+        local,
+        present_refs,
+        observed.tracked_state,
+        recovery_facts=facts,
+    ))
+
+    assert isinstance(recovered, sync.MixedMembershipPlan)
+    assert recovered.replacements == explicit.replacements
+    result = sync.apply_mixed_membership(recovered, jj_repo, github, "push")
+    assert isinstance(result, sync.Verified)
+    state = sync.read_state(jj_repo)[1]
+    assert state.stacks[0].ordered_prs[0] != first_id
+    assert first_id in {item.pr for item in state.detached_associations}
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_replacement_branch_allocation_avoids_all_historical_pr_usage(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, _append, server, _github = stack_append_case(jj_repo, monkeypatch)
+    repository = observed.publication.repository
+    first, second = server.read_pull_requests(observed.stack.pull_requests)
+    base, replacement = "0" * 40, "4" * 40
+    stem = f"{first.head_branch}-replacement"
+    historical = (
+        dataclasses.replace(
+            first,
+            identity=sync.PullRequestId(repository, 10),
+            node_id="PR_10",
+            state=sync.PullRequestState.CLOSED,
+            head_branch=stem,
+        ),
+        dataclasses.replace(
+            first,
+            identity=sync.PullRequestId(repository, 11),
+            node_id="PR_11",
+            state=sync.PullRequestState.MERGED,
+            head_branch="historical-11",
+            base_branch=f"{stem}-2",
+        ),
+        dataclasses.replace(
+            first,
+            identity=sync.PullRequestId(repository, 12),
+            node_id="PR_12",
+            state=sync.PullRequestState.OPEN,
+            head_branch=f"{stem}-3",
+        ),
+    )
+    refs = observed.publication.destinations + tuple(
+        sync.LiveRemoteRef(
+            sync.RemoteBranchRef(repository, f"refs/heads/{name}"), None
+        )
+        for name in (stem, f"{stem}-2", f"{stem}-3", f"{stem}-4")
+    )
+    local = dataclasses.replace(
+        observed.publication.local,
+        commits=(
+            sync.ObservedCommit(replacement, (base,), "cr", "Replacement", False, False),
+            sync.ObservedCommit(second.head_oid, (replacement,), "c2", "Two", False, False),
+        ),
+    )
+
+    plan = sync.plan_mixed_membership(sync.MixedMembershipInput(
+        repository,
+        "main",
+        observed.stack,
+        (first, second),
+        (
+            sync.ReplacementPRAssignment(first.identity, replacement),
+            sync.ExistingPRAssignment(second.identity, second.head_oid),
+        ),
+        local,
+        refs,
+        observed.tracked_state,
+        historical,
+    ))
+
+    assert isinstance(plan, sync.MixedMembershipPlan)
+    assert plan.new_goals[0].branch_name == f"{stem}-4"
+
+
+def test_replacement_composes_with_retained_and_ordinary_new_members(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, _append, server, github = stack_append_case(jj_repo, monkeypatch)
+    repository = observed.publication.repository
+    base, new, replacement, second = (value * 40 for value in "0342")
+    first_id, second_id = observed.stack.pull_requests
+    first, second_pr = server.read_pull_requests((first_id, second_id))
+    replacement_branch = f"{first.head_branch}-replacement"
+    refs = observed.publication.destinations + (
+        sync.LiveRemoteRef(
+            sync.RemoteBranchRef(
+                repository, f"refs/heads/{replacement_branch}"
+            ),
+            None,
+        ),
+    )
+    local = dataclasses.replace(
+        observed.publication.local,
+        commits=(
+            sync.ObservedCommit(replacement, (base,), "cr", "Replacement", False, False),
+            sync.ObservedCommit(new, (replacement,), "cn", "New", False, False),
+            sync.ObservedCommit(second, (new,), "c2", "Two", False, False),
+        ),
+    )
+    plan = sync.plan_mixed_membership(sync.MixedMembershipInput(
+        repository,
+        "main",
+        observed.stack,
+        (first, second_pr),
+        (
+            sync.ReplacementPRAssignment(first_id, replacement),
+            sync.NewPRAssignment(new, "new"),
+            sync.ExistingPRAssignment(second_id, second),
+        ),
+        local,
+        refs,
+        observed.tracked_state,
+    ))
+    assert isinstance(plan, sync.MixedMembershipPlan)
+    server.seed_branch(repository, replacement_branch, replacement)
+    monkeypatch.setattr(
+        sync.SubprocessGitTransport,
+        "observe_live_refs",
+        lambda *_args, **_kwargs: tuple(
+            sync.LiveRemoteRef(
+                sync.RemoteBranchRef(
+                    repository, f"refs/heads/{goal.branch_name}"
+                ),
+                goal.commit_id,
+            )
+            for goal in plan.new_goals
+        ),
+    )
+
+    result = sync.apply_mixed_membership(plan, jj_repo, github, "push")
+
+    assert isinstance(result, sync.Verified)
+    state = sync.read_state(jj_repo)[1]
+    members = state.stacks[0].ordered_prs
+    assert len(members) == 3 and members[-1] == second_id
+    assert first_id not in members
+    assert first_id in {item.pr for item in state.detached_associations}
+    prs = server.read_pull_requests(members)
+    assert tuple(pr.base_branch for pr in prs) == (
+        "main", replacement_branch, "new"
+    )
 
 
 if __name__ == "__main__":

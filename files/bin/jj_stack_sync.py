@@ -594,9 +594,23 @@ class NewPRAssignment:
     branch_name: str
 
 
+@dataclass(frozen=True)
+class ReplacementPRAssignment:
+    """Invocation-local authority to replace one qualified PR identity.
+
+    Unlike a new assignment, the branch is deliberately allocated by the
+    planner.  This keeps the authority tied to both the selected old identity
+    and the selected local position/change.
+    """
+
+    pr_identity: PullRequestId
+    commit_id: str
+
+
 MembershipAssignment = (
     ExistingPRAssignment
     | NewPRAssignment
+    | ReplacementPRAssignment
 )
 
 
@@ -685,6 +699,7 @@ class MixedMembershipPlan:
     new_goals: tuple[NewPullRequestGoal, ...]
     acquired_publications: tuple[tuple[PullRequestId, NewPullRequestGoal], ...] = ()
     abandoned_publications: tuple[tuple[PullRequestId, NewPullRequestGoal], ...] = ()
+    replacements: tuple[tuple[PullRequestId, NewPullRequestGoal], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -981,6 +996,7 @@ class BranchCreationAttempt:
     repository: GitHubRepositoryId
     push_url: str
     goals: tuple[NewPullRequestGoal, ...]
+    replacements: tuple[tuple[PullRequestId, NewPullRequestGoal], ...] = ()
 
     def __post_init__(self) -> None:
         names = tuple(goal.branch_name for goal in self.goals)
@@ -989,6 +1005,11 @@ class BranchCreationAttempt:
             or not self.push_url
             or not self.goals
             or len(set(names)) != len(names)
+            or len({old for old, _goal in self.replacements}) != len(self.replacements)
+            or any(
+                old.repository != self.repository or goal not in self.goals
+                for old, goal in self.replacements
+            )
         ):
             raise ValueError("branch creation requires a push URL and goals")
 
@@ -1192,7 +1213,7 @@ def _attempt_resources(attempt: MutationAttempt) -> _MutationResources:
     if isinstance(attempt, BranchCreationAttempt):
         return _MutationResources(
             attempt.repository,
-            frozenset(),
+            frozenset(pr for pr, _goal in attempt.replacements),
             frozenset(RemoteBranchRef(
                 attempt.repository, f"refs/heads/{goal.branch_name}"
             ) for goal in attempt.goals),
@@ -3173,6 +3194,10 @@ def _recovery_entry_to_dict(entry: RecoveryEntry) -> dict[str, object]:
             "possibly_live": entry.possibly_live,
             "repository": asdict(attempt.repository), "push_url": attempt.push_url,
             "goals": [asdict(goal) for goal in attempt.goals],
+            "replacements": [
+                {"pr": old.number, "goal": asdict(goal)}
+                for old, goal in attempt.replacements
+            ],
         }
     elif isinstance(attempt, PullRequestCreationAttempt):
         payload = {
@@ -3285,7 +3310,7 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
         if kind == "exact-pr"
         else common_fields | {"base_branch", "pull_requests"}
         if kind == "mixed-group"
-        else common_fields | {"push_url", "goals"}
+        else common_fields | {"push_url", "goals", "replacements"}
         if kind == "create-branches"
         else common_fields | {"goal", "pull_request"}
         if kind == "create-pr"
@@ -3427,11 +3452,24 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
             tuple(PullRequestId(repository, number) for number in numbers))
     elif kind == "create-branches":
         goals = raw["goals"]
-        if not isinstance(goals, list):
+        replacements = raw["replacements"]
+        if not isinstance(goals, list) or not isinstance(replacements, list):
             raise ValueError("branch creation goals must be an array")
         parsed_goals = tuple(NewPullRequestGoal(**goal) for goal in goals)
+        parsed_replacements = tuple(
+            (
+                PullRequestId(repository, item["pr"]),
+                NewPullRequestGoal(**item["goal"]),
+            )
+            for item in replacements
+            if isinstance(item, dict)
+            and set(item) == {"pr", "goal"}
+            and isinstance(item["goal"], dict)
+        )
+        if len(parsed_replacements) != len(replacements):
+            raise ValueError("branch creation replacement bindings are malformed")
         attempt = BranchCreationAttempt(
-            repository, raw["push_url"], parsed_goals
+            repository, raw["push_url"], parsed_goals, parsed_replacements
         )
     elif kind == "create-pr":
         goal = raw["goal"]
@@ -3959,13 +3997,53 @@ def plan_mixed_membership(
                         "detached source base is not explained by recovery provenance",
                     )
 
+    started_replacements: dict[PullRequestId, NewPullRequestGoal] = {}
+    for entry in observed.recovery_facts:
+        attempt = entry.attempt
+        if (not entry.possibly_live or not isinstance(attempt, BranchCreationAttempt)
+                or attempt.repository != observed.repository):
+            continue
+        for old, goal in attempt.replacements:
+            if old not in source_ids:
+                continue
+            previous = started_replacements.get(old)
+            if previous is not None and previous != goal:
+                return _block(
+                    "ambiguous-replacement", f"PR #{old.number}",
+                    "multiple started replacement candidates overlap one identity",
+                )
+            started_replacements[old] = goal
+    explicit_replacements = [
+        item for item in observed.ordered
+        if isinstance(item, ReplacementPRAssignment)
+    ]
+    recovered_replacement_ids = {
+        item.pr_identity
+        for item in observed.ordered
+        if isinstance(item, ExistingPRAssignment)
+        and started_replacements.get(item.pr_identity) is not None
+        and started_replacements[item.pr_identity].commit_id == item.commit_id
+    }
     existing = [
         item for item in observed.ordered
         if isinstance(item, (ExistingPRAssignment,))
+        and item.pr_identity not in recovered_replacement_ids
     ]
     existing_ids = tuple(item.pr_identity for item in existing)
     if len(existing_ids) != len(set(existing_ids)) or not set(existing_ids) <= set(source_ids):
         return _block("foreign-identity", "stack", "existing selections must be unique source identities")
+    replacement_ids = tuple(
+        item.pr_identity for item in explicit_replacements
+    ) + tuple(recovered_replacement_ids)
+    if (
+        len(replacement_ids) != len(set(replacement_ids))
+        or not set(replacement_ids) <= set(source_ids)
+        or set(replacement_ids).intersection(existing_ids)
+    ):
+        return _block(
+            "replacement-unauthorized", "stack",
+            "replacement identities must be unique omitted source identities",
+        )
     new = [item for item in observed.ordered if isinstance(item, NewPRAssignment)]
     new_names = tuple(item.branch_name for item in new)
     if len(new_names) != len(set(new_names)) or any(not name or f"refs/heads/{name}" not in refs for name in new_names):
@@ -3986,6 +4064,7 @@ def plan_mixed_membership(
     ordered: list[PullRequestId | NewPullRequestGoal] = []
     desired_metadata: list[tuple[str, str]] = []
     new_goals: list[NewPullRequestGoal] = []
+    replacement_goals: list[tuple[PullRequestId, NewPullRequestGoal]] = []
     historical_names = {
         name
         for pr in (*observed.pull_requests, *observed.historical_pull_requests)
@@ -3996,6 +4075,29 @@ def plan_mixed_membership(
         if name
     }
 
+    def replacement_branch(old: GitHubPullRequest, commit_id: str) -> str | None:
+        stem = f"{old.head_branch}-replacement"
+        recovered = {
+            goal.branch_name
+            for identity, goal in started_replacements.items()
+            if identity == old.identity and goal.commit_id == commit_id
+        }
+        if len(recovered) > 1:
+            return None
+        if recovered:
+            return recovered.pop()
+        for suffix in range(1, 10001):
+            candidate = stem if suffix == 1 else f"{stem}-{suffix}"
+            if candidate in historical_names:
+                continue
+            ref = f"refs/heads/{candidate}"
+            if ref not in refs:
+                continue
+            if refs[ref] is None:
+                historical_names.add(candidate)
+                return candidate
+        return None
+
     for assignment in observed.ordered:
         commit = commits.get(assignment.commit_id)
         if commit is None or commit.is_hidden or commit.has_conflicts or commit.parent_commit_ids != (predecessor,):
@@ -4003,12 +4105,33 @@ def plan_mixed_membership(
         metadata = _metadata(commit.description)
         if metadata is None:
             return _block("title-missing", assignment.commit_id, "selected commit has no title")
-        if isinstance(assignment, (ExistingPRAssignment,)):
+        recovered_replacement = (
+            started_replacements.get(assignment.pr_identity)
+            if isinstance(assignment, ExistingPRAssignment)
+            else None
+        )
+        if isinstance(
+            assignment, (ExistingPRAssignment,)
+        ) and recovered_replacement is None:
             ordered.append(assignment.pr_identity)
             pr = next(pr for pr in observed.pull_requests if pr.identity == assignment.pr_identity)
             predecessor_branch = pr.head_branch
         else:
-            branch_name = assignment.branch_name
+            if recovered_replacement is not None:
+                old = next(pr for pr in observed.pull_requests
+                    if pr.identity == assignment.pr_identity)
+                branch_name = recovered_replacement.branch_name
+            elif isinstance(assignment, ReplacementPRAssignment):
+                old = next(pr for pr in observed.pull_requests
+                    if pr.identity == assignment.pr_identity)
+                branch_name = replacement_branch(old, assignment.commit_id)
+                if branch_name is None:
+                    return _block(
+                        "replacement-branch-unavailable", f"PR #{old.number}",
+                        "no observed fresh deterministic replacement branch is available",
+                    )
+            else:
+                branch_name = assignment.branch_name
             destination = refs[f"refs/heads/{branch_name}"]
             owned = any(
                 isinstance(entry.attempt, BranchCreationAttempt)
@@ -4019,10 +4142,20 @@ def plan_mixed_membership(
             if destination is not None and (destination != assignment.commit_id or not owned):
                 return _block("remote-publication-collision", branch_name, "new destination is occupied without exact recovery ownership")
             title, body = metadata
-            goal = NewPullRequestGoal(
-                assignment.commit_id, branch_name, predecessor_branch, title, body,
+            goal = (
+                recovered_replacement
+                if recovered_replacement is not None
+                else NewPullRequestGoal(
+                    assignment.commit_id,
+                    branch_name,
+                    predecessor_branch,
+                    title,
+                    body,
+                )
             )
             new_goals.append(goal)
+            if isinstance(assignment, ReplacementPRAssignment) or recovered_replacement is not None:
+                replacement_goals.append((assignment.pr_identity, goal))
             recovered = tuple(
                 entry.attempt.pull_request for entry in observed.recovery_facts
                 if isinstance(entry.attempt, PullRequestCreationAttempt)
@@ -4088,6 +4221,7 @@ def plan_mixed_membership(
         MixedMembershipGoal(observed.repository, observed.base_branch, tuple(ordered), removed),
         observed.source_stack, observed.pull_requests, observed.live_refs, observed.ordered,
         tuple(desired_metadata), tuple(new_goals), active_acquired, abandoned_acquired,
+        tuple(replacement_goals),
     )
 
 
@@ -6795,6 +6929,7 @@ def _mixed_conflict(entry: RecoveryEntry, plan: MixedMembershipPlan) -> bool:
             any(goal.branch_name in branches for goal in attempt.goals)
             and (
                 attempt.goals != absorbed_goals
+                or attempt.replacements != plan.replacements
             )
         )
     if isinstance(attempt, HeadMutationAttempt):
@@ -6926,6 +7061,7 @@ def apply_mixed_membership(
                 isinstance(entry.attempt, BranchCreationAttempt)
                 and entry.attempt.repository == plan.goal.repository
                 and entry.attempt.goals == plan.new_goals
+                and entry.attempt.replacements == plan.replacements
                 and _classify_attempt(workspace, github, entry.attempt, git)
                 != "applied"
             ):
@@ -7069,12 +7205,13 @@ def apply_mixed_membership(
             owned = any(isinstance(entry.attempt, BranchCreationAttempt)
                 and entry.attempt.repository == plan.goal.repository
                 and entry.attempt.goals == goals
+                and entry.attempt.replacements == plan.replacements
                 for entry in facts)
             if current != wanted:
                 if any(value is not None for value in current):
                     return Stopped("heads", "a new publication destination changed")
                 attempt = BranchCreationAttempt(
-                    plan.goal.repository, push_url, goals
+                    plan.goal.repository, push_url, goals, plan.replacements
                 )
                 oid, entry = _append_recovery(workspace, attempt)
                 live = replace(entry, possibly_live=True)
@@ -7282,6 +7419,7 @@ def apply_mixed_membership(
                 or isinstance(entry.attempt, BranchCreationAttempt)
                 and entry.attempt.repository == plan.goal.repository
                 and entry.attempt.goals == absorbed_goals
+                and entry.attempt.replacements == plan.replacements
                 or isinstance(entry.attempt, PullRequestCreationAttempt)
                 and entry.attempt.repository == plan.goal.repository
                 and entry.attempt.goal in goal_set
