@@ -678,6 +678,29 @@ class StackAppendPlan:
 
 
 @dataclass(frozen=True)
+class RetainedTopologyInput:
+    """Complete evidence used to reinterpret an already-known stack."""
+
+    repository: GitHubRepositoryId
+    source_stack: GitHubStack
+    pull_requests: tuple[GitHubPullRequest, ...]
+    live_refs: tuple[LiveRemoteRef, ...]
+    tracked_state: TrackedState
+    desired: StackSelection
+    recovery_facts: tuple[RecoveryEntry, ...] = ()
+
+
+@dataclass(frozen=True)
+class RetainedTopologyPlan:
+    repository: GitHubRepositoryId
+    source_stack: GitHubStack
+    source_pull_requests: tuple[GitHubPullRequest, ...]
+    live_refs: tuple[LiveRemoteRef, ...]
+    desired: StackSelection
+    dissolve: bool
+
+
+@dataclass(frozen=True)
 class DesiredStack:
     repository: GitHubRepositoryId
     base_branch: str
@@ -928,6 +951,69 @@ class StackAppendAttempt:
 
 
 @dataclass(frozen=True)
+class StackDissolutionAttempt:
+    """Exact provenance for an unstack request; not a procedural target."""
+
+    repository: GitHubRepositoryId
+    stack: GitHubStackId
+    stack_node_id: str
+    base_branch: str
+    members: tuple[PullRequestId, ...]
+    pull_requests: tuple[GitHubPullRequest, ...]
+    live_refs: tuple[LiveRemoteRef, ...]
+    tracking: TrackedStack
+    ownership: tuple[LastPublishedHead | LastAdoptedHead, ...]
+
+    def __post_init__(self) -> None:
+        expected_summary = GitHubStackSummary(
+            self.stack, self.stack_node_id, self.base_branch
+        )
+        expected_heads = {
+            (
+                pr.identity,
+                f"refs/heads/{pr.head_branch}",
+                pr.head_oid,
+            )
+            for pr in self.pull_requests
+        }
+        observed_heads = {
+            (item.ref.full_name, item.commit_id) for item in self.live_refs
+        }
+        expected_live_refs = {
+            (ref, oid) for _pr, ref, oid in expected_heads
+        } | {
+            (f"refs/heads/{self.base_branch}", self.pull_requests[0].base_oid)
+        }
+        owned_heads = {
+            (item.pr, item.ref.full_name, item.verified_commit_id)
+            for item in self.ownership
+        }
+        if (
+            self.stack.repository != self.repository
+            or not isinstance(self.stack_node_id, str)
+            or not self.stack_node_id
+            or not isinstance(self.base_branch, str)
+            or not self.base_branch
+            or not self.members
+            or len(set(self.members)) != len(self.members)
+            or tuple(pr.identity for pr in self.pull_requests) != self.members
+            or any(
+                pr.head_repository != self.repository
+                or pr.head_oid is None
+                or pr.base_oid is None
+                or pr.stack != expected_summary
+                for pr in self.pull_requests
+            )
+            or observed_heads != expected_live_refs
+            or owned_heads != expected_heads
+            or self.tracking.repository != self.repository
+            or self.tracking.base_branch != self.base_branch
+            or self.tracking.ordered_prs != self.members
+        ):
+            raise ValueError("stack dissolution provenance is malformed")
+
+
+@dataclass(frozen=True)
 class AdoptionAttempt:
     repository: GitHubRepositoryId
     remote: str
@@ -947,8 +1033,120 @@ MutationAttempt = (
     | PullRequestCreationAttempt
     | StackCreationAttempt
     | StackAppendAttempt
+    | StackDissolutionAttempt
 )
 
+
+@dataclass(frozen=True)
+class _MutationResources:
+    """Server resources whose authority cannot be exercised concurrently."""
+
+    repository: GitHubRepositoryId
+    pull_requests: frozenset[PullRequestId] = frozenset()
+    refs: frozenset[RemoteBranchRef] = frozenset()
+    stacks: frozenset[GitHubStackId] = frozenset()
+    base_mutations: frozenset[PullRequestId] = frozenset()
+
+
+def _attempt_resources(attempt: MutationAttempt) -> _MutationResources:
+    if isinstance(attempt, HeadMutationAttempt):
+        return _MutationResources(
+            attempt.repository,
+            frozenset(attempt.tracking.ordered_prs),
+            frozenset(update.ref for update in attempt.updates),
+        )
+    if isinstance(attempt, MetadataMutationAttempt):
+        return _MutationResources(
+            attempt.repository, frozenset((attempt.update.pr_identity,))
+        )
+    if isinstance(attempt, BranchCreationAttempt):
+        return _MutationResources(
+            attempt.repository,
+            frozenset(),
+            frozenset(RemoteBranchRef(
+                attempt.repository, f"refs/heads/{goal.branch_name}"
+            ) for goal in attempt.goals),
+        )
+    if isinstance(attempt, PullRequestCreationAttempt):
+        return _MutationResources(
+            attempt.repository,
+            frozenset(() if attempt.pull_request is None else (attempt.pull_request,)),
+            frozenset((RemoteBranchRef(
+                attempt.repository, f"refs/heads/{attempt.goal.branch_name}"
+            ),)),
+        )
+    if isinstance(attempt, StackCreationAttempt):
+        members = frozenset(attempt.pull_requests)
+        return _MutationResources(
+            attempt.repository, members,
+            frozenset(RemoteBranchRef(
+                attempt.repository, f"refs/heads/{goal.branch_name}"
+            ) for goal in attempt.goals),
+            base_mutations=members,
+        )
+    if isinstance(attempt, StackAppendAttempt):
+        members = frozenset(attempt.old_members + attempt.additions)
+        return _MutationResources(
+            attempt.repository, members,
+            frozenset(RemoteBranchRef(
+                attempt.repository, f"refs/heads/{goal.branch_name}"
+            ) for goal in attempt.goals),
+            frozenset((attempt.stack,)), members,
+        )
+    if isinstance(attempt, StackDissolutionAttempt):
+        members = frozenset(attempt.members)
+        return _MutationResources(
+            attempt.repository, members,
+            frozenset(item.ref for item in attempt.live_refs),
+            frozenset((attempt.stack,)), members,
+        )
+    assert isinstance(attempt, AdoptionAttempt)
+    return _MutationResources(
+        attempt.repository,
+        frozenset(item.pr_identity for item in attempt.boundaries),
+        frozenset(RemoteBranchRef(
+            attempt.repository, f"refs/heads/{item.branch}"
+        ) for item in attempt.boundaries),
+    )
+
+
+def _resources_conflict(
+    left: _MutationResources, right: _MutationResources
+) -> bool:
+    if left.repository != right.repository:
+        return False
+    return bool(
+        left.pull_requests & right.pull_requests
+        or left.refs & right.refs
+        or left.stacks & right.stacks
+        or left.base_mutations & right.pull_requests
+        or right.base_mutations & left.pull_requests
+    )
+
+
+def _plan_resources(plan: NoOp | Apply | FirstPublicationPlan | StackAppendPlan | RetainedTopologyPlan) -> _MutationResources | None:
+    if isinstance(plan, (NoOp, Apply)):
+        repository = plan.desired.repository
+        prs = frozenset((pr.identity for pr in plan.dependencies.prs))
+        refs = frozenset({*(item.ref for item in plan.dependencies.live_heads), *(item.ref for item in plan.dependencies.live_bases), *(RemoteBranchRef(repository, f'refs/heads/{pr.head_branch}') for pr in plan.dependencies.prs)})
+        base_mutations = frozenset((update.pr_identity for update in plan.metadata_updates)) if isinstance(plan, Apply) else frozenset()
+        return _MutationResources(repository, prs, refs, base_mutations=base_mutations)
+    if isinstance(plan, FirstPublicationPlan):
+        repository = plan.goal.repository
+        return _MutationResources(repository, frozenset((pr.identity for pr in plan.historical_pull_requests)), frozenset((RemoteBranchRef(repository, f'refs/heads/{goal.branch_name}') for goal in plan.goal.pull_requests)))
+    if isinstance(plan, StackAppendPlan):
+        repository = plan.goal.repository
+        members = frozenset({*plan.goal.old_members, *(pr.identity for pr in plan.existing_pull_requests)})
+        return _MutationResources(repository, members, frozenset((RemoteBranchRef(repository, f'refs/heads/{goal.branch_name}') for goal in plan.goal.pull_requests)), frozenset((plan.goal.stack,)), members)
+    if isinstance(plan, RetainedTopologyPlan):
+        members = frozenset(plan.source_stack.pull_requests)
+        return _MutationResources(plan.repository, members, frozenset((item.ref for item in plan.live_refs)), frozenset((plan.source_stack.identity,)), members if plan.dissolve else frozenset())
+    repositories = {item.pr.repository for item in plan.selected + plan.retire}
+    if len(repositories) != 1:
+        return None
+    repository = next(iter(repositories))
+    associations = plan.selected + plan.retire
+    return _MutationResources(repository, frozenset((item.pr for item in associations)), frozenset((item.ref for item in associations)))
 
 @dataclass(frozen=True)
 class RecoveryEntry:
@@ -2795,6 +2993,23 @@ def _recovery_entry_to_dict(entry: RecoveryEntry) -> dict[str, object]:
             "additions": [pr.number for pr in attempt.additions],
             "goals": [asdict(goal) for goal in attempt.goals],
         }
+    elif isinstance(attempt, StackDissolutionAttempt):
+        payload = {
+            "kind": "unstack", "identity": entry.identity,
+            "possibly_live": entry.possibly_live,
+            "repository": asdict(attempt.repository),
+            "stack": attempt.stack.number, "stack_node_id": attempt.stack_node_id,
+            "base_branch": attempt.base_branch,
+            "members": [pr.number for pr in attempt.members],
+            "pull_requests": [asdict(pr) for pr in attempt.pull_requests],
+            "live_refs": [asdict(ref) for ref in attempt.live_refs],
+            "ownership": [
+                {"kind": "published" if isinstance(item, LastPublishedHead) else "adopted",
+                 "pr": item.pr.number, "ref": item.ref.full_name,
+                 "commit": item.verified_commit_id}
+                for item in attempt.ownership
+            ],
+        }
     else:
         raise ValueError("unknown recovery attempt")
     return payload
@@ -2810,6 +3025,27 @@ def parse_recovery(data: str) -> RecoveryJournal:
         return RecoveryJournal(tuple(_parse_recovery_entry(item) for item in raw["entries"]))
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise Error(f"invalid {RECOVERY_REF} payload: {exc}") from exc
+
+
+def _pull_request_from_recovery(raw: object, repository: GitHubRepositoryId) -> GitHubPullRequest:
+    if not isinstance(raw, dict):
+        raise ValueError("unstack pull request is malformed")
+    identity = raw.get("identity")
+    if not isinstance(identity, dict) or identity.get("repository") != asdict(repository):
+        raise ValueError("unstack pull request identity is malformed")
+    head_repository = raw.get("head_repository")
+    stack = raw.get("stack")
+    return GitHubPullRequest(
+        PullRequestId(repository, identity["number"]), raw["node_id"],
+        PullRequestState(raw["state"]), raw["draft"],
+        None if head_repository is None else GitHubRepositoryId(**head_repository),
+        raw["head_branch"], raw["head_oid"], raw["base_branch"], raw["base_oid"],
+        raw["auto_merge_enabled"], raw["in_merge_queue"], raw["title"], raw["body"],
+        None if stack is None else GitHubStackSummary(
+            GitHubStackId(repository, stack["identity"]["number"]),
+            stack["node_id"], stack["base_branch"],
+        ),
+    )
 
 
 def _parse_recovery_entry(raw: object) -> RecoveryEntry:
@@ -2833,6 +3069,8 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
         if kind == 'create-stack'
         else common_fields | {'stack', 'stack_node_id', 'base_branch', 'old_members', 'additions', 'goals'}
         if kind == 'append-stack'
+        else common_fields | {'stack', 'stack_node_id', 'base_branch', 'members', 'pull_requests', 'live_refs', 'ownership'}
+        if kind == 'unstack'
         else None
     )
     if expected_fields is None or set(raw) != expected_fields:
@@ -2988,6 +3226,36 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
             tuple(PullRequestId(repository, number) for number in old_members),
             tuple(PullRequestId(repository, number) for number in additions),
             tuple(NewPullRequestGoal(**goal) for goal in goals),
+        )
+    elif kind == "unstack":
+        numbers = raw["members"]
+        prs_raw = raw["pull_requests"]
+        refs_raw = raw["live_refs"]
+        ownership_raw = raw["ownership"]
+        if not all(isinstance(value, list) for value in (numbers, prs_raw, refs_raw, ownership_raw)):
+            raise ValueError("unstack provenance arrays are malformed")
+        members = tuple(PullRequestId(repository, number) for number in numbers)
+        prs = tuple(_pull_request_from_recovery(item, repository) for item in prs_raw)
+        refs = tuple(
+            LiveRemoteRef(RemoteBranchRef(repository, item["ref"]["full_name"]), item["commit_id"])
+            for item in refs_raw
+            if isinstance(item, dict) and set(item) == {"ref", "commit_id"}
+            and isinstance(item["ref"], dict)
+        )
+        ownership: list[LastPublishedHead | LastAdoptedHead] = []
+        for item in ownership_raw:
+            if not isinstance(item, dict) or set(item) != {"kind", "pr", "ref", "commit"}:
+                raise ValueError("unstack ownership is malformed")
+            cls = LastPublishedHead if item["kind"] == "published" else LastAdoptedHead if item["kind"] == "adopted" else None
+            if cls is None:
+                raise ValueError("unstack ownership kind is malformed")
+            ownership.append(cls(PullRequestId(repository, item["pr"]), RemoteBranchRef(repository, item["ref"]), item["commit"]))
+        if len(refs) != len(refs_raw):
+            raise ValueError("unstack live refs are malformed")
+        attempt = StackDissolutionAttempt(
+            repository, GitHubStackId(repository, raw["stack"]), raw["stack_node_id"],
+            raw["base_branch"], members, prs, refs,
+            TrackedStack(repository, raw["base_branch"], members), tuple(ownership),
         )
     else:
         raise ValueError("unknown recovery attempt")
@@ -3503,6 +3771,69 @@ def plan_stack_append(observed: StackAppendInput) -> StackAppendPlan | Blocked:
         ),
         planned.local, planned.destinations, planned.historical_pull_requests,
         observed.pull_requests,
+    )
+
+
+def plan_retained_topology(
+    observed: RetainedTopologyInput,
+) -> RetainedTopologyPlan | Blocked:
+    """Derive today's retained identities, using dissolution facts as provenance."""
+    source = observed.source_stack
+    provenance = tuple(
+        entry.attempt for entry in observed.recovery_facts
+        if isinstance(entry.attempt, StackDissolutionAttempt)
+        and entry.attempt.stack == source.identity
+    )
+    if provenance:
+        if len(provenance) != 1:
+            return _block("ambiguous-provenance", "stack", "multiple dissolution facts overlap")
+        source = GitHubStack(
+            provenance[0].stack, provenance[0].stack_node_id,
+            provenance[0].base_branch, provenance[0].members,
+        )
+    if source.identity.repository != observed.repository:
+        return _block("repository-mismatch", "stack", "source stack belongs elsewhere")
+    prs = observed.pull_requests
+    if tuple(pr.identity for pr in prs) != source.pull_requests:
+        return _block("incomplete-membership", "stack", "complete source membership is required")
+    desired_ids = tuple(item.pr_identity for item in observed.desired.ordered)
+    if not desired_ids or len(set(desired_ids)) != len(desired_ids) or not set(desired_ids) <= set(source.pull_requests):
+        return _block("unknown-retained-pr", "stack", "retained identities must be a nonempty source subset")
+    refs = {item.ref.full_name: item.commit_id for item in observed.live_refs}
+    if len(refs) != len(observed.live_refs) or any(
+        pr.head_repository != observed.repository or pr.head_oid is None
+        or refs.get(f"refs/heads/{pr.head_branch}") != pr.head_oid
+        for pr in prs
+    ):
+        return _block("head-disagrees", "stack", "source heads are not exact and repository-local")
+    tracking = tuple(stack for stack in observed.tracked_state.stacks
+        if stack.repository == observed.repository and stack.base_branch == source.base_branch
+        and stack.ordered_prs == source.pull_requests)
+    authority = observed.tracked_state.last_published_heads + observed.tracked_state.last_adopted_heads
+    if len(tracking) != 1 or any(not any(
+        item.pr == pr.identity and item.ref.full_name == f"refs/heads/{pr.head_branch}"
+        and item.verified_commit_id == pr.head_oid for item in authority
+    ) for pr in prs):
+        return _block("untracked-source", "stack", "exact topology and head ownership are required")
+    positions = {identity: index for index, identity in enumerate(desired_ids)}
+    groups: dict[GitHubStackSummary, list[PullRequestId]] = {}
+    for pr in prs:
+        if pr.stack is not None:
+            groups.setdefault(pr.stack, []).append(pr.identity)
+    obstructing_group = False
+    for identities in groups.values():
+        if any(identity not in positions for identity in identities):
+            obstructing_group = True
+            break
+        selected_positions = tuple(positions[identity] for identity in identities)
+        if selected_positions != tuple(
+            range(selected_positions[0], selected_positions[0] + len(identities))
+        ):
+            obstructing_group = True
+            break
+    return RetainedTopologyPlan(
+        observed.repository, source, prs, observed.live_refs, observed.desired,
+        dissolve=obstructing_group,
     )
 
 
@@ -4251,6 +4582,62 @@ def _classify_attempt(
             additions = github.pull_requests(attempt.additions)
             return "not-applied" if all(pr.stack is None for pr in additions) else "foreign"
         return "foreign"
+    if isinstance(attempt, StackDissolutionAttempt):
+        repository = github.resolve_repository(attempt.repository)
+        stack = github.stack(repository, attempt.stack)
+        prs = github.pull_requests(attempt.members)
+        if len(prs) != len(attempt.members) or tuple(pr.identity for pr in prs) != attempt.members:
+            return "foreign"
+        original = {pr.identity: pr for pr in attempt.pull_requests}
+        if any(
+            pr.head_repository != attempt.repository
+            or pr.head_branch != original[pr.identity].head_branch
+            or pr.head_oid != original[pr.identity].head_oid
+            or pr.base_branch != original[pr.identity].base_branch
+            or pr.base_oid != original[pr.identity].base_oid
+            for pr in prs
+        ):
+            return "foreign"
+        if stack is not None:
+            summary = GitHubStackSummary(
+                stack.identity, stack.node_id, stack.base_branch
+            )
+            if (
+                stack.node_id == attempt.stack_node_id
+                and stack.base_branch == attempt.base_branch
+                and stack.pull_requests == attempt.members
+                and all(pr.stack == summary for pr in prs)
+            ):
+                return "not-applied"
+            surviving = tuple(
+                identity for identity in attempt.members
+                if next(pr for pr in prs if pr.identity == identity).stack == summary
+            )
+            if (
+                stack.identity == attempt.stack
+                and stack.node_id == attempt.stack_node_id
+                and stack.base_branch == attempt.base_branch
+                and stack.pull_requests == surviving
+                and surviving
+                and all(pr.stack in (None, summary) for pr in prs)
+            ):
+                return "applied"
+            return "foreign"
+        groups = {pr.stack for pr in prs if pr.stack is not None}
+        if len(groups) > 1:
+            return "foreign"
+        if groups:
+            summary = next(iter(groups))
+            assert summary is not None
+            surviving = github.stack(repository, summary.identity)
+            if surviving is None or surviving.node_id != summary.node_id:
+                return "foreign"
+            source_order = tuple(pr for pr in attempt.members if pr in surviving.pull_requests)
+            if surviving.pull_requests != source_order or any(
+                pr.stack not in (None, summary) for pr in prs
+            ):
+                return "foreign"
+        return "applied"
     assert isinstance(attempt, MetadataMutationAttempt)
     prs = github.pull_requests((attempt.update.pr_identity,))
     if len(prs) != 1:
@@ -4344,6 +4731,10 @@ def settle_recovery(
             applied_stacks.append(entry.attempt)
         elif isinstance(entry.attempt, StackAppendAttempt):
             applied_appends.append(entry.attempt)
+        elif isinstance(entry.attempt, StackDissolutionAttempt):
+            # Applied dissolution is retained as identity provenance until the
+            # recomputed core result explicitly absorbs it.
+            remaining.append(entry)
         elif isinstance(entry.attempt, PullRequestCreationAttempt):
             goal = entry.attempt.goal
             matches = github.find_pull_requests(
@@ -4471,7 +4862,9 @@ def _attempt_conflicts_plan(entry: RecoveryEntry, plan: NoOp | Apply) -> bool:
             attempt.repository, f"refs/heads/{attempt.goal.branch_name}"
         )
         return ref in active_refs or attempt.pull_request in active_prs
-    if isinstance(attempt, StackCreationAttempt):
+    if isinstance(attempt, StackDissolutionAttempt):
+        members = attempt.members
+    elif isinstance(attempt, StackCreationAttempt):
         members = attempt.pull_requests
     elif isinstance(attempt, StackAppendAttempt):
         members = attempt.old_members + attempt.additions
@@ -4950,6 +5343,8 @@ def _append_conflict(entry: RecoveryEntry, plan: StackAppendPlan) -> bool:
         )
     if isinstance(attempt, MetadataMutationAttempt):
         return attempt.update.pr_identity in members
+    if isinstance(attempt, StackDissolutionAttempt):
+        return attempt.stack == plan.goal.stack or bool(set(attempt.members) & members)
     if isinstance(attempt, AdoptionAttempt):
         return any(
             boundary.pr_identity in members or boundary.branch in names
@@ -5141,6 +5536,153 @@ def apply_stack_append(
         except Error as exc:
             return Stopped("receipt", str(exc))
         return Verified(head_published=current != wanted, state_recorded=True)
+
+
+def apply_retained_topology(
+    plan: RetainedTopologyPlan,
+    workspace: str | Path,
+    github: GitHubClient,
+    *,
+    dry_run: bool = False,
+    git_transport: GitTransport | None = None,
+) -> ApplyResult:
+    """Dissolve only an obstructing association; retain the resulting provenance."""
+    if not plan.dissolve:
+        return Verified()
+    if dry_run:
+        return Verified()
+    with repository_lock(workspace):
+        _locked_oid, locked_journal = read_recovery(workspace)
+        unresolved = settle_recovery(
+            workspace, github, git_transport=git_transport
+        )
+        resources = _plan_resources(plan)
+        assert resources is not None
+        if any(_resources_conflict(
+                _attempt_resources(entry.attempt), resources
+        ) for entry in unresolved):
+            return Stopped("recovery", "an intersecting mutation remains unresolved")
+        _state_oid, state = read_state(workspace)
+        tracking = TrackedStack(
+            plan.repository, plan.source_stack.base_branch,
+            plan.source_stack.pull_requests,
+        )
+        ownership = tuple(item for item in
+            state.last_published_heads + state.last_adopted_heads
+            if item.pr in resources.pull_requests)
+        attempt = StackDissolutionAttempt(
+            plan.repository, plan.source_stack.identity, plan.source_stack.node_id,
+            plan.source_stack.base_branch, plan.source_stack.pull_requests,
+            plan.source_pull_requests, plan.live_refs, tracking, ownership,
+        )
+        try:
+            repository = github.resolve_repository(plan.repository)
+            classification = _classify_attempt(
+                workspace, github, attempt, git_transport
+            )
+            if classification != "not-applied":
+                return Stopped("stack", f"source topology is {classification}")
+            oid, entry = _append_recovery(workspace, attempt)
+            live = replace(entry, possibly_live=True)
+            _replace_recovery_entry(workspace, oid, live)
+            try:
+                github.unstack(repository, plan.source_stack.identity)
+            except GitHubTransportError:
+                pass
+            except GitHubHttpError:
+                # A complete rejection proves this request cannot arrive later.
+                current_oid, _journal = read_recovery(workspace)
+                assert current_oid is not None
+                _remove_recovery_entry(workspace, current_oid, entry.identity)
+                return Stopped("stack", "unstack was rejected")
+            result = _classify_attempt(
+                workspace, github, attempt, git_transport
+            )
+            if result != "applied":
+                return Stopped("stack", f"unstack is {result}")
+            # Move omitted members from active topology into durable private
+            # associations while the exact dissolution evidence is still bound.
+            desired_ids = tuple(item.pr_identity for item in plan.desired.ordered)
+            removed = set(plan.source_stack.pull_requests) - set(desired_ids)
+            if removed:
+                state_oid, current = read_state(workspace)
+                authority = current.last_published_heads + current.last_adopted_heads
+                acquired = tuple(
+                    DetachedAssociation(item.pr, item.ref, item.verified_commit_id)
+                    for item in authority
+                    if item.pr in removed
+                )
+                if {item.pr for item in acquired} != removed or len(acquired) != len(removed):
+                    return Stopped(
+                        "state", "removed PR ownership is incomplete or ambiguous"
+                    )
+                detached_by_pr = {
+                    item.pr: item for item in current.detached_associations
+                }
+                for item in acquired:
+                    previous = detached_by_pr.get(item.pr)
+                    if previous is not None and previous != item:
+                        return Stopped("state", "detached association changed")
+                    detached_by_pr[item.pr] = item
+                source = TrackedStack(plan.repository, plan.source_stack.base_branch,
+                    plan.source_stack.pull_requests)
+                desired_tracking = TrackedStack(
+                    plan.repository, plan.desired.base_branch, desired_ids
+                )
+                stacks = tuple(
+                    item
+                    for item in current.stacks
+                    if item != source and item != desired_tracking
+                ) + (desired_tracking,)
+                publications = tuple(item for item in current.last_published_heads
+                    if item.pr not in removed)
+                adoptions = tuple(item for item in current.last_adopted_heads
+                    if item.pr not in removed)
+                cas_write_state(workspace, state_oid,
+                    TrackedState(
+                        stacks,
+                        publications,
+                        adoptions,
+                        tuple(detached_by_pr.values()),
+                        current.last_published_boundaries,
+                    ))
+            return Verified()
+        except Error as exc:
+            return Stopped("stack", str(exc))
+
+
+def execute_retained_topology(
+    workspace: str | Path,
+    github: GitHubClient,
+    recompute: Callable[[tuple[RecoveryEntry, ...]], RetainedTopologyPlan | Blocked],
+    *,
+    dry_run: bool = False,
+    git_transport: GitTransport | None = None,
+) -> tuple[RetainedTopologyPlan | Blocked | None, ApplyResult]:
+    """Settle dissolution facts and recompute today's retained topology."""
+    try:
+        with repository_lock(workspace):
+            facts = settle_recovery(
+                workspace,
+                github,
+                dry_run=dry_run,
+                git_transport=git_transport,
+            )
+    except Error as exc:
+        return None, Stopped("recovery", str(exc))
+    try:
+        plan = recompute(facts)
+    except Error as exc:
+        return None, Stopped("observe", str(exc))
+    if isinstance(plan, Blocked):
+        return plan, Stopped("plan", "a blocked retained topology cannot be applied")
+    return plan, apply_retained_topology(
+        plan,
+        workspace,
+        github,
+        dry_run=dry_run,
+        git_transport=git_transport,
+    )
 
 
 def execute_stack_append(

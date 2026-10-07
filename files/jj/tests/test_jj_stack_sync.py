@@ -4122,5 +4122,215 @@ def test_stack_append_dry_run_preserves_server_state_and_private_refs(
     assert sync.read_recovery(jj_repo) == before_recovery
 
 
+def test_retained_topology_reorder_is_journaled_before_unstack_and_recoverable(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, _append, server, github = stack_append_case(jj_repo, monkeypatch)
+    first, second = observed.stack.pull_requests
+    retained = sync.RetainedTopologyInput(
+        observed.publication.repository,
+        observed.stack,
+        observed.pull_requests,
+        observed.publication.destinations[:-1],
+        observed.tracked_state,
+        sync.StackSelection(
+            "main",
+            (
+                sync.ExistingPRAssignment(second, "2" * 40),
+                sync.ExistingPRAssignment(first, "1" * 40),
+            ),
+        ),
+    )
+    plan = sync.plan_retained_topology(retained)
+    assert isinstance(plan, sync.RetainedTopologyPlan) and plan.dissolve
+    original = github.unstack
+
+    def inspect_before_send(repository, identity):
+        journal = sync.read_recovery(jj_repo)[1]
+        assert journal is not None
+        assert journal.entries[0].possibly_live
+        assert isinstance(journal.entries[0].attempt, sync.StackDissolutionAttempt)
+        return original(repository, identity)
+
+    monkeypatch.setattr(github, "unstack", inspect_before_send)
+    result = sync.apply_retained_topology(plan, jj_repo, github)
+
+    assert isinstance(result, sync.Verified)
+    repository = server.read_repository(plan.repository)
+    assert server.read_stack(repository, plan.source_stack.identity) is None
+    journal = sync.read_recovery(jj_repo)[1]
+    assert journal is not None and journal.entries[0].possibly_live
+    assert sync.parse_recovery(sync.recovery_to_json(journal)) == journal
+
+
+def test_retained_topology_equivalent_grouping_does_not_unstack(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, _append, _server, github = stack_append_case(jj_repo, monkeypatch)
+    selected = sync.StackSelection(
+        "main",
+        tuple(
+            sync.ExistingPRAssignment(pr.identity, pr.head_oid)
+            for pr in observed.pull_requests
+            if pr.head_oid is not None
+        ),
+    )
+    plan = sync.plan_retained_topology(sync.RetainedTopologyInput(
+        observed.publication.repository, observed.stack, observed.pull_requests,
+        observed.publication.destinations[:-1], observed.tracked_state, selected,
+    ))
+    assert isinstance(plan, sync.RetainedTopologyPlan) and not plan.dissolve
+    monkeypatch.setattr(
+        github, "unstack", lambda *_args: pytest.fail("equivalent topology unstacked")
+    )
+    assert sync.apply_retained_topology(plan, jj_repo, github) == sync.Verified()
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+def test_retained_topology_lost_unstack_recomputes_changed_intent(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, _append, server, github = stack_append_case(jj_repo, monkeypatch)
+    first, second = observed.stack.pull_requests
+    selected = sync.StackSelection(
+        "main",
+        (
+            sync.ExistingPRAssignment(second, "2" * 40),
+            sync.ExistingPRAssignment(first, "1" * 40),
+        ),
+    )
+    initial = sync.RetainedTopologyInput(
+        observed.publication.repository,
+        observed.stack,
+        observed.pull_requests,
+        observed.publication.destinations[:-1],
+        observed.tracked_state,
+        selected,
+    )
+    plan = sync.plan_retained_topology(initial)
+    assert isinstance(plan, sync.RetainedTopologyPlan) and plan.dissolve
+
+    with github.lose_response(sync.GitHubClient.unstack):
+        result = sync.apply_retained_topology(plan, jj_repo, github)
+
+    assert isinstance(result, sync.Verified)
+    facts = sync.settle_recovery(jj_repo, github)
+    assert len(facts) == 1
+    detached = server.read_pull_requests(observed.stack.pull_requests)
+    assert all(pr.stack is None for pr in detached)
+    changed = sync.StackSelection(
+        "main", (sync.ExistingPRAssignment(second, "2" * 40),)
+    )
+    replanned = sync.plan_retained_topology(
+        dataclasses.replace(
+            initial,
+            pull_requests=detached,
+            desired=changed,
+            recovery_facts=facts,
+        )
+    )
+    assert isinstance(replanned, sync.RetainedTopologyPlan)
+    assert not replanned.dissolve
+    assert replanned.desired == changed
+
+
+def test_retained_topology_held_and_fail_before_do_not_resend(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, _append, server, github = stack_append_case(jj_repo, monkeypatch)
+    first, second = observed.stack.pull_requests
+    plan = sync.plan_retained_topology(
+        sync.RetainedTopologyInput(
+            observed.publication.repository,
+            observed.stack,
+            observed.pull_requests,
+            observed.publication.destinations[:-1],
+            observed.tracked_state,
+            sync.StackSelection(
+                "main",
+                (
+                    sync.ExistingPRAssignment(second, "2" * 40),
+                    sync.ExistingPRAssignment(first, "1" * 40),
+                ),
+            ),
+        )
+    )
+    assert isinstance(plan, sync.RetainedTopologyPlan)
+
+    with github.hold_next(sync.GitHubClient.unstack) as pending:
+        stopped = sync.apply_retained_topology(plan, jj_repo, github)
+    assert isinstance(stopped, sync.Stopped)
+    assert stopped.stage == "stack"
+    retry = sync.apply_retained_topology(plan, jj_repo, github)
+    assert isinstance(retry, sync.Stopped)
+    assert retry.stage == "recovery"
+    pending.release()
+    facts = sync.settle_recovery(jj_repo, github)
+    assert len(facts) == 1
+    assert server.read_stack(
+        server.read_repository(plan.repository), plan.source_stack.identity
+    ) is None
+
+    # A separately prepared request known only to have failed before dispatch
+    # remains conservative as well; an old-looking read is not retry authority.
+    other_repo = jj_repo.parent / "other"
+    run("jj", "git", "init", "--colocate", other_repo)
+    sync.cas_write_state(other_repo, None, observed.tracked_state)
+    # Restore the source topology in an independent semantic server.
+    server2 = FakeGitHubServer()
+    repository = server.read_repository(plan.repository)
+    server2.seed_repository(repository)
+    for ref in observed.publication.destinations[:-1]:
+        assert ref.commit_id is not None
+        server2.seed_branch(
+            plan.repository,
+            ref.ref.full_name.removeprefix("refs/heads/"),
+            ref.commit_id,
+        )
+    for pr in observed.pull_requests:
+        server2.seed_pull_request(dataclasses.replace(pr, stack=None))
+    server2.seed_stack(observed.stack)
+    github2 = FakeGitHubClient(server2)
+    with github2.fail_before(sync.GitHubClient.unstack):
+        stopped = sync.apply_retained_topology(plan, other_repo, github2)
+    assert isinstance(stopped, sync.Stopped)
+    assert stopped.stage == "stack"
+    retry = sync.apply_retained_topology(plan, other_repo, github2)
+    assert isinstance(retry, sync.Stopped)
+    assert retry.stage == "recovery"
+
+
+def test_retained_topology_accepts_partial_survivor_and_rejects_foreign_head(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, _append, server, github = stack_append_case(jj_repo, monkeypatch)
+    first, second = observed.stack.pull_requests
+    plan = sync.plan_retained_topology(
+        sync.RetainedTopologyInput(
+            observed.publication.repository,
+            observed.stack,
+            observed.pull_requests,
+            observed.publication.destinations[:-1],
+            observed.tracked_state,
+            sync.StackSelection(
+                "main", (sync.ExistingPRAssignment(second, "2" * 40),)
+            ),
+        )
+    )
+    assert isinstance(plan, sync.RetainedTopologyPlan)
+    server.merge_pull_request(first)
+
+    assert isinstance(sync.apply_retained_topology(plan, jj_repo, github), sync.Verified)
+    facts = sync.settle_recovery(jj_repo, github)
+    assert len(facts) == 1
+    surviving = server.read_stack(
+        server.read_repository(plan.repository), plan.source_stack.identity
+    )
+    assert surviving is not None and surviving.pull_requests == (first,)
+
+    server.override_pr_head_observation(second, "9" * 40)
+    assert sync._classify_attempt(jj_repo, github, facts[0].attempt) == "foreign"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
