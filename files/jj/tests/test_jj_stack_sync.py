@@ -2936,5 +2936,303 @@ def test_unresolved_effect_blocks_only_the_stack_it_can_change(jj_repo: Path) ->
     assert stopped.stage == "recovery"
 
 
+def test_first_publication_planning_is_pure_ordered_and_base_sensitive() -> None:
+    repository = sync.GitHubRepositoryId("github.com", "repo")
+    base, first, second = (value * 40 for value in "012")
+    commits = (
+        sync.ObservedCommit(first, (base,), "c1", "First\n\nbody one", False, False),
+        sync.ObservedCommit(second, (first,), "c2", "Second\nbody two", False, False),
+    )
+    local = sync.LocalObservation("/repo", "op", (), (), (), (), (), commits, "/git")
+    names = ("topic/first", "topic/second")
+    destinations = (
+        sync.LiveRemoteRef(sync.RemoteBranchRef(repository, "refs/heads/main"), base),
+        *(
+            sync.LiveRemoteRef(
+                sync.RemoteBranchRef(repository, f"refs/heads/{name}"), None
+            )
+            for name in names
+        ),
+    )
+    observed = sync.FirstPublicationInput(
+        repository,
+        "main",
+        (first, second),
+        local,
+        None,
+        tuple(
+            sync.PublicationAssignment(oid, name)
+            for oid, name in zip((first, second), names, strict=True)
+        ),
+        ("managed",),
+        destinations,
+        (),
+    )
+
+    plan = sync.plan_first_publication(observed)
+
+    assert isinstance(plan, sync.FirstPublicationPlan)
+    assert plan.goal.base_commit_id == base
+    assert tuple(
+        (item.branch_name, item.base_branch, item.title, item.body)
+        for item in plan.goal.pull_requests
+    ) == (
+        (names[0], "main", "First", "body one"),
+        (names[1], names[0], "Second", "body two"),
+    )
+    assert observed.local == local
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        plan.goal.base_branch = "other"  # type: ignore[misc]
+
+    moved = "9" * 40
+    replanned = sync.plan_first_publication(
+        dataclasses.replace(
+            observed,
+            local=dataclasses.replace(
+                local,
+                commits=(
+                    dataclasses.replace(commits[0], parent_commit_ids=(moved,)),
+                    commits[1],
+                ),
+            ),
+            destinations=(
+                dataclasses.replace(destinations[0], commit_id=moved),
+                *destinations[1:],
+            ),
+        )
+    )
+    assert isinstance(replanned, sync.FirstPublicationPlan)
+    assert replanned.goal.base_commit_id == moved
+
+
+def test_first_publication_assignment_precedence_completeness_and_ambiguity() -> None:
+    repository = sync.GitHubRepositoryId("github.com", "repo")
+    base, first, second = (value * 40 for value in "012")
+    bookmark = sync.LocalBookmark("intentional", sync.CommitTarget(first))
+    local = sync.LocalObservation(
+        "/repo",
+        "op",
+        (),
+        (),
+        (bookmark,),
+        (),
+        (),
+        (
+            sync.ObservedCommit(first, (base,), "c1", "First", False, False),
+            sync.ObservedCommit(second, (first,), "c2", "Second", False, False),
+        ),
+        "/git",
+    )
+    destinations = tuple(
+        sync.LiveRemoteRef(
+            sync.RemoteBranchRef(repository, f"refs/heads/{name}"),
+            base if name == "main" else None,
+        )
+        for name in (
+            "main",
+            "intentional",
+            "generated-two",
+            "explicit-one",
+            "explicit-two",
+        )
+    )
+    observed = sync.FirstPublicationInput(
+        repository,
+        "main",
+        (first, second),
+        local,
+        None,
+        (
+            sync.PublicationAssignment(first, "generated-one"),
+            sync.PublicationAssignment(second, "generated-two"),
+        ),
+        (),
+        destinations,
+        (),
+    )
+    assert sync.resolve_publication_assignments(observed) == (
+        sync.PublicationAssignment(first, "intentional"),
+        sync.PublicationAssignment(second, "generated-two"),
+    )
+    explicit = (
+        sync.PublicationAssignment(first, "explicit-one"),
+        sync.PublicationAssignment(second, "explicit-two"),
+    )
+    assert (
+        sync.resolve_publication_assignments(
+            dataclasses.replace(observed, explicit_assignments=explicit)
+        )
+        == explicit
+    )
+    incomplete = sync.resolve_publication_assignments(
+        dataclasses.replace(observed, explicit_assignments=explicit[:1])
+    )
+    assert isinstance(incomplete, sync.Blocked)
+    assert incomplete.reasons[0].code == "incomplete-explicit-assignment"
+    ambiguous_local = dataclasses.replace(
+        local,
+        local_bookmarks=(
+            bookmark,
+            sync.LocalBookmark("other", sync.CommitTarget(first)),
+        ),
+    )
+    ambiguous = sync.resolve_publication_assignments(
+        dataclasses.replace(observed, local=ambiguous_local)
+    )
+    assert isinstance(ambiguous, sync.Blocked)
+    assert ambiguous.reasons[0].code == "ambiguous-local-bookmark"
+
+
+def test_first_publication_rejects_local_and_historical_name_reuse() -> None:
+    repository = sync.GitHubRepositoryId("github.com", "repo")
+    fork = sync.GitHubRepositoryId("github.com", "fork")
+    base, commit_id = (value * 40 for value in "01")
+    assignment = sync.PublicationAssignment(commit_id, "topic")
+    observed = sync.FirstPublicationInput(
+        repository,
+        "main",
+        (commit_id,),
+        sync.LocalObservation(
+            "/repo",
+            "op",
+            (),
+            (),
+            (),
+            (),
+            (),
+            (sync.ObservedCommit(commit_id, (base,), "c1", "Title", False, False),),
+            "/git",
+        ),
+        (assignment,),
+        (),
+        (),
+        (
+            sync.LiveRemoteRef(
+                sync.RemoteBranchRef(repository, "refs/heads/main"), base
+            ),
+            sync.LiveRemoteRef(
+                sync.RemoteBranchRef(repository, "refs/heads/topic"), None
+            ),
+        ),
+        (),
+    )
+    historical = sync.GitHubPullRequest(
+        sync.PullRequestId(repository, 1),
+        "PR_node",
+        sync.PullRequestState.CLOSED,
+        False,
+        fork,
+        "topic",
+        "2" * 40,
+        "other",
+        "3" * 40,
+        False,
+        False,
+        "Old",
+        "",
+        None,
+    )
+
+    # A fork can independently use the same head name.
+    assert sync.resolve_publication_assignments(
+        dataclasses.replace(observed, historical_pull_requests=(historical,))
+    ) == (assignment,)
+
+    same_repository = sync.resolve_publication_assignments(
+        dataclasses.replace(
+            observed,
+            historical_pull_requests=(
+                dataclasses.replace(historical, head_repository=repository),
+            ),
+        )
+    )
+    assert isinstance(same_repository, sync.Blocked)
+    assert same_repository.reasons[0].code == "pull-request-branch-collision"
+
+    used_as_base = sync.resolve_publication_assignments(
+        dataclasses.replace(
+            observed,
+            historical_pull_requests=(
+                dataclasses.replace(historical, base_branch="topic"),
+            ),
+        )
+    )
+    assert isinstance(used_as_base, sync.Blocked)
+    assert used_as_base.reasons[0].code == "pull-request-branch-collision"
+
+    local_collision = sync.resolve_publication_assignments(
+        dataclasses.replace(
+            observed,
+            local=dataclasses.replace(
+                observed.local,
+                local_bookmarks=(
+                    sync.LocalBookmark("topic", sync.AbsentBookmarkTarget()),
+                ),
+            ),
+        )
+    )
+    assert isinstance(local_collision, sync.Blocked)
+    assert local_collision.reasons[0].code == "local-publication-collision"
+
+
+@pytest.mark.parametrize(
+    ("change", "code"),
+    (
+        ("invalid-ref", "invalid-publication-branch"),
+        ("missing-destination", "destination-unavailable"),
+        ("occupied-destination", "remote-publication-collision"),
+        ("nonlinear", "invalid-publication-commit"),
+        ("conflicted", "invalid-publication-commit"),
+    ),
+)
+def test_first_publication_blocks_bad_evidence(change: str, code: str) -> None:
+    repository = sync.GitHubRepositoryId("github.com", "repo")
+    base, first, second = (value * 40 for value in "012")
+    commits = (
+        sync.ObservedCommit(
+            first, (base,), "c1", "First", change == "conflicted", False
+        ),
+        sync.ObservedCommit(
+            second,
+            ((base if change == "nonlinear" else first),),
+            "c2",
+            "Second",
+            False,
+            False,
+        ),
+    )
+    name = "bad..ref" if change == "invalid-ref" else "one"
+    destinations = [
+        sync.LiveRemoteRef(sync.RemoteBranchRef(repository, "refs/heads/main"), base)
+    ]
+    if change != "missing-destination":
+        destinations.append(
+            sync.LiveRemoteRef(
+                sync.RemoteBranchRef(repository, f"refs/heads/{name}"),
+                "8" * 40 if change == "occupied-destination" else None,
+            )
+        )
+    destinations.append(
+        sync.LiveRemoteRef(sync.RemoteBranchRef(repository, "refs/heads/two"), None)
+    )
+    observed = sync.FirstPublicationInput(
+        repository,
+        "main",
+        (first, second),
+        sync.LocalObservation("/repo", "op", (), (), (), (), (), commits, "/git"),
+        None,
+        (
+            sync.PublicationAssignment(first, name),
+            sync.PublicationAssignment(second, "two"),
+        ),
+        (),
+        tuple(destinations),
+        (),
+    )
+    blocked = sync.plan_first_publication(observed)
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == code
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

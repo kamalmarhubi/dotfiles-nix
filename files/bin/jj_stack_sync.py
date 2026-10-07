@@ -579,6 +579,30 @@ class StackSelection:
 
 
 @dataclass(frozen=True)
+class PublicationAssignment:
+    """An exact local commit to new GitHub branch assignment."""
+
+    commit_id: str
+    branch_name: str
+
+
+@dataclass(frozen=True)
+class FirstPublicationInput:
+    """Complete, already-read evidence for planning a first publication."""
+
+    repository: GitHubRepositoryId
+    base_branch: str
+    ordered_commit_ids: tuple[str, ...]
+    local: LocalObservation
+    explicit_assignments: tuple[PublicationAssignment, ...] | None
+    template_results: tuple[PublicationAssignment, ...]
+    managed_branch_names: tuple[str, ...]
+    destinations: tuple[LiveRemoteRef, ...]
+    historical_pull_requests: tuple[GitHubPullRequest, ...]
+    recovery_facts: tuple[RecoveryEntry, ...] = ()
+
+
+@dataclass(frozen=True)
 class NewPullRequestGoal:
     commit_id: str
     branch_name: str
@@ -604,6 +628,24 @@ class NewPullRequestGoal:
             or not self.title
         ):
             raise ValueError("new pull request goal fields must be nonempty")
+
+
+@dataclass(frozen=True)
+class FirstPublicationGoal:
+    repository: GitHubRepositoryId
+    base_branch: str
+    base_commit_id: str
+    pull_requests: tuple[NewPullRequestGoal, ...]
+
+
+@dataclass(frozen=True)
+class FirstPublicationPlan:
+    """A pure goal together with every observation on which it depends."""
+
+    goal: FirstPublicationGoal
+    local: LocalObservation
+    destinations: tuple[LiveRemoteRef, ...]
+    historical_pull_requests: tuple[GitHubPullRequest, ...]
 
 
 @dataclass(frozen=True)
@@ -2906,6 +2948,256 @@ def _metadata(description: str) -> tuple[str, str] | None:
     if separator:
         body = _reflow_markdown(body.removeprefix("\n"))
     return title, body
+
+
+def _valid_publication_branch(name: str) -> bool:
+    """Pure equivalent of check-ref-format for ``refs/heads/<name>``."""
+    return not (
+        not name
+        or name == "@"
+        or name.startswith("/")
+        or name.endswith(("/", "."))
+        or "//" in name
+        or ".." in name
+        or "@{" in name
+        or any(ord(character) < 32 or ord(character) == 127 for character in name)
+        or any(character in " ~^:?*[\\" for character in name)
+        or any(
+            not component or component.startswith(".") or component.endswith(".lock")
+            for component in name.split("/")
+        )
+    )
+
+
+def resolve_publication_assignments(
+    observed: FirstPublicationInput,
+) -> tuple[PublicationAssignment, ...] | Blocked:
+    """Resolve names solely from supplied evidence, without performing reads."""
+    commits = observed.ordered_commit_ids
+    if not commits or len(set(commits)) != len(commits):
+        return _block(
+            "invalid-publication-selection",
+            "selection",
+            "selected commits must be nonempty and unique",
+        )
+    if observed.explicit_assignments is not None:
+        assignments = observed.explicit_assignments
+        if tuple(item.commit_id for item in assignments) != commits:
+            return _block(
+                "incomplete-explicit-assignment",
+                "selection",
+                "explicit assignments must exactly cover the ordered selection",
+            )
+    else:
+        templates: dict[str, str] = {}
+        for item in observed.template_results:
+            if item.commit_id not in commits or item.commit_id in templates:
+                return _block(
+                    "invalid-template-result",
+                    item.commit_id,
+                    "template results must uniquely identify selected commits",
+                )
+            templates[item.commit_id] = item.branch_name
+        ineligible = set(observed.managed_branch_names) | {observed.base_branch}
+        selected: list[PublicationAssignment] = []
+        for commit_id in commits:
+            bookmarks = tuple(
+                bookmark.name
+                for bookmark in observed.local.local_bookmarks
+                if bookmark.name not in ineligible
+                and isinstance(bookmark.target, CommitTarget)
+                and bookmark.target.commit_id == commit_id
+            )
+            if len(bookmarks) > 1:
+                return _block(
+                    "ambiguous-local-bookmark",
+                    commit_id,
+                    "selected commit has multiple eligible exact-target bookmarks",
+                )
+            name = bookmarks[0] if bookmarks else templates.get(commit_id, "")
+            if not name:
+                return _block(
+                    "template-name-unavailable",
+                    commit_id,
+                    "no eligible bookmark or evaluated template result is available",
+                )
+            selected.append(PublicationAssignment(commit_id, name))
+        assignments = tuple(selected)
+
+    names = tuple(item.branch_name for item in assignments)
+    if len(set(names)) != len(names):
+        return _block(
+            "duplicate-publication-branch", "selection", "branch names must be unique"
+        )
+    reserved = set(observed.managed_branch_names) | {observed.base_branch}
+    for assignment in assignments:
+        name = assignment.branch_name
+        if not _valid_publication_branch(name):
+            return _block("invalid-publication-branch", name, "branch name is invalid")
+        if name in reserved:
+            return _block(
+                "protected-publication-branch",
+                name,
+                "target, managed, or protected names cannot be published",
+            )
+        same_name = tuple(
+            bookmark
+            for bookmark in observed.local.local_bookmarks
+            if bookmark.name == name
+        )
+        if len(same_name) > 1 or any(
+            not isinstance(bookmark.target, CommitTarget)
+            or bookmark.target.commit_id != assignment.commit_id
+            for bookmark in same_name
+        ):
+            return _block(
+                "local-publication-collision",
+                name,
+                "local bookmark is deleted, conflicted, or targets another commit",
+            )
+
+    destinations: dict[str, LiveRemoteRef] = {}
+    for destination in observed.destinations:
+        if destination.ref.repository != observed.repository:
+            return _block(
+                "destination-repository-mismatch",
+                destination.ref.full_name,
+                "destination belongs to another repository",
+            )
+        name = destination.ref.full_name.removeprefix("refs/heads/")
+        if name in destinations:
+            return _block(
+                "ambiguous-destination", name, "destination was observed twice"
+            )
+        destinations[name] = destination
+    owned_branches = {}
+    owned_prs = {}
+    for assignment in assignments:
+        name = assignment.branch_name
+        destination = destinations.get(name)
+        if destination is None:
+            return _block(
+                "destination-unavailable",
+                name,
+                "confirmed destination absence was not observed",
+            )
+        owned_commit_id = owned_branches.get(name)
+        if owned_commit_id is not None and owned_commit_id != assignment.commit_id:
+            return _block(
+                "publication-attempt-unresolved",
+                name,
+                "an earlier candidate for this branch may still land",
+            )
+        if destination.commit_id is not None and (
+            destination.commit_id != assignment.commit_id
+            or owned_commit_id != assignment.commit_id
+        ):
+            return _block(
+                "remote-publication-collision",
+                name,
+                "destination branch already exists",
+            )
+    for pull_request in observed.historical_pull_requests:
+        if pull_request.identity.repository != observed.repository:
+            return _block(
+                "history-repository-mismatch",
+                f"PR #{pull_request.number}",
+                "history belongs to another repository",
+            )
+        for name in names:
+            if pull_request.base_branch == name or (
+                pull_request.head_repository == observed.repository
+                and pull_request.head_branch == name
+            ):
+                goal = owned_prs.get(pull_request.identity)
+                if goal is not None and (
+                    pull_request.head_repository == observed.repository
+                    and pull_request.head_branch == goal.branch_name
+                    and pull_request.head_oid == goal.commit_id
+                    and pull_request.base_branch == goal.base_branch
+                    and pull_request.title == goal.title
+                    and pull_request.body == goal.body
+                    and not pull_request.draft
+                ):
+                    continue
+                return _block(
+                    "pull-request-branch-collision",
+                    name,
+                    "branch has historical same-repository pull request use",
+                )
+    return assignments
+
+
+def plan_first_publication(
+    observed: FirstPublicationInput,
+) -> FirstPublicationPlan | Blocked:
+    """Produce a deeply immutable first-publication plan; never perform I/O."""
+    assignments = resolve_publication_assignments(observed)
+    if isinstance(assignments, Blocked):
+        return assignments
+    commits: dict[str, ObservedCommit] = {}
+    for commit in observed.local.commits:
+        if commit.commit_id in commits:
+            return _block(
+                "ambiguous-commit", commit.commit_id, "commit was observed twice"
+            )
+        commits[commit.commit_id] = commit
+    base_ref = f"refs/heads/{observed.base_branch}"
+    base_reads = tuple(
+        item for item in observed.destinations if item.ref.full_name == base_ref
+    )
+    if len(base_reads) != 1 or base_reads[0].commit_id is None:
+        return _block(
+            "base-unavailable",
+            observed.base_branch,
+            "live base was not observed exactly once",
+        )
+    base_commit_id = base_reads[0].commit_id
+    goals: list[NewPullRequestGoal] = []
+    expected_parent = base_commit_id
+    expected_base = observed.base_branch
+    for assignment in assignments:
+        commit = commits.get(assignment.commit_id)
+        if (
+            commit is None
+            or commit.is_hidden
+            or commit.has_conflicts
+            or not commit.change_id
+            or commit.parent_commit_ids != (expected_parent,)
+        ):
+            return _block(
+                "invalid-publication-commit",
+                assignment.commit_id,
+                "selection must be observed, visible, conflict-free, and one complete linear chain",
+            )
+        metadata = _metadata(commit.description)
+        if metadata is None:
+            return _block(
+                "title-missing",
+                commit.commit_id,
+                "selected commit has no description title",
+            )
+        title, body = metadata
+        goals.append(
+            NewPullRequestGoal(
+                commit.commit_id,
+                assignment.branch_name,
+                expected_base,
+                title,
+                body,
+            )
+        )
+        expected_parent = commit.commit_id
+        expected_base = assignment.branch_name
+    goal = FirstPublicationGoal(
+        observed.repository, observed.base_branch, base_commit_id, tuple(goals)
+    )
+    return FirstPublicationPlan(
+        goal,
+        observed.local,
+        observed.destinations,
+        observed.historical_pull_requests,
+    )
 
 
 def _complete_selection(
