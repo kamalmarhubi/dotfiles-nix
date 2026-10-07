@@ -20,6 +20,8 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import quote, urlparse
+
+import jj_stack_temporary_target as temporary_target
 from markdown_it import MarkdownIt
 from markdown_it.rules_inline.newline import newline as _parse_newline
 from markdown_it.rules_inline.state_inline import StateInline
@@ -943,6 +945,11 @@ class NewSyncIntent:
 SyncIntent = ExistingSyncIntent | NewSyncIntent
 
 
+@dataclass(frozen=True)
+class ResumeTemporaryTarget:
+    obligation_id: str
+
+
 SyncCommandValue = (
     Blocked
     | NoOp
@@ -952,6 +959,7 @@ SyncCommandValue = (
     | StackAppendPlan
     | RetainedTopologyPlan
     | MixedMembershipPlan
+    | ResumeTemporaryTarget
 )
 
 
@@ -961,6 +969,7 @@ class SyncCommandPlan:
 
     value: SyncCommandValue
     push_url: str
+    temporary_target_policy: temporary_target.Policy | None = None
 
 
 @dataclass(frozen=True)
@@ -1199,6 +1208,28 @@ class StackDissolutionAttempt:
 
 
 @dataclass(frozen=True)
+class ObligationStackUnlinkAttempt:
+    """Narrow unlink owned by a temporary-target obligation.
+
+    Unlike ``StackDissolutionAttempt`` this is never general recovery
+    provenance: it may only be interpreted by the owning obligation driver.
+    """
+
+    repository: GitHubRepositoryId
+    stack: GitHubStackId
+    stack_node_id: str
+    members: tuple[PullRequestId, ...]
+    retained_members: tuple[PullRequestId, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (self.stack.repository != self.repository or not self.stack_node_id
+                or not self.members or len(set(self.members)) != len(self.members)
+                or not set(self.retained_members).issubset(self.members)
+                or any(member.repository != self.repository for member in self.members)):
+            raise ValueError("obligation stack unlink is malformed")
+
+
+@dataclass(frozen=True)
 class DetachedCloseAttempt:
     association: DetachedAssociation
     expected_state: PullRequestState = PullRequestState.OPEN
@@ -1234,6 +1265,7 @@ MutationAttempt = (
     | StackCreationAttempt
     | StackAppendAttempt
     | StackDissolutionAttempt
+    | ObligationStackUnlinkAttempt
     | DetachedCloseAttempt
 )
 
@@ -1312,6 +1344,12 @@ def _attempt_resources(attempt: MutationAttempt) -> _MutationResources:
             frozenset(item.ref for item in attempt.live_refs),
             frozenset((attempt.stack,)), members,
         )
+    if isinstance(attempt, ObligationStackUnlinkAttempt):
+        members = frozenset(attempt.members)
+        return _MutationResources(
+            attempt.repository, members, stacks=frozenset((attempt.stack,)),
+            base_mutations=members,
+        )
     if isinstance(attempt, DetachedCloseAttempt):
         return _MutationResources(
             attempt.association.pr.repository,
@@ -1328,6 +1366,142 @@ def _attempt_resources(attempt: MutationAttempt) -> _MutationResources:
     )
 
 
+@dataclass(frozen=True)
+class TemporaryTargetParticipant:
+    """One frozen result member; ``pull_request`` is bound after creation."""
+
+    slot: str
+    branch: str
+    desired_oid: str
+    entry_base: str
+    final_base: str
+    final_title: str
+    final_body: str
+    pull_request: PullRequestId | None = None
+    entry_title: str | None = None
+    entry_body: str | None = None
+
+    def __post_init__(self) -> None:
+        if not all((self.slot, self.branch, self.desired_oid, self.entry_base,
+                    self.final_base, self.final_title)):
+            raise ValueError("temporary-target participant is malformed")
+
+
+@dataclass(frozen=True)
+class TemporaryTargetSourceGuard:
+    stack: GitHubStackId | None
+    stack_node_id: str | None
+    members: tuple[PullRequestId, ...]
+    pull_requests: tuple[GitHubPullRequest, ...] = ()
+
+    def __post_init__(self) -> None:
+        if (self.stack is None) != (self.stack_node_id is None):
+            raise ValueError("temporary-target source guard is malformed")
+        if tuple(pr.identity for pr in self.pull_requests) != self.members:
+            raise ValueError("temporary-target source facts do not match membership")
+
+
+@dataclass(frozen=True)
+class TemporaryTargetCoreGoal:
+    """Affected state only; participant slots are bound before state handoff."""
+
+    expected: TrackedState
+    stack_base: str
+    historical_members: tuple[PullRequestId, ...]
+    stack_slots: tuple[str, ...]
+    publications: tuple[tuple[str, str, str], ...]
+    adoptions: tuple[LastAdoptedHead, ...]
+    detached: tuple[DetachedAssociation, ...]
+    boundaries: tuple[LastPublishedBoundary, ...]
+
+    def __post_init__(self) -> None:
+        if (not self.stack_base or not self.stack_slots
+                or len(set(self.stack_slots)) != len(self.stack_slots)
+                or any(slot not in self.stack_slots for slot, _ref, _oid in self.publications)):
+            raise ValueError("temporary-target core goal is malformed")
+
+
+@dataclass(frozen=True)
+class TemporaryTargetExistingBatch:
+    """One atomic push of existing heads and a boundary seam, if any."""
+
+    heads: tuple[PlannedHeadUpdate, ...]
+    boundaries: tuple[LastPublishedBoundary, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.heads and not self.boundaries:
+            raise ValueError("temporary-target existing batch is empty")
+
+
+@dataclass(frozen=True)
+class StatusSuccess:
+    """Durable evidence for exact identities, OIDs, and policy contexts."""
+
+    bindings: tuple[tuple[PullRequestId, str], ...]
+    contexts: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (not self.bindings or not self.contexts
+                or len({pr for pr, _oid in self.bindings}) != len(self.bindings)
+                or any(not oid for _pr, oid in self.bindings)):
+            raise ValueError("status-success receipt is malformed")
+
+
+@dataclass(frozen=True)
+class TemporaryTargetObligation:
+    """Frozen authority and candidate for a resumable temporary-target run."""
+
+    identity: str
+    repository: GitHubRepositoryId
+    push_url: str
+    temporary_base: str
+    contexts: tuple[str, ...]
+    participants: tuple[TemporaryTargetParticipant, ...]
+    source: TemporaryTargetSourceGuard
+    absent_branches: tuple[tuple[str, str], ...]
+    existing_batch: TemporaryTargetExistingBatch | None
+    core: TemporaryTargetCoreGoal
+    status_success: StatusSuccess | None = None
+
+    def __post_init__(self) -> None:
+        prs = tuple(p.pull_request for p in self.participants if p.pull_request is not None)
+        if (not self.identity or not self.push_url or not self.temporary_base
+                or not self.contexts or not self.participants
+                or len({p.slot for p in self.participants}) != len(self.participants)
+                or len({p.branch for p in self.participants}) != len(self.participants)
+                or any(pr.repository != self.repository for pr in prs)
+                or tuple(p.slot for p in self.participants) != self.core.stack_slots
+                or any(update.ref.repository != self.repository
+                       for update in (() if self.existing_batch is None
+                                      else self.existing_batch.heads))):
+            raise ValueError("temporary-target obligation is malformed")
+
+
+def _obligation_resources(
+    obligation: TemporaryTargetObligation,
+) -> _MutationResources:
+    pull_requests = frozenset({
+        *obligation.source.members,
+        *obligation.core.historical_members,
+        *(participant.pull_request for participant in obligation.participants
+          if participant.pull_request is not None),
+    })
+    refs = frozenset({
+        *(RemoteBranchRef(
+            obligation.repository, f"refs/heads/{participant.branch}"
+        ) for participant in obligation.participants),
+        *(boundary.ref for boundary in obligation.core.boundaries),
+    })
+    return _MutationResources(
+        obligation.repository,
+        pull_requests,
+        refs,
+        frozenset(() if obligation.source.stack is None
+                  else (obligation.source.stack,)),
+        pull_requests,
+    )
+
+
 def _resources_conflict(
     left: _MutationResources, right: _MutationResources
 ) -> bool:
@@ -1339,6 +1513,14 @@ def _resources_conflict(
         or left.stacks & right.stacks
         or left.base_mutations & right.pull_requests
         or right.base_mutations & left.pull_requests
+    )
+
+
+def _obligation_conflicts_attempt(
+    obligation: TemporaryTargetObligation, attempt: MutationAttempt
+) -> bool:
+    return _resources_conflict(
+        _obligation_resources(obligation), _attempt_resources(attempt)
     )
 
 
@@ -1424,6 +1606,222 @@ def _plan_resources(
     )
 
 
+def _obligation_conflicts_plan(
+    obligation: TemporaryTargetObligation,
+    plan: NoOp | Apply | FirstPublicationPlan | StackAppendPlan
+        | RetainedTopologyPlan | MixedMembershipPlan | DetachedCleanupPlan,
+) -> bool:
+    resources = _plan_resources(plan)
+    return resources is not None and _resources_conflict(
+        _obligation_resources(obligation), resources
+    )
+
+
+def _temporary_target_projection(
+    state: TrackedState, repository: GitHubRepositoryId,
+    identities: Collection[PullRequestId],
+) -> TrackedState:
+    """Select only state records the eventual handoff is allowed to replace."""
+    selected = set(identities)
+    return TrackedState(
+        tuple(stack for stack in state.stacks if stack.repository == repository
+              and selected.intersection(stack.ordered_prs)),
+        tuple(item for item in state.last_published_heads if item.pr in selected),
+        tuple(item for item in state.last_adopted_heads if item.pr in selected),
+        tuple(item for item in state.detached_associations if item.pr in selected),
+        tuple(item for item in state.last_published_boundaries
+              if item.merged_pr in selected),
+    )
+
+
+def _temporary_target_authority(
+    state: TrackedState, pr: PullRequestId, ref: RemoteBranchRef, old: str,
+) -> Authority:
+    publications = tuple(item for item in state.last_published_heads
+                         if item.pr == pr and item.ref == ref
+                         and item.verified_commit_id == old)
+    adoptions = tuple(item for item in state.last_adopted_heads
+                      if item.pr == pr and item.ref == ref
+                      and item.verified_commit_id == old)
+    if len(publications) == 1:
+        return MatchesLastPublication(publications[0])
+    if len(adoptions) == 1:
+        return MatchesLastAdoption(adoptions[0])
+    return FastForward()
+
+
+def temporary_target_candidate(
+    plan: FirstPublicationPlan | MixedMembershipPlan | Apply | StackAppendPlan | NoOp,
+    push_url: str,
+    tracked_state: TrackedState,
+    policy: temporary_target.Policy | None = None,
+) -> TemporaryTargetObligation | None:
+    """Normalize any publication plan without reading or changing external state."""
+    if isinstance(plan, NoOp):
+        return None
+    selected_policy = policy
+    if selected_policy is None:
+        return None
+
+    source_prs: tuple[GitHubPullRequest, ...]
+    source_stack: GitHubStackId | None = None
+    source_node: str | None = None
+    existing_updates: tuple[PlannedHeadUpdate, ...] = ()
+    boundaries: tuple[LastPublishedBoundary, ...] = ()
+    historical: tuple[PullRequestId, ...] = ()
+    participants: list[TemporaryTargetParticipant] = []
+
+    if isinstance(plan, FirstPublicationPlan):
+        repository, base = plan.goal.repository, plan.goal.base_branch
+        source_prs = ()
+        goals: tuple[PullRequestId | NewPullRequestGoal, ...] = plan.goal.pull_requests
+    elif isinstance(plan, MixedMembershipPlan):
+        repository, base = plan.goal.repository, plan.goal.base_branch
+        source_prs = plan.source_pull_requests
+        if plan.source_stack is not None:
+            source_stack, source_node = plan.source_stack.identity, plan.source_stack.node_id
+        goals = plan.goal.ordered
+    elif isinstance(plan, StackAppendPlan):
+        repository, base = plan.goal.repository, plan.goal.base_branch
+        source_prs = plan.existing_pull_requests
+        source_stack, source_node = plan.goal.stack, plan.goal.stack_node_id
+        open_existing = tuple(pr.identity for pr in source_prs
+                              if pr.state is PullRequestState.OPEN)
+        if not open_existing:
+            historical = plan.goal.old_members
+        goals = open_existing + plan.goal.pull_requests
+        if plan.completed_boundary is not None:
+            boundaries = (plan.completed_boundary,)
+    else:
+        repository, base = plan.desired.repository, plan.desired.base_branch
+        source_prs = plan.dependencies.prs
+        historical = tuple(pr.identity for pr in source_prs
+                           if pr.state is PullRequestState.MERGED)
+        if isinstance(plan.dependencies.membership, ServerStackMembership):
+            source_stack = plan.dependencies.membership.stack.identity
+            source_node = plan.dependencies.membership.stack.node_id
+        goals = tuple(item.pr_identity for item in plan.desired.active)
+        existing_updates = plan.head_updates
+        boundaries = plan.boundary_receipts
+
+    # Boundary receipts are bookkeeping, not publication participants.  In
+    # particular, a completed stack with only a base-boundary update must stay
+    # on the ordinary Apply path even when temporary-target policy is enabled.
+    if not goals:
+        return None
+
+    by_id = {pr.identity: pr for pr in source_prs}
+    new_by_branch = {
+        goal.branch_name: goal
+        for goal in goals if isinstance(goal, NewPullRequestGoal)
+    }
+    previous = base if not historical else source_prs[-1].head_branch
+    if isinstance(plan, (Apply, NoOp)) and goals:
+        first = goals[0]
+        assert isinstance(first, PullRequestId)
+        # A merged prefix leaves the first open PR attached to the frozen
+        # integration seam rather than directly to the literal stack base.
+        previous = by_id[first].base_branch
+    for index, item in enumerate(goals):
+        if isinstance(item, PullRequestId):
+            pr = by_id[item]
+            desired = next((wanted for wanted in getattr(getattr(plan, "desired", None), "active", ())
+                            if wanted.pr_identity == item), None)
+            mixed_assignment = (plan.assignments[index]
+                if isinstance(plan, MixedMembershipPlan) else None)
+            oid = (mixed_assignment.commit_id if mixed_assignment is not None
+                   else pr.head_oid if desired is None else desired.desired_commit_id)
+            assert oid is not None
+            title, body = (plan.metadata[index] if isinstance(plan, MixedMembershipPlan)
+                           and index < len(plan.metadata)
+                           else (pr.title, pr.body) if desired is None
+                           else (desired.title, desired.body))
+            participant = TemporaryTargetParticipant(
+                f"pr:{item.number}", pr.head_branch, oid, pr.base_branch,
+                previous, title, body, item, pr.title, pr.body)
+        else:
+            goal = new_by_branch[item.branch_name]
+            participant = TemporaryTargetParticipant(
+                f"new:{index}:{goal.branch_name}", goal.branch_name, goal.commit_id,
+                selected_policy.base, previous, goal.title, goal.body)
+        participants.append(participant)
+        previous = participant.branch
+
+    identities = tuple(pr.identity for pr in source_prs)
+    if isinstance(plan, MixedMembershipPlan):
+        desired_oids = {p.pull_request: p.desired_oid for p in participants
+                        if p.pull_request is not None}
+        for pr in source_prs:
+            wanted = desired_oids.get(pr.identity)
+            if wanted is not None and wanted != pr.head_oid:
+                assert pr.head_oid is not None
+                ref = RemoteBranchRef(repository, f"refs/heads/{pr.head_branch}")
+                existing_updates += (PlannedHeadUpdate(
+                    ref, pr.head_oid, wanted,
+                    ExplicitLocalWins() if isinstance(plan.assignments[
+                        next(i for i, p in enumerate(participants)
+                             if p.pull_request == pr.identity)], LocalWinsPRAssignment)
+                    else _temporary_target_authority(
+                        tracked_state, pr.identity, ref, pr.head_oid)),)
+
+    absent = tuple((p.branch, p.desired_oid) for p in participants
+                   if p.pull_request is None)
+    retained_boundaries = boundaries
+    written_refs = {update.ref for update in existing_updates}
+    boundaries = tuple(item for item in boundaries if item.ref in written_refs)
+    batch = (TemporaryTargetExistingBatch(existing_updates, boundaries)
+             if existing_updates else None)
+    slots = tuple(p.slot for p in participants)
+    written_prs = {p.pull_request for p in participants
+                   if p.pull_request is not None and any(
+                       update.ref.full_name == f"refs/heads/{p.branch}"
+                       for update in existing_updates)}
+    created_slots = {p.slot for p in participants if p.pull_request is None}
+    removed = set(plan.goal.removed) if isinstance(plan, MixedMembershipPlan) else set()
+    active_prs = {p.pull_request for p in participants if p.pull_request is not None}
+    preserved_publications = tuple(
+        item for item in tracked_state.last_published_heads
+        if item.pr in active_prs and item.pr not in removed and item.pr not in written_prs
+    )
+    publications = tuple((p.slot, f"refs/heads/{p.branch}", p.desired_oid)
+                         for p in participants
+                         if p.slot in created_slots or p.pull_request in written_prs)
+    publications += tuple((f"pr:{item.pr.number}", item.ref.full_name,
+                           item.verified_commit_id)
+                          for item in preserved_publications)
+    scope = set(identities)
+    detached = tuple(item for item in tracked_state.detached_associations
+                     if item.pr in scope)
+    if isinstance(plan, MixedMembershipPlan):
+        authority = tracked_state.last_published_heads + tracked_state.last_adopted_heads
+        detached_by_pr = {item.pr: item for item in detached}
+        for receipt in authority:
+            if receipt.pr in plan.goal.removed:
+                detached_by_pr[receipt.pr] = DetachedAssociation(
+                    receipt.pr, receipt.ref, receipt.verified_commit_id)
+        for participant in participants:
+            if participant.pull_request is not None:
+                detached_by_pr.pop(participant.pull_request, None)
+        detached = tuple(detached_by_pr.values())
+    core_adoptions = tuple(
+        item for item in tracked_state.last_adopted_heads
+        if item.pr in active_prs and item.pr not in removed and item.pr not in written_prs
+    )
+    core = TemporaryTargetCoreGoal(
+        _temporary_target_projection(tracked_state, repository, scope), base,
+        historical, slots, publications,
+        core_adoptions,
+        detached, retained_boundaries)
+    source = TemporaryTargetSourceGuard(
+        source_stack, source_node, tuple(pr.identity for pr in source_prs), source_prs)
+    identity = "temporary-target:" + ":".join(
+        (repository.node_id, *(p.slot + "@" + p.desired_oid for p in participants)))
+    return TemporaryTargetObligation(
+        identity, repository, push_url, selected_policy.base,
+        selected_policy.required_statuses, tuple(participants), source, absent,
+        batch, core)
+
+
 @dataclass(frozen=True)
 class RecoveryEntry:
     """One exact write sent (or about to be sent), with stable causal identity."""
@@ -1431,6 +1829,8 @@ class RecoveryEntry:
     identity: str
     attempt: MutationAttempt
     possibly_live: bool = False
+    obligation: str | None = None
+    verified_applied: bool = False
 
     def __post_init__(self) -> None:
         if not self.identity:
@@ -1440,11 +1840,19 @@ class RecoveryEntry:
 @dataclass(frozen=True)
 class RecoveryJournal:
     entries: tuple[RecoveryEntry, ...]
+    obligations: tuple[TemporaryTargetObligation, ...] = ()
 
     def __post_init__(self) -> None:
         identities = tuple(entry.identity for entry in self.entries)
-        if not identities or len(set(identities)) != len(identities):
+        obligation_ids = tuple(item.identity for item in self.obligations)
+        if (not identities and not obligation_ids) or len(set(identities)) != len(identities):
             raise ValueError("recovery journal must be nonempty with unique entries")
+        if len(set(obligation_ids)) != len(obligation_ids):
+            raise ValueError("recovery journal obligations must be unique")
+        owners = set(obligation_ids)
+        if any(entry.obligation is not None and entry.obligation not in owners
+               for entry in self.entries):
+            raise ValueError("recovery entry names an unknown obligation")
 
 
 def _run(
@@ -2639,6 +3047,8 @@ def observe_local(
         except Error as exc:
             if key in {
                 "git.push",
+                temporary_target.BASE_CONFIG,
+                temporary_target.STATUSES_CONFIG,
             } and f"Value not found for {key}" in str(exc):
                 continue
             raise
@@ -3177,8 +3587,11 @@ def cas_write_state(
 
 def recovery_to_json(journal: RecoveryJournal) -> str:
     return json.dumps(
-        {"entries": [_recovery_entry_to_dict(entry) for entry in journal.entries]},
-        sort_keys=True, separators=(",", ":"),
+        {"version": 2,
+         "entries": [_recovery_entry_to_dict(entry) for entry in journal.entries],
+         "obligations": [_obligation_to_dict(item) for item in journal.obligations]},
+        sort_keys=True,
+        separators=(",", ":"),
     ) + "\n"
 
 
@@ -3318,6 +3731,15 @@ def _recovery_entry_to_dict(entry: RecoveryEntry) -> dict[str, object]:
                 pr.number for pr in attempt.invocation_local_authority
             ],
         }
+    elif isinstance(attempt, ObligationStackUnlinkAttempt):
+        payload = {
+            "kind": "obligation-unlink", "identity": entry.identity,
+            "possibly_live": entry.possibly_live,
+            "repository": asdict(attempt.repository), "stack": attempt.stack.number,
+            "stack_node_id": attempt.stack_node_id,
+            "members": [member.number for member in attempt.members],
+            "retained_members": [member.number for member in attempt.retained_members],
+        }
     else:
         assert isinstance(attempt, DetachedCloseAttempt)
         association = attempt.association
@@ -3330,17 +3752,219 @@ def _recovery_entry_to_dict(entry: RecoveryEntry) -> dict[str, object]:
             "disposition": association.disposition.value,
             "expected_state": attempt.expected_state.value,
         }
+    if entry.obligation is not None:
+        payload["obligation"] = entry.obligation
+    if entry.verified_applied:
+        payload["verified_applied"] = True
     return payload
+
+
+def _obligation_to_dict(item: TemporaryTargetObligation) -> dict[str, object]:
+    def receipt(
+        value: LastPublishedHead | LastAdoptedHead | LastPublishedBoundary,
+    ) -> dict[str, object]:
+        identity = value.merged_pr if isinstance(value, LastPublishedBoundary) else value.pr
+        return {"pr": identity.number, "ref": value.ref.full_name,
+                "oid": value.verified_commit_id}
+    return {
+        "identity": item.identity, "repository": asdict(item.repository),
+        "push_url": item.push_url, "temporary_base": item.temporary_base,
+        "contexts": list(item.contexts),
+        "participants": [
+            {"slot": p.slot, "branch": p.branch, "desired_oid": p.desired_oid,
+             "entry_base": p.entry_base, "final_base": p.final_base,
+             "final_title": p.final_title, "final_body": p.final_body,
+             "entry_title": p.entry_title, "entry_body": p.entry_body,
+             "pull_request": None if p.pull_request is None else p.pull_request.number}
+            for p in item.participants],
+        "source": {"stack": None if item.source.stack is None else item.source.stack.number,
+                   "stack_node_id": item.source.stack_node_id,
+                   "members": [member.number for member in item.source.members],
+                   "pull_requests": [asdict(pr) for pr in item.source.pull_requests]},
+        "absent_branches": [list(value) for value in item.absent_branches],
+        "existing_batch": None if item.existing_batch is None else {
+        "heads": [
+            {"ref": update.ref.full_name, "old": update.expected_old_commit_id,
+             "new": update.new_commit_id,
+             "authority": (
+                 {"kind": "publication", "receipt": receipt(update.authority.publication)}
+                 if isinstance(update.authority, MatchesLastPublication) else
+                 {"kind": "adoption", "receipt": receipt(update.authority.adoption)}
+                 if isinstance(update.authority, MatchesLastAdoption) else
+                 {"kind": "local-wins"} if isinstance(update.authority, ExplicitLocalWins)
+                 else {"kind": "fast-forward"})}
+            for update in item.existing_batch.heads],
+        "boundaries": [receipt(value) for value in item.existing_batch.boundaries]},
+        "core": {"expected": json.loads(state_to_json(item.core.expected)),
+                 "stack_base": item.core.stack_base,
+                 "historical_members": [pr.number for pr in item.core.historical_members],
+                 "stack_slots": list(item.core.stack_slots),
+                 "publications": [list(value) for value in item.core.publications],
+                 "adoptions": [receipt(value) for value in item.core.adoptions],
+                 "detached": [asdict(value) for value in item.core.detached],
+                 "boundaries": [receipt(value) for value in item.core.boundaries]},
+        "status_success": None if item.status_success is None else {
+            "bindings": [[pr.number, oid] for pr, oid in item.status_success.bindings],
+            "contexts": list(item.status_success.contexts)},
+    }
+
+
+def _parse_guard_pr(
+    repository: GitHubRepositoryId, raw: object
+) -> GitHubPullRequest:
+    fields = {"identity", "node_id", "state", "draft", "head_repository",
+              "head_branch", "head_oid", "base_branch", "base_oid",
+              "auto_merge_enabled", "in_merge_queue", "title", "body", "stack"}
+    if not isinstance(raw, dict) or set(raw) != fields:
+        raise ValueError("temporary-target source PR is malformed")
+    identity = raw["identity"]
+    if not isinstance(identity, dict) or set(identity) != {"repository", "number"}:
+        raise ValueError("temporary-target source PR identity is malformed")
+    stack_raw = raw["stack"]
+    stack = None
+    if stack_raw is not None:
+        if not isinstance(stack_raw, dict) or set(stack_raw) != {
+                "identity", "node_id", "base_branch"}:
+            raise ValueError("temporary-target source stack is malformed")
+        stack_id = stack_raw["identity"]
+        if not isinstance(stack_id, dict) or set(stack_id) != {"repository", "number"}:
+            raise ValueError("temporary-target source stack identity is malformed")
+        stack = GitHubStackSummary(GitHubStackId(repository, stack_id["number"]),
+                                   stack_raw["node_id"], stack_raw["base_branch"])
+    head_repository = None if raw["head_repository"] is None else repository
+    return GitHubPullRequest(
+        PullRequestId(repository, identity["number"]), raw["node_id"],
+        PullRequestState(raw["state"]), raw["draft"], head_repository,
+        raw["head_branch"], raw["head_oid"], raw["base_branch"], raw["base_oid"],
+        raw["auto_merge_enabled"], raw["in_merge_queue"], raw["title"], raw["body"], stack)
+
+
+def _parse_guard_detached(
+    repository: GitHubRepositoryId, raw: object
+) -> DetachedAssociation:
+    if not isinstance(raw, dict) or set(raw) != {
+            "pr", "ref", "verified_commit_id", "disposition"}:
+        raise ValueError("temporary-target detached receipt is malformed")
+    return DetachedAssociation(
+        PullRequestId(repository, raw["pr"]["number"]),
+        RemoteBranchRef(repository, raw["ref"]["full_name"]),
+        raw["verified_commit_id"], DetachedDisposition(raw["disposition"]))
+
+
+def _parse_obligation(raw: object) -> TemporaryTargetObligation:
+    fields = {"identity", "repository", "push_url", "temporary_base", "contexts",
+              "participants", "source", "absent_branches", "existing_batch",
+              "core", "status_success"}
+    if not isinstance(raw, dict) or set(raw) != fields:
+        raise ValueError("temporary-target obligation fields are invalid")
+    repo_raw = raw["repository"]
+    if not isinstance(repo_raw, dict) or set(repo_raw) != {"host", "node_id"}:
+        raise ValueError("temporary-target repository is malformed")
+    repository = GitHubRepositoryId(**repo_raw)
+    participants_raw, source_raw, batch_raw, core_raw = (
+        raw["participants"], raw["source"], raw["existing_batch"], raw["core"])
+    if (not isinstance(participants_raw, list) or not isinstance(source_raw, dict)
+            or set(source_raw) != {"stack", "stack_node_id", "members", "pull_requests"}
+            or not isinstance(core_raw, dict)
+            or set(core_raw) != {"expected", "stack_base", "historical_members",
+                                 "stack_slots", "publications", "adoptions",
+                                 "detached", "boundaries"}):
+        raise ValueError("temporary-target obligation candidate is malformed")
+    participant_fields = {"slot", "branch", "desired_oid", "entry_base", "final_base",
+                          "final_title", "final_body", "pull_request",
+                          "entry_title", "entry_body"}
+    if any(not isinstance(item, dict) or set(item) != participant_fields
+           for item in participants_raw):
+        raise ValueError("temporary-target participants are malformed")
+    participants = tuple(TemporaryTargetParticipant(
+        item["slot"], item["branch"], item["desired_oid"], item["entry_base"],
+        item["final_base"], item["final_title"], item["final_body"],
+        None if item["pull_request"] is None else PullRequestId(repository, item["pull_request"]),
+        item["entry_title"], item["entry_body"])
+        for item in participants_raw)
+    stack_number = source_raw["stack"]
+    source = TemporaryTargetSourceGuard(
+        None if stack_number is None else GitHubStackId(repository, stack_number),
+        source_raw["stack_node_id"],
+        tuple(PullRequestId(repository, number) for number in source_raw["members"]),
+        tuple(_parse_guard_pr(repository, item) for item in source_raw["pull_requests"]))
+    def receipts(values: object, boundary: bool = False) -> tuple[LastPublishedHead, ...] | tuple[LastPublishedBoundary, ...]:
+        if not isinstance(values, list) or any(not isinstance(item, dict)
+                or set(item) != {"pr", "ref", "oid"} for item in values):
+            raise ValueError("temporary-target receipts are malformed")
+        cls = LastPublishedBoundary if boundary else LastPublishedHead
+        return tuple(cls(PullRequestId(repository, item["pr"]),
+            RemoteBranchRef(repository, item["ref"]), item["oid"]) for item in values)
+    status_raw = raw["status_success"]
+    status = None
+    if status_raw is not None:
+        if not isinstance(status_raw, dict) or set(status_raw) != {"bindings", "contexts"}:
+            raise ValueError("status-success fields are invalid")
+        status = StatusSuccess(tuple((PullRequestId(repository, value[0]), value[1])
+            for value in status_raw["bindings"]), tuple(status_raw["contexts"]))
+    absent = raw["absent_branches"]
+    if not isinstance(absent, list) or any(not isinstance(value, list) or len(value) != 2
+                                           for value in absent):
+        raise ValueError("temporary-target absent batch is malformed")
+    batch = None
+    if batch_raw is not None:
+        if not isinstance(batch_raw, dict) or set(batch_raw) != {"heads", "boundaries"}:
+            raise ValueError("temporary-target existing batch is malformed")
+        heads = []
+        for item in batch_raw["heads"]:
+            if not isinstance(item, dict) or set(item) != {"ref", "old", "new", "authority"}:
+                raise ValueError("temporary-target head is malformed")
+            authority_raw = item["authority"]
+            if not isinstance(authority_raw, dict) or authority_raw.get("kind") not in {
+                    "fast-forward", "local-wins", "publication", "adoption"}:
+                raise ValueError("temporary-target authority is malformed")
+            kind = authority_raw["kind"]
+            if kind == "publication":
+                authority: Authority = MatchesLastPublication(
+                    receipts([authority_raw["receipt"]])[0])
+            elif kind == "adoption":
+                value = receipts([authority_raw["receipt"]])[0]
+                authority = MatchesLastAdoption(LastAdoptedHead(value.pr, value.ref,
+                                                                 value.verified_commit_id))
+            else:
+                if set(authority_raw) != {"kind"}:
+                    raise ValueError("temporary-target authority fields are invalid")
+                authority = ExplicitLocalWins() if kind == "local-wins" else FastForward()
+            heads.append(PlannedHeadUpdate(RemoteBranchRef(repository, item["ref"]),
+                                           item["old"], item["new"], authority))
+        batch = TemporaryTargetExistingBatch(tuple(heads), receipts(batch_raw["boundaries"], True))
+    expected = parse_state(json.dumps(core_raw["expected"]))
+    detached = tuple(_parse_guard_detached(repository, item) for item in core_raw["detached"])
+    adopted_heads = receipts(core_raw["adoptions"])
+    core = TemporaryTargetCoreGoal(
+        expected, core_raw["stack_base"],
+        tuple(PullRequestId(repository, number) for number in core_raw["historical_members"]),
+        tuple(core_raw["stack_slots"]),
+        tuple(tuple(value) for value in core_raw["publications"]),
+        tuple(LastAdoptedHead(value.pr, value.ref, value.verified_commit_id)
+              for value in adopted_heads), detached,
+        receipts(core_raw["boundaries"], True))
+    return TemporaryTargetObligation(raw["identity"], repository, raw["push_url"],
+        raw["temporary_base"], tuple(raw["contexts"]), participants, source,
+        tuple((value[0], value[1]) for value in absent), batch, core, status)
 
 
 def parse_recovery(data: str) -> RecoveryJournal:
     try:
         raw = json.loads(data)
-        if not isinstance(raw, dict) or set(raw) != {"entries"}:
+        if not isinstance(raw, dict):
+            raise ValueError("root must be an object")
+        legacy = set(raw) == {"entries"}
+        if not legacy and set(raw) != {"version", "entries", "obligations"}:
             raise ValueError("root fields are invalid")
-        if not isinstance(raw["entries"], list):
-            raise ValueError("entries must be an array")
-        return RecoveryJournal(tuple(_parse_recovery_entry(item) for item in raw["entries"]))
+        if not legacy and raw["version"] != 2:
+            raise ValueError("unsupported recovery journal version")
+        entries_raw = raw["entries"]
+        obligations_raw = [] if legacy else raw["obligations"]
+        if not isinstance(entries_raw, list) or not isinstance(obligations_raw, list):
+            raise ValueError("entries and obligations must be arrays")
+        return RecoveryJournal(tuple(_parse_recovery_entry(item) for item in entries_raw),
+            tuple(_parse_obligation(item) for item in obligations_raw))
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise Error(f"invalid {RECOVERY_REF} payload: {exc}") from exc
 
@@ -3370,7 +3994,9 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
     if not isinstance(raw, dict):
         raise ValueError("entry must be an object")
     kind = raw.get("kind")
-    common_fields = {"kind", "identity", "possibly_live", "repository"}
+    owner_fields = ({"obligation"} if isinstance(raw, dict) and "obligation" in raw else set())
+    verified_fields = ({"verified_applied"} if isinstance(raw, dict) and "verified_applied" in raw else set())
+    common_fields = {"kind", "identity", "possibly_live", "repository"} | owner_fields | verified_fields
     expected_fields = (
         common_fields | {"push_url", "updates", "tracking", "publications", "boundaries"}
         if kind == "heads"
@@ -3398,8 +4024,10 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
             "live_refs", "ownership", "invocation_local_authority"
         }
         if kind == "unstack"
-        else common_fields | {'pr', 'ref', 'commit', 'disposition', 'expected_state'}
-        if kind == 'close-detached'
+        else common_fields | {"stack", "stack_node_id", "members", "retained_members"}
+        if kind == "obligation-unlink"
+        else common_fields | {"pr", "ref", "commit", "disposition", "expected_state"}
+        if kind == "close-detached"
         else None
     )
     if expected_fields is None or set(raw) != expected_fields:
@@ -3614,13 +4242,26 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
             tuple(PullRequestId(repository, number) for number in
                   raw.get("invocation_local_authority", [])),
         )
+    elif kind == "obligation-unlink":
+        numbers = raw["members"]
+        retained = raw["retained_members"]
+        if not isinstance(numbers, list) or not isinstance(retained, list):
+            raise ValueError("obligation unlink members must be an array")
+        attempt = ObligationStackUnlinkAttempt(repository,
+            GitHubStackId(repository, raw["stack"]), raw["stack_node_id"],
+            tuple(PullRequestId(repository, number) for number in numbers),
+            tuple(PullRequestId(repository, number) for number in retained))
     else:
         attempt = DetachedCloseAttempt(DetachedAssociation(
             PullRequestId(repository, raw["pr"]), RemoteBranchRef(repository, raw["ref"]),
             raw["commit"], DetachedDisposition(raw["disposition"])),
             PullRequestState(raw["expected_state"]),
         )
-    return RecoveryEntry(identity, attempt, possibly_live)
+    owner = raw.get("obligation")
+    verified = raw.get("verified_applied", False)
+    if owner is not None and not isinstance(owner, str) or not isinstance(verified, bool):
+        raise ValueError("recovery ownership fields are malformed")
+    return RecoveryEntry(identity, attempt, possibly_live, owner, verified)
 
 
 def read_recovery(workspace: str | Path) -> tuple[str | None, RecoveryJournal | None]:
@@ -3661,11 +4302,16 @@ def cas_write_recovery(
 
 
 def _append_recovery(
-    workspace: str | Path, attempt: MutationAttempt
+    workspace: str | Path, attempt: MutationAttempt, *, obligation: str | None = None
 ) -> tuple[str, RecoveryEntry]:
     oid, journal = read_recovery(workspace)
-    entry = RecoveryEntry(os.urandom(16).hex(), attempt)
-    updated = RecoveryJournal((journal.entries if journal is not None else ()) + (entry,))
+    if obligation is None and journal is not None and any(
+            _obligation_conflicts_attempt(item, attempt)
+            for item in journal.obligations):
+        raise ConcurrentUpdate("an overlapping temporary-target obligation is active")
+    entry = RecoveryEntry(os.urandom(16).hex(), attempt, obligation=obligation)
+    updated = RecoveryJournal((journal.entries if journal is not None else ()) + (entry,),
+                              () if journal is None else journal.obligations)
     new_oid = cas_write_recovery(workspace, oid, updated)
     assert new_oid is not None
     return new_oid, entry
@@ -3685,7 +4331,7 @@ def _replace_recovery_entry(
         replacement if entry.identity == replacement.identity else entry
         for entry in journal.entries
     )
-    new_oid = cas_write_recovery(workspace, oid, RecoveryJournal(entries))
+    new_oid = cas_write_recovery(workspace, oid, RecoveryJournal(entries, journal.obligations))
     assert new_oid is not None
     return new_oid
 
@@ -3701,9 +4347,68 @@ def _remove_recovery_entry(
     entries = tuple(entry for entry in journal.entries if entry.identity != identity)
     return cas_write_recovery(
         workspace, oid,
-        RecoveryJournal(entries)
-        if entries else None
+        RecoveryJournal(entries, journal.obligations)
+        if entries or journal.obligations else None
     )
+
+
+def append_temporary_target_obligation(
+    workspace: str | Path, obligation: TemporaryTargetObligation
+) -> str:
+    """CAS-add frozen authority before its first external effect."""
+    oid, journal = read_recovery(workspace)
+    entries = () if journal is None else journal.entries
+    obligations = () if journal is None else journal.obligations
+    if any(item.identity == obligation.identity for item in obligations):
+        raise ConcurrentUpdate("temporary-target obligation already exists")
+    if any(_resources_conflict(
+            _obligation_resources(item), _obligation_resources(obligation)
+    ) for item in obligations):
+        raise ConcurrentUpdate("an overlapping temporary-target obligation exists")
+    if any(_obligation_conflicts_attempt(obligation, entry.attempt)
+           for entry in entries):
+        raise ConcurrentUpdate("conflicting legacy recovery is active")
+    result = cas_write_recovery(workspace, oid,
+        RecoveryJournal(entries, obligations + (obligation,)))
+    assert result is not None
+    return result
+
+
+def create_temporary_target_obligation(
+    workspace: str | Path, obligation: TemporaryTargetObligation
+) -> str:
+    """Persist a frozen transaction under the repository lock before any write."""
+    with repository_lock(workspace):
+        return append_temporary_target_obligation(workspace, obligation)
+
+
+def replace_temporary_target_obligation(
+    workspace: str | Path, expected_oid: str, replacement: TemporaryTargetObligation
+) -> str:
+    oid, journal = read_recovery(workspace)
+    if oid != expected_oid or journal is None or sum(
+            item.identity == replacement.identity for item in journal.obligations) != 1:
+        raise ConcurrentUpdate("temporary-target obligation changed")
+    obligations = tuple(replacement if item.identity == replacement.identity else item
+                        for item in journal.obligations)
+    result = cas_write_recovery(workspace, oid, RecoveryJournal(journal.entries, obligations))
+    assert result is not None
+    return result
+
+
+def remove_temporary_target_obligation(
+    workspace: str | Path, expected_oid: str, identity: str
+) -> str | None:
+    oid, journal = read_recovery(workspace)
+    if oid != expected_oid or journal is None or any(
+            entry.obligation == identity for entry in journal.entries):
+        raise ConcurrentUpdate("temporary-target obligation still owns effects")
+    obligations = tuple(item for item in journal.obligations if item.identity != identity)
+    if len(obligations) + 1 != len(journal.obligations):
+        raise ConcurrentUpdate("temporary-target obligation changed")
+    return cas_write_recovery(workspace, oid,
+        RecoveryJournal(journal.entries, obligations)
+        if journal.entries or obligations else None)
 
 
 @contextmanager
@@ -5589,6 +6294,30 @@ def _classify_attempt(
             ):
                 return "foreign"
         return "applied"
+    if isinstance(attempt, ObligationStackUnlinkAttempt):
+        repository = github.resolve_repository(attempt.repository)
+        stack = github.stack(repository, attempt.stack)
+        prs = github.pull_requests(attempt.members)
+        if len(prs) != len(attempt.members) or tuple(pr.identity for pr in prs) != attempt.members:
+            return "foreign"
+        if stack is not None:
+            expected = GitHubStackSummary(
+                attempt.stack, attempt.stack_node_id, stack.base_branch
+            )
+            if stack.node_id != attempt.stack_node_id:
+                return "foreign"
+            if (stack.pull_requests == attempt.members
+                    and all(pr.stack == expected for pr in prs)):
+                return ("applied" if attempt.retained_members == attempt.members
+                        else "not-applied")
+            return "applied" if (
+                stack.pull_requests == attempt.retained_members
+                and all(pr.stack == expected
+                        if pr.identity in attempt.retained_members
+                        else pr.stack is None for pr in prs)
+            ) else "foreign"
+        return "applied" if (not attempt.retained_members
+            and all(pr.stack is None for pr in prs)) else "foreign"
     if isinstance(attempt, DetachedCloseAttempt):
         prs = github.pull_requests((attempt.association.pr,))
         if len(prs) != 1:
@@ -5655,6 +6384,9 @@ def settle_recovery(
     for entry in journal.entries:
         # Obligation effects are durable facts until the core receipt handoff.
         # The generic driver, not legacy settlement, reconciles or retires them.
+        if entry.obligation is not None:
+            remaining.append(entry)
+            continue
         if not entry.possibly_live:
             continue
         if isinstance(entry.attempt, AdoptionAttempt):
@@ -5810,13 +6542,15 @@ def settle_recovery(
             cas_write_recovery(
                 workspace,
                 oid,
-                RecoveryJournal(updated)
-                if updated else None,
+                RecoveryJournal(updated, journal.obligations)
+                if updated or journal.obligations else None,
             )
     return tuple(remaining)
 
 
 def _attempt_conflicts_plan(entry: RecoveryEntry, plan: NoOp | Apply) -> bool:
+    if entry.obligation is not None:
+        return False
     attempt = entry.attempt
     # Scope recovery to complete logical membership and all observed refs;
     # omitted and merged members can still carry unresolved writes.
@@ -6223,6 +6957,8 @@ def push_absent_heads(
 def _first_publication_conflict(
     entry: RecoveryEntry, plan: FirstPublicationPlan
 ) -> bool:
+    if entry.obligation is not None:
+        return False
     names = {goal.branch_name for goal in plan.goal.pull_requests}
     attempt = entry.attempt
     if isinstance(attempt, PullRequestCreationAttempt):
@@ -6279,7 +7015,7 @@ def _retire_first_publication_facts(
     members = set(attempt.pull_requests)
     entries = tuple(
         entry for entry in journal.entries
-        if not (
+        if entry.obligation is not None or not (
             isinstance(entry.attempt, StackCreationAttempt)
             and entry.attempt == attempt
             or isinstance(entry.attempt, BranchCreationAttempt)
@@ -6294,12 +7030,14 @@ def _retire_first_publication_facts(
     )
     cas_write_recovery(
         workspace, expected_oid,
-        RecoveryJournal(entries)
-        if entries else None,
+        RecoveryJournal(entries, journal.obligations)
+        if entries or journal.obligations else None,
     )
 
 
 def _append_conflict(entry: RecoveryEntry, plan: StackAppendPlan) -> bool:
+    if entry.obligation is not None:
+        return False
     goals = {goal.branch_name: goal for goal in plan.goal.pull_requests}
     names = {
         plan.goal.base_branch,
@@ -6357,6 +7095,8 @@ def _append_conflict(entry: RecoveryEntry, plan: StackAppendPlan) -> bool:
         return bool(set(attempt.pull_requests) & members)
     if isinstance(attempt, StackDissolutionAttempt):
         return attempt.stack == plan.goal.stack or bool(set(attempt.members) & members)
+    if isinstance(attempt, ObligationStackUnlinkAttempt):
+        return attempt.stack == plan.goal.stack or bool(set(attempt.members) & members)
     if isinstance(attempt, DetachedCloseAttempt):
         return (
             attempt.association.pr in members
@@ -6378,6 +7118,10 @@ def apply_stack_append(
     """Publish a new suffix and append it with an exactly recoverable request."""
     git = git_transport or SubprocessGitTransport(workspace)
     _oid, journal = read_recovery(workspace)
+    if journal is not None and any(
+        _obligation_conflicts_plan(item, plan) for item in journal.obligations
+    ):
+        return Stopped("recovery", "an overlapping temporary-target obligation is active")
     if dry_run:
         try:
             unresolved = settle_recovery(
@@ -6390,6 +7134,13 @@ def apply_stack_append(
         ) else Verified()
     with repository_lock(workspace):
         _locked_oid, locked_journal = read_recovery(workspace)
+        if locked_journal is not None and any(
+            _obligation_conflicts_plan(item, plan)
+            for item in locked_journal.obligations
+        ):
+            return Stopped(
+                "recovery", "an overlapping temporary-target obligation is active"
+            )
         try:
             unresolved = settle_recovery(
                 workspace, github, git_transport=git
@@ -6601,15 +7352,24 @@ def apply_stack_append(
                 goal_set = set(goals)
                 addition_set = set(additions)
                 retained = tuple(entry for entry in journal.entries if not (
-                    isinstance(entry.attempt, BranchCreationAttempt) and entry.attempt.repository == plan.goal.repository and (set(entry.attempt.goals) == goal_set) or (isinstance(entry.attempt, PullRequestCreationAttempt) and entry.attempt.repository == plan.goal.repository and (entry.attempt.goal in goal_set) and (entry.attempt.pull_request in addition_set))
+                    entry.obligation is None
+                    and (
+                    isinstance(entry.attempt, BranchCreationAttempt)
+                    and entry.attempt.repository == plan.goal.repository
+                    and set(entry.attempt.goals) == goal_set
+                    or isinstance(entry.attempt, PullRequestCreationAttempt)
+                    and entry.attempt.repository == plan.goal.repository
+                    and entry.attempt.goal in goal_set
+                    and entry.attempt.pull_request in addition_set
+                    )
                 ))
                 if retained != journal.entries:
                     try:
                         cas_write_recovery(
                             workspace,
                             journal_oid,
-                            RecoveryJournal(retained)
-                            if retained
+                            RecoveryJournal(retained, journal.obligations)
+                            if retained or journal.obligations
                             else None,
                         )
                     except Error as exc:
@@ -6688,6 +7448,13 @@ def apply_detached_cleanup(
         return Verified()
     with repository_lock(workspace):
         _locked_oid, locked_journal = read_recovery(workspace)
+        if locked_journal is not None and any(
+            _obligation_conflicts_plan(item, plan)
+            for item in locked_journal.obligations
+        ):
+            return Stopped(
+                "recovery", "an overlapping temporary-target obligation is active"
+            )
         targets = plan.retire + plan.selected
         for association in targets:
             try:
@@ -6739,6 +7506,538 @@ def apply_detached_cleanup(
     return Verified(state_recorded=bool(targets))
 
 
+def _owned_effect(
+    workspace: str | Path, github: GitHubClient, obligation: str,
+    attempt: MutationAttempt, send: Callable[[], object],
+    *, git_transport: GitTransport | None = None,
+) -> tuple[str, RecoveryEntry]:
+    """Run one obligation effect without ever replaying an uncertain request."""
+    oid, journal = read_recovery(workspace)
+    assert journal is not None
+    matches = tuple(e for e in journal.entries
+                    if e.obligation == obligation and e.attempt == attempt)
+    if len(matches) > 1:
+        raise ConcurrentUpdate("ambiguous obligation effect")
+    if matches:
+        entry = matches[0]
+        if entry.verified_applied:
+            return oid or "", entry
+        classification = _classify_attempt(
+            workspace, github, attempt, git_transport
+        )
+        if classification == "foreign":
+            raise SourceMismatch("an obligation effect has a foreign result")
+        if (
+            classification == "applied"
+            and not entry.possibly_live
+            and isinstance(
+                attempt,
+                (BranchCreationAttempt, PullRequestCreationAttempt, HeadMutationAttempt),
+            )
+        ):
+            raise SourceMismatch("an unsent obligation effect is already applied")
+        if classification == "not-applied" and entry.possibly_live:
+            raise SourceMismatch("a possibly-live obligation effect read back negative")
+    else:
+        oid, entry = _append_recovery(workspace, attempt, obligation=obligation)
+        classification = _classify_attempt(
+            workspace, github, attempt, git_transport
+        )
+        if classification == "foreign":
+            raise SourceMismatch("an obligation effect has a foreign precondition")
+        if classification == "applied" and isinstance(
+            attempt,
+            (BranchCreationAttempt, PullRequestCreationAttempt, HeadMutationAttempt),
+        ):
+            # Equality observed before this fresh attempt was sent is not
+            # provenance.  Only an earlier possibly-live/verified entry can
+            # own a creation or write that already reads as applied.
+            raise SourceMismatch("an unsent obligation effect is already applied")
+    if classification == "not-applied":
+        live = replace(entry, possibly_live=True)
+        oid = _replace_recovery_entry(workspace, oid, live)
+        entry = live
+        try:
+            send()
+        except (GitHubTransportError, GitPushError):
+            pass
+        except GitHubHttpError as exc:
+            if exc.response.status < 500:
+                _remove_recovery_entry(workspace, oid, entry.identity)
+            raise
+        classification = _classify_attempt(
+            workspace, github, attempt, git_transport
+        )
+        if classification != "applied":
+            raise SourceMismatch(f"obligation effect is {classification}")
+    verified = replace(entry, verified_applied=True)
+    oid = _replace_recovery_entry(workspace, oid, verified)
+    return oid, verified
+
+
+def _target_projection(obligation: TemporaryTargetObligation) -> TrackedState:
+    bound = {p.slot: p for p in obligation.participants}
+    identities = tuple(bound[slot].pull_request for slot in obligation.core.stack_slots)
+    if any(item is None for item in identities):
+        raise SourceMismatch("temporary-target identities are not durably bound")
+    prs = tuple(item for item in identities if item is not None)
+    publications = tuple(LastPublishedHead(
+        bound[slot].pull_request, RemoteBranchRef(obligation.repository, ref), oid)
+        for slot, ref, oid in obligation.core.publications)
+    assert all(item.pr is not None for item in publications)
+    return TrackedState(
+        (TrackedStack(obligation.repository, obligation.core.stack_base,
+                      obligation.core.historical_members + prs),),
+        publications, obligation.core.adoptions, obligation.core.detached,
+        obligation.core.boundaries)
+
+
+def _handoff_temporary_target_state(
+    workspace: str | Path, obligation: TemporaryTargetObligation,
+) -> None:
+    """Replace only the frozen affected projection, accepting an earlier CAS."""
+    oid, state = read_state(workspace)
+    target = _target_projection(obligation)
+    affected = {
+        *obligation.source.members,
+        *obligation.core.historical_members,
+        *(p.pull_request for p in obligation.participants if p.pull_request is not None),
+    }
+    current_projection = _temporary_target_projection(state, obligation.repository, affected)
+    if current_projection == target:
+        return
+    if current_projection != obligation.core.expected:
+        raise SourceMismatch("tracked-state affected projection changed")
+    new = TrackedState(
+        tuple(s for s in state.stacks if not (s.repository == obligation.repository
+              and affected.intersection(s.ordered_prs))) + target.stacks,
+        tuple(x for x in state.last_published_heads if x.pr not in affected)
+            + target.last_published_heads,
+        tuple(x for x in state.last_adopted_heads if x.pr not in affected)
+            + target.last_adopted_heads,
+        tuple(x for x in state.detached_associations if x.pr not in affected)
+            + target.detached_associations,
+        tuple(x for x in state.last_published_boundaries if x.merged_pr not in affected)
+            + target.last_published_boundaries,
+    )
+    cas_write_state(workspace, oid, new)
+
+
+def apply_temporary_target_obligation(
+    workspace: str | Path, github: GitHubClient, obligation_id: str,
+    dry_run: bool = False,
+    git_transport: GitTransport | None = None,
+) -> ApplyResult:
+    """Resume a frozen temporary-target transaction; no planning input is read."""
+    if dry_run:
+        return Verified()
+    git = git_transport or SubprocessGitTransport(workspace)
+    with repository_lock(workspace):
+        try:
+            oid, journal = read_recovery(workspace)
+            if journal is None:
+                return Stopped("temporary-target", "obligation is absent")
+            found = tuple(x for x in journal.obligations if x.identity == obligation_id)
+            if len(found) != 1:
+                return Stopped("temporary-target", "obligation is absent or ambiguous")
+            obligation = found[0]
+            repository = github.resolve_repository(obligation.repository)
+            if repository.identity != obligation.repository:
+                raise SourceMismatch("temporary-target repository changed")
+
+            owned = tuple(e for e in journal.entries if e.obligation == obligation_id)
+            if obligation.status_success is None:
+                for entry in owned:
+                    if not entry.possibly_live or entry.verified_applied:
+                        continue
+                    classification = _classify_attempt(
+                        workspace, github, entry.attempt, git
+                    )
+                    if classification != "applied":
+                        raise SourceMismatch(
+                            "a possibly-live obligation effect is " + classification
+                        )
+                    assert oid is not None
+                    oid = _replace_recovery_entry(
+                        workspace, oid, replace(entry, verified_applied=True)
+                    )
+                oid, journal = read_recovery(workspace)
+                assert journal is not None
+                owned = tuple(
+                    entry for entry in journal.entries
+                    if entry.obligation == obligation_id
+                )
+
+            # Before an unlink can be sent, require the complete frozen source.
+            unlink_done = any(isinstance(e.attempt, ObligationStackUnlinkAttempt)
+                              and e.verified_applied for e in owned)
+            unlink_required = (
+                obligation.source.stack is not None
+                and obligation.source.members != obligation.core.historical_members
+            )
+            if (obligation.source.pull_requests
+                    and not any(entry.verified_applied for entry in owned)):
+                actual = github.pull_requests(obligation.source.members)
+                owned_branches = {
+                    pr.head_branch
+                    for pr in obligation.source.pull_requests
+                    if pr.head_repository == obligation.repository
+                }
+                if len(actual) != len(obligation.source.pull_requests):
+                    raise SourceMismatch("source pull requests changed")
+                guarded_actual = tuple(
+                    replace(observed, base_oid=frozen.base_oid)
+                    if observed.base_branch == frozen.base_branch
+                    and frozen.base_branch not in owned_branches
+                    else observed
+                    for observed, frozen in zip(
+                        actual, obligation.source.pull_requests, strict=True
+                    )
+                )
+                if guarded_actual != obligation.source.pull_requests:
+                    raise SourceMismatch("source pull requests changed")
+                if obligation.source.stack is not None:
+                    stack = github.stack(repository, obligation.source.stack)
+                    if (stack is None or stack.node_id != obligation.source.stack_node_id
+                            or stack.pull_requests != obligation.source.members):
+                        raise SourceMismatch("source stack membership changed")
+
+            if unlink_required and not unlink_done:
+                attempt = ObligationStackUnlinkAttempt(
+                    obligation.repository, obligation.source.stack,
+                    obligation.source.stack_node_id or "", obligation.source.members,
+                    obligation.core.historical_members)
+                _owned_effect(workspace, github, obligation_id, attempt,
+                    lambda: github.unstack(repository, obligation.source.stack),
+                    git_transport=git)
+                standalone = github.pull_requests(obligation.source.members)
+                retained = github.stack(repository, obligation.source.stack)
+                retained_summary = None if retained is None else GitHubStackSummary(
+                    retained.identity, retained.node_id, retained.base_branch
+                )
+                if (retained is None) != (not obligation.core.historical_members) or (
+                    retained is not None and (
+                        retained.node_id != obligation.source.stack_node_id
+                        or retained.pull_requests != obligation.core.historical_members
+                    )
+                ) or standalone != tuple(replace(
+                    pr,
+                    stack=(retained_summary
+                           if pr.identity in obligation.core.historical_members
+                           else None),
+                ) for pr in obligation.source.pull_requests):
+                    raise SourceMismatch("unlinked participants are not exact standalone PRs")
+
+            def validate_forward_state() -> None:
+                """Require every observed change to have an obligation receipt."""
+                _current_oid, current_journal = read_recovery(workspace)
+                assert current_journal is not None
+                effects = tuple(
+                    entry for entry in current_journal.entries
+                    if entry.obligation == obligation_id
+                )
+                exact = {
+                    entry.attempt.pull_request: entry.attempt
+                    for entry in effects
+                    if entry.verified_applied
+                    and isinstance(entry.attempt, ExactPullRequestMutationAttempt)
+                }
+                bound = tuple(
+                    participant for participant in obligation.participants
+                    if participant.pull_request is not None
+                )
+                actuals = github.pull_requests(tuple(
+                    participant.pull_request for participant in bound
+                    if participant.pull_request is not None
+                ))
+                if len(actuals) != len(bound):
+                    raise SourceMismatch("temporary-target participants changed")
+                source = {pr.identity: pr for pr in obligation.source.pull_requests}
+                for actual, participant in zip(actuals, bound, strict=True):
+                    mutation = exact.get(participant.pull_request)
+                    expected_metadata = (
+                        (mutation.title, mutation.body) if mutation is not None
+                        else (participant.entry_title or participant.final_title,
+                              participant.entry_body if participant.entry_body is not None
+                              else participant.final_body)
+                    )
+                    expected_base = (mutation.base if mutation is not None
+                                     else participant.entry_base)
+                    if (actual.identity != participant.pull_request
+                            or actual.head_repository != obligation.repository
+                            or actual.head_branch != participant.branch
+                            or actual.state is not PullRequestState.OPEN
+                            or actual.stack is not None
+                            or actual.base_branch != expected_base
+                            or (actual.title, actual.body) != expected_metadata):
+                        raise SourceMismatch("temporary-target participant drifted")
+                    old = source.get(participant.pull_request)
+                    if old is not None and actual.head_oid not in {
+                        old.head_oid, participant.desired_oid
+                    }:
+                        raise SourceMismatch("temporary-target participant head drifted")
+
+                branch_written = any(
+                    entry.verified_applied
+                    and isinstance(entry.attempt, BranchCreationAttempt)
+                    for entry in effects
+                )
+                head_written = any(
+                    entry.verified_applied
+                    and isinstance(entry.attempt, HeadMutationAttempt)
+                    for entry in effects
+                )
+                expected_refs: dict[str, str | None] = {
+                    f"refs/heads/{participant.branch}": (
+                        participant.desired_oid if branch_written
+                        else None
+                    )
+                    for participant in obligation.participants
+                    if participant.pull_request is None
+                }
+                for participant in bound:
+                    old = source.get(participant.pull_request)
+                    expected_refs[f"refs/heads/{participant.branch}"] = (
+                        participant.desired_oid if head_written or old is None
+                        else old.head_oid
+                    )
+                for boundary in obligation.core.boundaries:
+                    update = next(
+                        (
+                            item
+                            for item in (
+                                ()
+                                if obligation.existing_batch is None
+                                else obligation.existing_batch.heads
+                            )
+                            if item.ref == boundary.ref
+                        ),
+                        None,
+                    )
+                    expected_refs.setdefault(
+                        boundary.ref.full_name,
+                        boundary.verified_commit_id
+                        if update is None or head_written
+                        else update.expected_old_commit_id,
+                    )
+                observed = git.observe_live_refs(
+                    obligation.push_url, obligation.repository,
+                    tuple(expected_refs),
+                )
+                if {item.ref.full_name: item.commit_id for item in observed} != expected_refs:
+                    raise SourceMismatch("temporary-target refs drifted")
+
+            # Once success is durable, never bounce an already-restored member
+            # back to the temporary base.
+            if obligation.status_success is None:
+                for participant in obligation.participants:
+                    if participant.pull_request is None:
+                        continue
+                    validate_forward_state()
+                    entry_title = participant.entry_title or participant.final_title
+                    entry_body = (participant.entry_body
+                                  if participant.entry_body is not None
+                                  else participant.final_body)
+                    attempt = ExactPullRequestMutationAttempt(
+                        obligation.repository, participant.pull_request,
+                        participant.entry_base, entry_title, entry_body,
+                        obligation.temporary_base, entry_title, entry_body)
+                    _owned_effect(workspace, github, obligation_id, attempt,
+                        lambda p=participant: github.update_pull_request(
+                            repository, p.pull_request,
+                            base_branch=obligation.temporary_base),
+                        git_transport=git)
+
+            if obligation.status_success is None and obligation.absent_branches:
+                goals = tuple(NewPullRequestGoal(oid_, branch, obligation.temporary_base,
+                    next(p.final_title for p in obligation.participants if p.branch == branch),
+                    next(p.final_body for p in obligation.participants if p.branch == branch))
+                    for branch, oid_ in obligation.absent_branches)
+                branch_attempt = BranchCreationAttempt(obligation.repository,
+                                                       obligation.push_url, goals)
+                validate_forward_state()
+                _owned_effect(workspace, github, obligation_id, branch_attempt,
+                    lambda: git.push_absent_heads(
+                        obligation.push_url, obligation.repository, goals
+                    ), git_transport=git)
+                for goal in goals:
+                    participant = next(p for p in obligation.participants
+                                       if p.branch == goal.branch_name)
+                    if participant.pull_request is not None:
+                        continue
+                    validate_forward_state()
+                    attempt = PullRequestCreationAttempt(obligation.repository, goal)
+                    _owned_effect(workspace, github, obligation_id, attempt,
+                        lambda g=goal: github.create_pull_request(repository,
+                            head_branch=g.branch_name, base_branch=g.base_branch,
+                            title=g.title, body=g.body, draft=False),
+                        git_transport=git)
+                    matches = github.find_pull_requests(obligation.repository,
+                        head_branches=(goal.branch_name,), states=tuple(PullRequestState))
+                    exact = tuple(p for p in matches if p.head_oid == goal.commit_id
+                                  and p.base_branch == obligation.temporary_base
+                                  and p.title == goal.title and p.body == goal.body)
+                    if len(exact) != 1:
+                        raise SourceMismatch("created pull request is not exact")
+                    if participant.pull_request is None:
+                        oid, current = read_recovery(workspace)
+                        assert oid is not None and current is not None
+                        obligation = replace(obligation, participants=tuple(
+                            replace(p, pull_request=exact[0].identity) if p == participant else p
+                            for p in obligation.participants))
+                        replace_temporary_target_obligation(workspace, oid, obligation)
+
+            if obligation.status_success is None and obligation.existing_batch is not None:
+                participants = tuple(p.pull_request for p in obligation.participants
+                                     if p.pull_request is not None)
+                tracking = TrackedStack(obligation.repository, obligation.temporary_base,
+                    obligation.core.historical_members + participants)
+                by_ref = {f"refs/heads/{p.branch}": p.pull_request
+                          for p in obligation.participants}
+                boundary_refs = {item.ref for item in obligation.existing_batch.boundaries}
+                pubs = tuple(LastPublishedHead(by_ref[u.ref.full_name], u.ref,
+                                               u.new_commit_id)
+                             for u in obligation.existing_batch.heads
+                             if u.ref.full_name in by_ref and u.ref not in boundary_refs)
+                attempt = HeadMutationAttempt(obligation.repository, obligation.push_url,
+                    obligation.existing_batch.heads, tracking, pubs,
+                    obligation.existing_batch.boundaries)
+                validate_forward_state()
+                _owned_effect(workspace, github, obligation_id, attempt,
+                    lambda: git.push_exact_head_updates(
+                        obligation.push_url, obligation.existing_batch.heads
+                    ), git_transport=git)
+
+            def validate_refs() -> None:
+                expected = {
+                    f"refs/heads/{p.branch}": p.desired_oid
+                    for p in obligation.participants
+                }
+                for boundary in obligation.core.boundaries:
+                    previous = expected.setdefault(
+                        boundary.ref.full_name, boundary.verified_commit_id
+                    )
+                    if previous != boundary.verified_commit_id:
+                        raise SourceMismatch("temporary-target ref expectations conflict")
+                observed = git.observe_live_refs(
+                    obligation.push_url, obligation.repository, tuple(expected)
+                )
+                if {item.ref.full_name: item.commit_id for item in observed} != expected:
+                    raise SourceMismatch("temporary-target live refs changed")
+
+            if obligation.status_success is None:
+                # Exact temporary-base readback precedes the status receipt.
+                prs = github.pull_requests(tuple(p.pull_request for p in obligation.participants
+                                                 if p.pull_request is not None))
+                if len(prs) != len(obligation.participants) or any(
+                        actual.identity != frozen.pull_request
+                        or actual.head_repository != obligation.repository
+                        or actual.head_branch != frozen.branch
+                        or actual.head_oid != frozen.desired_oid
+                        or actual.base_branch != obligation.temporary_base
+                        or actual.state is not PullRequestState.OPEN
+                        or actual.stack is not None
+                        or (actual.title, actual.body) != (
+                            frozen.entry_title or frozen.final_title,
+                            frozen.entry_body if frozen.entry_body is not None
+                            else frozen.final_body)
+                        for actual, frozen in zip(prs, obligation.participants, strict=True)):
+                    raise SourceMismatch("temporary-target exact readback changed")
+                validate_refs()
+                ready = True
+                for participant in obligation.participants:
+                    statuses = github.commit_statuses(repository, participant.desired_oid,
+                                                       contexts=obligation.contexts)
+                    ready &= all(statuses.get(c) is CommitStatusState.SUCCESS
+                                 for c in obligation.contexts)
+                if not ready:
+                    return Stopped("temporary-target-statuses", "required statuses are pending")
+                receipt = StatusSuccess(tuple((p.pull_request, p.desired_oid)
+                    for p in obligation.participants if p.pull_request is not None),
+                    obligation.contexts)
+                oid, _ = read_recovery(workspace)
+                assert oid is not None
+                obligation = replace(obligation, status_success=receipt)
+                replace_temporary_target_obligation(workspace, oid, obligation)
+
+            # A durable success receipt forbids status reads and permits only exact restoration.
+            expected_receipt = tuple((p.pull_request, p.desired_oid)
+                                     for p in obligation.participants)
+            if obligation.status_success.bindings != expected_receipt:
+                raise SourceMismatch("status receipt no longer matches desired heads")
+
+            def validate_bound(*, final: bool = False) -> None:
+                identities = tuple(p.pull_request for p in obligation.participants)
+                if any(identity is None for identity in identities):
+                    raise SourceMismatch("temporary-target identity is not bound")
+                actuals = github.pull_requests(tuple(identity for identity in identities
+                                                     if identity is not None))
+                if len(actuals) != len(obligation.participants):
+                    raise SourceMismatch("temporary-target membership changed")
+                for actual, frozen in zip(actuals, obligation.participants, strict=True):
+                    allowed_bases = {frozen.final_base} if final else {
+                        obligation.temporary_base, frozen.final_base}
+                    entry_metadata = (
+                        frozen.entry_title or frozen.final_title,
+                        frozen.entry_body
+                        if frozen.entry_body is not None else frozen.final_body,
+                    )
+                    allowed_metadata = ({(frozen.final_title, frozen.final_body)} if final
+                        else {entry_metadata, (frozen.final_title, frozen.final_body)}
+                        if obligation.temporary_base == frozen.final_base
+                        else {(frozen.final_title, frozen.final_body)}
+                        if actual.base_branch == frozen.final_base else {entry_metadata})
+                    if (actual.identity != frozen.pull_request
+                            or actual.head_repository != obligation.repository
+                            or actual.head_branch != frozen.branch
+                            or actual.head_oid != frozen.desired_oid
+                            or actual.state is not PullRequestState.OPEN
+                            or actual.base_branch not in allowed_bases
+                            or (actual.title, actual.body) not in allowed_metadata
+                            or actual.stack is not None):
+                        raise SourceMismatch("bound temporary-target participant changed")
+                validate_refs()
+
+            for participant in obligation.participants:
+                assert participant.pull_request is not None
+                validate_bound()
+                entry_title = participant.entry_title or participant.final_title
+                entry_body = (participant.entry_body
+                              if participant.entry_body is not None
+                              else participant.final_body)
+                attempt = ExactPullRequestMutationAttempt(obligation.repository,
+                    participant.pull_request, obligation.temporary_base,
+                    entry_title, entry_body,
+                    participant.final_base, participant.final_title, participant.final_body)
+                _owned_effect(workspace, github, obligation_id, attempt,
+                    lambda p=participant: github.update_pull_request(repository,
+                        p.pull_request, base_branch=p.final_base,
+                        title=p.final_title, body=p.final_body),
+                    git_transport=git)
+
+            validate_bound(final=True)
+            validate_refs()
+            _handoff_temporary_target_state(workspace, obligation)
+            oid, current = read_recovery(workspace)
+            assert oid is not None and current is not None
+            entries = tuple(e for e in current.entries if e.obligation != obligation_id)
+            obligations = tuple(o for o in current.obligations if o.identity != obligation_id)
+            cas_write_recovery(workspace, oid,
+                RecoveryJournal(entries, obligations) if entries or obligations else None)
+
+            # Optional grouping is outside core completion, but its own request
+            # is journaled before send so a delayed base-changing request cannot
+            # race a later mutation after the obligation has retired.
+            _best_effort_group(
+                workspace, github, repository, obligation.core.stack_base,
+                tuple(p.pull_request for p in obligation.participants
+                      if p.pull_request is not None), git,
+            )
+            return Verified(state_recorded=True)
+        except Error as exc:
+            return Stopped("temporary-target", str(exc))
+
+
 def apply_retained_topology(
     plan: RetainedTopologyPlan,
     workspace: str | Path,
@@ -6754,12 +8053,19 @@ def apply_retained_topology(
         return Verified()
     with repository_lock(workspace):
         _locked_oid, locked_journal = read_recovery(workspace)
+        if locked_journal is not None and any(
+            _obligation_conflicts_plan(item, plan)
+            for item in locked_journal.obligations
+        ):
+            return Stopped(
+                "recovery", "an overlapping temporary-target obligation is active"
+            )
         unresolved = settle_recovery(
             workspace, github, git_transport=git_transport
         )
         resources = _plan_resources(plan)
         assert resources is not None
-        if any(_resources_conflict(
+        if any(entry.obligation is None and _resources_conflict(
                 _attempt_resources(entry.attempt), resources
         ) for entry in unresolved):
             return Stopped("recovery", "an intersecting mutation remains unresolved")
@@ -6937,6 +8243,10 @@ def apply_first_publication(
     """Publish a fully planned new stack, recovering uncertain creations first."""
     git = git_transport or SubprocessGitTransport(workspace)
     _oid, journal = read_recovery(workspace)
+    if journal is not None and any(
+        _obligation_conflicts_plan(item, plan) for item in journal.obligations
+    ):
+        return Stopped("recovery", "an overlapping temporary-target obligation is active")
     if dry_run:
         try:
             unresolved = settle_recovery(
@@ -6949,6 +8259,13 @@ def apply_first_publication(
         return Verified()
     with repository_lock(workspace):
         _locked_oid, locked_journal = read_recovery(workspace)
+        if locked_journal is not None and any(
+            _obligation_conflicts_plan(item, plan)
+            for item in locked_journal.obligations
+        ):
+            return Stopped(
+                "recovery", "an overlapping temporary-target obligation is active"
+            )
         try:
             unresolved = settle_recovery(
                 workspace, github, git_transport=git
@@ -7221,6 +8538,8 @@ def execute_first_publication(
 
 
 def _mixed_conflict(entry: RecoveryEntry, plan: MixedMembershipPlan) -> bool:
+    if entry.obligation is not None:
+        return False
     attempt = entry.attempt
     repository = (attempt.association.pr.repository
         if isinstance(attempt, DetachedCloseAttempt) else attempt.repository)
@@ -7363,6 +8682,10 @@ def apply_mixed_membership(
     """Repair exact mixed members; grouping is a recoverable best-effort epilogue."""
     git = git_transport or SubprocessGitTransport(workspace)
     _oid, journal = read_recovery(workspace)
+    if journal is not None and any(
+        _obligation_conflicts_plan(item, plan) for item in journal.obligations
+    ):
+        return Stopped("recovery", "an overlapping temporary-target obligation is active")
     if dry_run:
         try:
             facts = settle_recovery(
@@ -7374,6 +8697,13 @@ def apply_mixed_membership(
             if any(_mixed_conflict(entry, plan) for entry in facts) else Verified())
     with repository_lock(workspace):
         _locked_oid, locked_journal = read_recovery(workspace)
+        if locked_journal is not None and any(
+            _obligation_conflicts_plan(item, plan)
+            for item in locked_journal.obligations
+        ):
+            return Stopped(
+                "recovery", "an overlapping temporary-target obligation is active"
+            )
         try:
             facts = settle_recovery(workspace, github, git_transport=git)
             repository = github.resolve_repository(plan.goal.repository)
@@ -7396,6 +8726,13 @@ def apply_mixed_membership(
                 expected = (goal.base_branch, goal.title, goal.body)
                 for entry in facts:
                     attempt = entry.attempt
+                    if (
+                        entry.verified_applied
+                        and isinstance(attempt, ExactPullRequestMutationAttempt)
+                        and attempt.pull_request == identity
+                        and (attempt.old_base, attempt.old_title, attempt.old_body) == expected
+                    ):
+                        expected = (attempt.base, attempt.title, attempt.body)
                 actual = by_identity.get(identity)
                 if (
                     actual is None
@@ -7820,8 +9157,8 @@ def apply_mixed_membership(
             ))
             if retained != journal.entries:
                 cas_write_recovery(workspace, journal_oid,
-                    RecoveryJournal(retained)
-                    if retained else None)
+                    RecoveryJournal(retained, journal.obligations)
+                    if retained or journal.obligations else None)
 
         # Group only after core completion. Its request remains independently recoverable.
         if len(identities) > 1 and {pr.stack for pr in current_prs.values()} == {None}:
@@ -7881,6 +9218,10 @@ def apply(
     if isinstance(plan, Blocked):
         return Stopped("plan", "a blocked plan cannot be applied")
     _oid, journal = read_recovery(workspace)
+    if journal is not None and any(
+        _obligation_conflicts_plan(item, plan) for item in journal.obligations
+    ):
+        return Stopped("recovery", "an overlapping temporary-target obligation is active")
     if dry_run:
         try:
             unresolved = settle_recovery(
@@ -7893,6 +9234,13 @@ def apply(
         return Verified()
     with repository_lock(workspace):
         _locked_oid, locked_journal = read_recovery(workspace)
+        if locked_journal is not None and any(
+            _obligation_conflicts_plan(item, plan)
+            for item in locked_journal.obligations
+        ):
+            return Stopped(
+                "recovery", "an overlapping temporary-target obligation is active"
+            )
         try:
             unresolved = settle_recovery(
                 workspace, github, git_transport=git
@@ -8227,8 +9575,18 @@ def _plan_new_sync(
         revision=f"ancestors({intent.revision})",
         config_keys=(
             "git.push",
+            temporary_target.BASE_CONFIG,
+            temporary_target.STATUSES_CONFIG,
         ),
     )
+    config = dict(local.effective_config)
+    try:
+        policy = temporary_target.parse_policy(
+            config.get(temporary_target.BASE_CONFIG),
+            config.get(temporary_target.STATUSES_CONFIG),
+        )
+    except temporary_target.Error as exc:
+        raise Error(str(exc)) from exc
     selected = observe_commits(
         workspace, local.operation_id, intent.revision, ancestry_order=True
     )
@@ -8259,6 +9617,7 @@ def _plan_new_sync(
     return SyncCommandPlan(
         plan_first_publication(publication),
         push_url,
+        policy,
     )
 
 
@@ -8298,8 +9657,16 @@ def _plan_existing_sync(
         ), "")
     revision = "all()" if intent.revision is None else f"ancestors({intent.revision})"
     local = observe_local(workspace, revision=revision, config_keys=(
-        "git.push",
+        "git.push", temporary_target.BASE_CONFIG, temporary_target.STATUSES_CONFIG,
     ))
+    config = dict(local.effective_config)
+    try:
+        policy = temporary_target.parse_policy(
+            config.get(temporary_target.BASE_CONFIG),
+            config.get(temporary_target.STATUSES_CONFIG),
+        )
+    except temporary_target.Error as exc:
+        raise Error(str(exc)) from exc
     remote = resolve_remote(local, requested_remote)
     push_url = resolve_push_url(local, remote)
     repository = github.resolve_repository(push_url)
@@ -8552,14 +9919,14 @@ def _plan_existing_sync(
         if intent.revision is None and not intent.force_local_wins:
             adoption = plan_remote_restack_adoption(snapshot)
             if isinstance(adoption, RemoteRestackAdoption):
-                return SyncCommandPlan(adoption, push_url)
+                return SyncCommandPlan(adoption, push_url, policy)
         ordinary = plan_sync(
             snapshot,
             desired,
             local_wins=tuple(item.pr_identity for item in existing
                 if isinstance(item, LocalWinsPRAssignment)),
         )
-        return SyncCommandPlan(ordinary, push_url)
+        return SyncCommandPlan(ordinary, push_url, policy)
 
     stack = recovered_stack
     if (
@@ -8606,7 +9973,7 @@ def _plan_existing_sync(
         )
         return SyncCommandPlan(plan_stack_append(StackAppendInput(
             publication, stack, snapshot.pull_requests, tool_state.state
-        )), push_url)
+        )), push_url, policy)
 
     candidate_names = [
         item.branch_name for item in assignments if isinstance(item, NewPRAssignment)
@@ -8660,7 +10027,7 @@ def _plan_existing_sync(
         recovery_facts,
     )
     return SyncCommandPlan(
-        plan_mixed_membership(mixed), push_url
+        plan_mixed_membership(mixed), push_url, policy
     )
 
 
@@ -8696,6 +10063,8 @@ def plan_sync_command(
 def render_sync_command(value: SyncCommandPlan | ApplyResult | AdoptionVerified) -> str:
     if isinstance(value, SyncCommandPlan):
         plan = value.value
+        if isinstance(plan, ResumeTemporaryTarget):
+            return f"resume temporary target: {plan.obligation_id}"
         if isinstance(plan, (Blocked, NoOp, Apply)):
             return render(plan)
         if isinstance(plan, RemoteRestackAdoption):
@@ -8708,6 +10077,12 @@ def render_sync_command(value: SyncCommandPlan | ApplyResult | AdoptionVerified)
                 f"  - {goal.commit_id} -> {goal.branch_name} (base {goal.base_branch})"
                 for goal in plan.goal.pull_requests
             )
+            if value.temporary_target_policy is not None:
+                rendered += (
+                    f"\n  - wait at {value.temporary_target_policy.base} for statuses: "
+                    + ", ".join(value.temporary_target_policy.required_statuses)
+                    + "\n  - restore chained bases"
+                )
             return rendered
         if isinstance(plan, StackAppendPlan):
             return "append stack:\n" + "\n".join(
@@ -8724,6 +10099,14 @@ def render_sync_command(value: SyncCommandPlan | ApplyResult | AdoptionVerified)
             else f"  - new {item.branch_name} at {item.commit_id}"
             for item in plan.goal.ordered
         )
+        if value.temporary_target_policy is not None:
+            rendered += (
+                f"\n  - temporarily target {value.temporary_target_policy.base}"
+                " before publication"
+                "\n  - wait for statuses: "
+                + ", ".join(value.temporary_target_policy.required_statuses)
+                + "\n  - restore chained bases"
+            )
         return rendered
     if isinstance(value, AdoptionVerified):
         return f"verified remote restack adoption ({len(value.adopted_heads)} head(s))"
@@ -8741,6 +10124,14 @@ def apply_sync_command(
     git_transport: GitTransport | None = None,
 ) -> ApplyResult | AdoptionVerified:
     value = command.value
+    if isinstance(value, ResumeTemporaryTarget):
+        return apply_temporary_target_obligation(
+            workspace,
+            github,
+            value.obligation_id,
+            dry_run=dry_run,
+            git_transport=git_transport,
+        )
     if isinstance(value, Blocked):
         return Stopped("plan", "a blocked plan cannot be applied")
     if isinstance(value, RemoteRestackAdoption):
@@ -8808,6 +10199,113 @@ def execute_sync_command(
     """Resume durable work first, otherwise exactly plan and apply one command."""
     try:
         with repository_lock(workspace):
+            journal_oid, journal = read_recovery(workspace)
+            obligations = () if journal is None else journal.obligations
+            if not obligations:
+                applicable = ()
+            else:
+                selection_revision = (
+                    f"ancestors({intent.revision})"
+                    if isinstance(intent, NewSyncIntent) or intent.revision is not None
+                    else "all()"
+                )
+                local = observe_local(
+                    workspace, revision=selection_revision, config_keys=("git.push",)
+                )
+                remote = resolve_remote(local, requested_remote)
+                selected_repository = github.resolve_repository(
+                    resolve_push_url(local, remote)
+                ).identity
+                selected_commits = {commit.commit_id for commit in local.commits}
+                if not dry_run and journal is not None:
+                    pristine = tuple(
+                        obligation
+                        for obligation in obligations
+                        if obligation.repository == selected_repository
+                        and not any(
+                            entry.obligation == obligation.identity
+                            and (entry.possibly_live or entry.verified_applied)
+                            for entry in journal.entries
+                        )
+                    )
+                    if pristine:
+                        identities = {
+                            obligation.identity for obligation in pristine
+                        }
+                        entries = tuple(
+                            entry
+                            for entry in journal.entries
+                            if entry.obligation not in identities
+                        )
+                        obligations = tuple(
+                            obligation
+                            for obligation in obligations
+                            if obligation.identity not in identities
+                        )
+                        cas_write_recovery(
+                            workspace,
+                            journal_oid,
+                            RecoveryJournal(entries, obligations)
+                            if entries or obligations
+                            else None,
+                        )
+                        journal_oid, journal = read_recovery(workspace)
+                        obligations = (
+                            () if journal is None else journal.obligations
+                        )
+                if isinstance(intent, ExistingSyncIntent):
+                    _state_oid, selected_state = read_state(workspace)
+                    selected = _selected_pr_number(
+                        selected_state, selected_repository, intent.pr_number
+                    )
+                    if isinstance(selected, Blocked):
+                        applicable = tuple(
+                            obligation for obligation in obligations
+                            if obligation.repository == selected_repository
+                            and any(participant.desired_oid in selected_commits
+                                    for participant in obligation.participants)
+                        )
+                    else:
+                        applicable = tuple(
+                            obligation for obligation in obligations
+                            if obligation.repository == selected_repository and any(
+                                identity.number == selected
+                                for identity in {
+                                    *obligation.source.members,
+                                    *obligation.core.historical_members,
+                                    *(participant.pull_request
+                                      for participant in obligation.participants
+                                      if participant.pull_request is not None),
+                                }
+                            )
+                        )
+                else:
+                    applicable = tuple(
+                        obligation for obligation in obligations
+                        if obligation.repository == selected_repository
+                        and any(participant.desired_oid in selected_commits
+                                for participant in obligation.participants)
+                    )
+            if len(applicable) > 1:
+                return None, Stopped(
+                    "recovery", "multiple temporary-target obligations overlap intent"
+                )
+            resume = applicable[0] if applicable else None
+            if resume is not None:
+                command = SyncCommandPlan(
+                    ResumeTemporaryTarget(resume.identity), resume.push_url
+                )
+            else:
+                command = None
+        if command is not None:
+            return command, apply_sync_command(
+                command,
+                workspace,
+                github,
+                dry_run=dry_run,
+                git_transport=git_transport,
+            )
+        with repository_lock(workspace):
             facts = settle_recovery(
                 workspace,
                 github,
@@ -8850,6 +10348,28 @@ def execute_sync_command(
                 "revalidate", "authority-bearing facts changed during confirmation"
             )
         command = current
+    candidate_types = (FirstPublicationPlan, MixedMembershipPlan, StackAppendPlan, Apply)
+    if command.temporary_target_policy is not None and isinstance(
+        command.value, candidate_types
+    ):
+        _state_oid, state = read_state(workspace)
+        candidate = temporary_target_candidate(
+            command.value, command.push_url, state,
+            command.temporary_target_policy,
+        )
+        if candidate is not None:
+            if dry_run:
+                return command, Verified()
+            try:
+                create_temporary_target_obligation(workspace, candidate)
+            except Error as exc:
+                return command, Stopped("recovery", str(exc))
+            resume = SyncCommandPlan(
+                ResumeTemporaryTarget(candidate.identity), candidate.push_url
+            )
+            return resume, apply_sync_command(
+                resume, workspace, github, git_transport=git_transport
+            )
     return command, apply_sync_command(
         command,
         workspace,
