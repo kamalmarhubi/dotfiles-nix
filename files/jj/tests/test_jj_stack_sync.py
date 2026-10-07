@@ -408,6 +408,73 @@ def test_state_round_trip_uses_unversioned_shape() -> None:
     assert sync.parse_state(payload) == sync.EMPTY_STATE
 
 
+def test_recovery_journal_round_trip_and_generation_cas(jj_repo: Path) -> None:
+    repository = sync.GitHubRepositoryId("github.com", "R_repo")
+    pr = sync.PullRequestId(repository, 7)
+    added_pr = sync.PullRequestId(repository, 8)
+    ref = sync.RemoteBranchRef(repository, "refs/heads/topic")
+    update = sync.PlannedHeadUpdate(
+        ref,
+        "1" * 40,
+        "2" * 40,
+        sync.FastForward(),
+    )
+    goal = sync.NewPullRequestGoal("3" * 40, "new-topic", "main", "Title", "")
+    journal = sync.RecoveryJournal(
+        (
+            sync.RecoveryEntry(
+                "effect-1",
+                sync.HeadMutationAttempt(
+                    repository,
+                    "ssh://example/repo",
+                    (update,),
+                    sync.TrackedStack(repository, "main", (pr,)),
+                    (sync.LastPublishedHead(pr, ref, "2" * 40),),
+                ),
+                possibly_live=True,
+            ),
+            sync.RecoveryEntry(
+                "effect-2",
+                sync.BranchCreationAttempt(repository, "ssh://example/repo", (goal,)),
+                possibly_live=True,
+            ),
+            sync.RecoveryEntry(
+                "effect-3",
+                sync.PullRequestCreationAttempt(repository, goal, pr),
+                possibly_live=True,
+            ),
+            sync.RecoveryEntry(
+                "effect-4",
+                sync.StackCreationAttempt(repository, "main", (pr,), (goal,)),
+                possibly_live=True,
+            ),
+            sync.RecoveryEntry(
+                "effect-5",
+                sync.StackAppendAttempt(
+                    repository,
+                    sync.GitHubStackId(repository, 1),
+                    "STACK_node",
+                    "main",
+                    (pr,),
+                    (added_pr,),
+                    (goal,),
+                ),
+                possibly_live=True,
+            ),
+        ),
+    )
+
+    oid = sync.cas_write_recovery(jj_repo, None, journal)
+
+    assert oid is not None
+    assert sync.read_recovery(jj_repo) == (oid, journal)
+    with pytest.raises(sync.ConcurrentUpdate):
+        sync.cas_write_recovery(jj_repo, "f" * 40, None)
+    assert sync.read_recovery(jj_repo) == (oid, journal)
+    assert sync.cas_write_recovery(jj_repo, oid, None) is None
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
 @pytest.mark.parametrize(
     "payload",
     (
@@ -3704,6 +3771,355 @@ def test_first_publication_receipt_handoff_rejects_stale_journal_generation(
         sync._retire_first_publication_facts(jj_repo, old_oid, stack)
 
     assert sync.read_recovery(jj_repo)[1].entries == entries + (newer,)
+
+
+def stack_append_case(jj_repo: Path, monkeypatch):
+    repository_id = sync.GitHubRepositoryId("github.com", "R_repo")
+    repository = sync.GitHubRepository(
+        repository_id, "owner/repo", "https://github.com/owner/repo", "main"
+    )
+    base, first, second, new = (value * 40 for value in "0123")
+    first_id = sync.PullRequestId(repository_id, 1)
+    second_id = sync.PullRequestId(repository_id, 2)
+    stack_id = sync.GitHubStackId(repository_id, 1)
+    server = FakeGitHubServer()
+    server.seed_repository(repository)
+    for branch, oid in (("main", base), ("one", first), ("two", second), ("new", new)):
+        server.seed_branch(repository_id, branch, oid)
+    for identity, branch, oid, base_branch, base_oid in (
+        (first_id, "one", first, "main", base),
+        (second_id, "two", second, "one", first),
+    ):
+        server.seed_pull_request(
+            sync.GitHubPullRequest(
+                identity,
+                f"PR_{identity.number}",
+                sync.PullRequestState.OPEN,
+                False,
+                repository_id,
+                branch,
+                oid,
+                base_branch,
+                base_oid,
+                False,
+                False,
+                branch.title(),
+                "",
+                None,
+            )
+        )
+    stack = sync.GitHubStack(stack_id, "STACK_1", "main", (first_id, second_id))
+    server.seed_stack(stack)
+    existing = server.read_pull_requests((first_id, second_id))
+    local = sync.LocalObservation(
+        str(jj_repo),
+        "op",
+        (),
+        (),
+        (),
+        (),
+        (),
+        (sync.ObservedCommit(new, (second,), "c3", "New\n\nBody", False, False),),
+        str(jj_repo / ".git"),
+    )
+    destinations = (
+        sync.LiveRemoteRef(
+            sync.RemoteBranchRef(repository_id, "refs/heads/main"), base
+        ),
+        sync.LiveRemoteRef(
+            sync.RemoteBranchRef(repository_id, "refs/heads/one"), first
+        ),
+        sync.LiveRemoteRef(
+            sync.RemoteBranchRef(repository_id, "refs/heads/two"), second
+        ),
+        sync.LiveRemoteRef(
+            sync.RemoteBranchRef(repository_id, "refs/heads/new"), None
+        ),
+    )
+    publication = sync.FirstPublicationInput(
+        repository_id,
+        "main",
+        (new,),
+        local,
+        (sync.PublicationAssignment(new, "new"),),
+        (),
+        (),
+        destinations,
+        (),
+    )
+    tracked = sync.TrackedState(
+        (sync.TrackedStack(repository_id, "main", (first_id, second_id)),),
+        (
+            sync.LastPublishedHead(
+                first_id,
+                sync.RemoteBranchRef(repository_id, "refs/heads/one"),
+                first,
+            ),
+            sync.LastPublishedHead(
+                second_id,
+                sync.RemoteBranchRef(repository_id, "refs/heads/two"),
+                second,
+            ),
+        ),
+    )
+    observed = sync.StackAppendInput(publication, stack, existing, tracked)
+    plan = sync.plan_stack_append(observed)
+    assert isinstance(plan, sync.StackAppendPlan)
+    github = FakeGitHubClient(server)
+    absent = (destinations[-1],)
+    present = (dataclasses.replace(destinations[-1], commit_id=new),)
+    reads = iter((absent, present))
+    monkeypatch.setattr(
+        sync.SubprocessGitTransport,
+        "observe_live_refs",
+        lambda *_args, **_kwargs: next(reads, present),
+    )
+    monkeypatch.setattr(
+        sync.SubprocessGitTransport,
+        "push_absent_heads",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, "", ""),
+    )
+    sync.cas_write_state(jj_repo, None, tracked)
+    return observed, plan, server, github
+
+
+def test_stack_append_plans_linear_suffix_and_rejects_stale_evidence(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, plan, _server, _github = stack_append_case(jj_repo, monkeypatch)
+
+    assert tuple(
+        (goal.branch_name, goal.base_branch) for goal in plan.goal.pull_requests
+    ) == (("new", "two"),)
+
+    closed = dataclasses.replace(
+        observed.pull_requests[-1], state=sync.PullRequestState.CLOSED
+    )
+    blocked = sync.plan_stack_append(
+        dataclasses.replace(
+            observed, pull_requests=observed.pull_requests[:-1] + (closed,)
+        )
+    )
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "stack-not-appendable"
+
+    stale_refs = dataclasses.replace(
+        observed.publication,
+        destinations=tuple(
+            dataclasses.replace(item, commit_id="9" * 40)
+            if item.ref.full_name == "refs/heads/two"
+            else item
+            for item in observed.publication.destinations
+        ),
+    )
+    blocked = sync.plan_stack_append(
+        dataclasses.replace(observed, publication=stale_refs)
+    )
+    assert isinstance(blocked, sync.Blocked)
+    assert blocked.reasons[0].code == "head-disagrees"
+
+
+def test_stack_append_publishes_and_records_complete_membership(
+    jj_repo: Path, monkeypatch
+) -> None:
+    _observed, plan, server, github = stack_append_case(jj_repo, monkeypatch)
+
+    result = sync.apply_stack_append(plan, jj_repo, github, "push")
+
+    assert isinstance(result, sync.Verified)
+    stack = server.read_stack(
+        server.read_repository(plan.goal.repository), plan.goal.stack
+    )
+    assert stack is not None
+    assert len(stack.pull_requests) == 3
+    state = sync.read_state(jj_repo)[1]
+    assert state.stacks == (
+        sync.TrackedStack(plan.goal.repository, "main", stack.pull_requests),
+    )
+    assert sync.read_recovery(jj_repo) == (None, None)
+
+
+@pytest.mark.parametrize("fault", ("lose_response", "fail_before"))
+def test_stack_append_ambiguous_add_is_verified_or_preserved(
+    jj_repo: Path, monkeypatch, fault: str
+) -> None:
+    _observed, plan, server, github = stack_append_case(jj_repo, monkeypatch)
+
+    with getattr(github, fault)(sync.GitHubClient.add_stack_members):
+        result = sync.apply_stack_append(plan, jj_repo, github, "push")
+
+    stack = server.read_stack(
+        server.read_repository(plan.goal.repository), plan.goal.stack
+    )
+    assert stack is not None
+    if fault == "lose_response":
+        assert isinstance(result, sync.Verified)
+        assert len(stack.pull_requests) == 3
+        assert sync.read_recovery(jj_repo) == (None, None)
+    else:
+        assert isinstance(result, sync.Stopped)
+        assert result.stage == "stack"
+        assert len(stack.pull_requests) == 2
+        assert any(
+            isinstance(entry.attempt, sync.StackAppendAttempt)
+            for entry in sync.read_recovery(jj_repo)[1].entries
+        )
+
+
+def test_stack_append_held_add_lands_only_on_release(
+    jj_repo: Path, monkeypatch
+) -> None:
+    _observed, plan, server, github = stack_append_case(jj_repo, monkeypatch)
+
+    with github.hold_next(sync.GitHubClient.add_stack_members) as pending:
+        stopped = sync.apply_stack_append(plan, jj_repo, github, "push")
+
+    assert isinstance(stopped, sync.Stopped)
+    assert stopped.stage == "stack"
+    stack = server.read_stack(
+        server.read_repository(plan.goal.repository), plan.goal.stack
+    )
+    assert stack is not None and len(stack.pull_requests) == 2
+    pending.release()
+    assert sync.settle_recovery(jj_repo, github) == ()
+    stack = server.read_stack(
+        server.read_repository(plan.goal.repository), plan.goal.stack
+    )
+    assert stack is not None and len(stack.pull_requests) == 3
+    assert len(sync.read_state(jj_repo)[1].stacks[0].ordered_prs) == 3
+
+
+def test_stack_append_recomputes_from_applied_branch_ownership(
+    jj_repo: Path, monkeypatch
+) -> None:
+    _observed, plan, server, github = stack_append_case(jj_repo, monkeypatch)
+    goal = plan.goal.pull_requests[0]
+    branch = sync.RecoveryEntry(
+        "branch-crash",
+        sync.BranchCreationAttempt(plan.goal.repository, "push", (goal,)),
+        possibly_live=True,
+    )
+    sync.cas_write_recovery(jj_repo, None, sync.RecoveryJournal((branch,)))
+    present = (
+        sync.LiveRemoteRef(
+            sync.RemoteBranchRef(
+                plan.goal.repository, f"refs/heads/{goal.branch_name}"
+            ),
+            goal.commit_id,
+        ),
+    )
+    monkeypatch.setattr(
+        sync.SubprocessGitTransport,
+        "observe_live_refs",
+        lambda *_args, **_kwargs: present,
+    )
+    recovered = dataclasses.replace(
+        plan,
+        destinations=tuple(
+            dataclasses.replace(item, commit_id=goal.commit_id)
+            if item.ref.full_name == f"refs/heads/{goal.branch_name}"
+            else item
+            for item in plan.destinations
+        ),
+    )
+    seen: list[tuple[sync.RecoveryEntry, ...]] = []
+
+    _replanned, result = sync.execute_stack_append(
+        jj_repo,
+        github,
+        "push",
+        lambda facts: seen.append(facts) or recovered,
+    )
+
+    assert isinstance(result, sync.Verified)
+    assert any(
+        isinstance(entry.attempt, sync.BranchCreationAttempt)
+        for entry in seen[0]
+    )
+    stack = server.read_stack(
+        server.read_repository(plan.goal.repository), plan.goal.stack
+    )
+    assert stack is not None and len(stack.pull_requests) == 3
+
+
+def test_stack_append_conflicts_with_possibly_live_existing_tip_head_write(
+    jj_repo: Path, monkeypatch
+) -> None:
+    observed, plan, _server, github = stack_append_case(jj_repo, monkeypatch)
+    tip = observed.pull_requests[-1]
+    assert tip.head_oid is not None
+    ref = sync.RemoteBranchRef(
+        plan.goal.repository, f"refs/heads/{tip.head_branch}"
+    )
+    publication = sync.LastPublishedHead(tip.identity, ref, "9" * 40)
+    attempt = sync.HeadMutationAttempt(
+        plan.goal.repository,
+        "push",
+        (sync.PlannedHeadUpdate(
+            ref, tip.head_oid, publication.verified_commit_id, sync.FastForward()
+        ),),
+        sync.TrackedStack(
+            plan.goal.repository, plan.goal.base_branch, plan.goal.old_members
+        ),
+        (publication,),
+    )
+    held = sync.RecoveryEntry("held-old-tip", attempt, possibly_live=True)
+    monkeypatch.setattr(sync, "settle_recovery", lambda *_args, **_kwargs: (held,))
+
+    result = sync.apply_stack_append(plan, jj_repo, github, "push")
+
+    assert result == sync.Stopped(
+        "recovery", "a conflicting mutation remains unresolved"
+    )
+
+
+def test_stack_append_head_conflict_is_repository_and_stack_scoped(
+    jj_repo: Path, monkeypatch
+) -> None:
+    _observed, plan, _server, _github = stack_append_case(jj_repo, monkeypatch)
+
+    def head_attempt(repository: sync.GitHubRepositoryId, number: int):
+        pr = sync.PullRequestId(repository, number)
+        ref = sync.RemoteBranchRef(repository, "refs/heads/unrelated")
+        publication = sync.LastPublishedHead(pr, ref, "8" * 40)
+        return sync.RecoveryEntry(
+            f"unrelated-{number}",
+            sync.HeadMutationAttempt(
+                repository,
+                "push",
+                (sync.PlannedHeadUpdate(
+                    ref, "7" * 40, publication.verified_commit_id,
+                    sync.FastForward(),
+                ),),
+                sync.TrackedStack(repository, "other-base", (pr,)),
+                (publication,),
+            ),
+            possibly_live=True,
+        )
+
+    other_repository = sync.GitHubRepositoryId("github.com", "R_other")
+
+    assert not sync._append_conflict(head_attempt(other_repository, 1), plan)
+    assert not sync._append_conflict(head_attempt(plan.goal.repository, 99), plan)
+
+
+def test_stack_append_dry_run_preserves_server_state_and_private_refs(
+    jj_repo: Path, monkeypatch
+) -> None:
+    _observed, plan, server, github = stack_append_case(jj_repo, monkeypatch)
+    before_state = sync.read_state(jj_repo)
+    before_recovery = sync.read_recovery(jj_repo)
+
+    assert sync.apply_stack_append(
+        plan, jj_repo, github, "push", dry_run=True
+    ) == sync.Verified()
+
+    stack = server.read_stack(
+        server.read_repository(plan.goal.repository), plan.goal.stack
+    )
+    assert stack is not None and len(stack.pull_requests) == 2
+    assert sync.read_state(jj_repo) == before_state
+    assert sync.read_recovery(jj_repo) == before_recovery
 
 
 if __name__ == "__main__":

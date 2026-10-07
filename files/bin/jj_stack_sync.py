@@ -649,6 +649,35 @@ class FirstPublicationPlan:
 
 
 @dataclass(frozen=True)
+class StackAppendInput:
+    """Complete evidence for adding a linear suffix to one open stack."""
+
+    publication: FirstPublicationInput
+    stack: GitHubStack
+    pull_requests: tuple[GitHubPullRequest, ...]
+    tracked_state: TrackedState
+
+
+@dataclass(frozen=True)
+class StackAppendGoal:
+    repository: GitHubRepositoryId
+    stack: GitHubStackId
+    stack_node_id: str
+    base_branch: str
+    old_members: tuple[PullRequestId, ...]
+    pull_requests: tuple[NewPullRequestGoal, ...]
+
+
+@dataclass(frozen=True)
+class StackAppendPlan:
+    goal: StackAppendGoal
+    local: LocalObservation
+    destinations: tuple[LiveRemoteRef, ...]
+    historical_pull_requests: tuple[GitHubPullRequest, ...]
+    existing_pull_requests: tuple[GitHubPullRequest, ...]
+
+
+@dataclass(frozen=True)
 class DesiredStack:
     repository: GitHubRepositoryId
     base_branch: str
@@ -870,6 +899,35 @@ class StackCreationAttempt:
 
 
 @dataclass(frozen=True)
+class StackAppendAttempt:
+    """Exact, self-contained receipt handoff for one stack-add request."""
+
+    repository: GitHubRepositoryId
+    stack: GitHubStackId
+    stack_node_id: str
+    base_branch: str
+    old_members: tuple[PullRequestId, ...]
+    additions: tuple[PullRequestId, ...]
+    goals: tuple[NewPullRequestGoal, ...]
+
+    def __post_init__(self) -> None:
+        all_members = self.old_members + self.additions
+        if (
+            self.stack.repository != self.repository
+            or not isinstance(self.stack_node_id, str)
+            or not self.stack_node_id
+            or not isinstance(self.base_branch, str)
+            or not self.base_branch
+            or not self.old_members
+            or not self.additions
+            or len(self.additions) != len(self.goals)
+            or len(set(all_members)) != len(all_members)
+            or any(pr.repository != self.repository for pr in all_members)
+        ):
+            raise ValueError("stack append receipt is malformed")
+
+
+@dataclass(frozen=True)
 class AdoptionAttempt:
     repository: GitHubRepositoryId
     remote: str
@@ -888,6 +946,7 @@ MutationAttempt = (
     | BranchCreationAttempt
     | PullRequestCreationAttempt
     | StackCreationAttempt
+    | StackAppendAttempt
 )
 
 
@@ -2725,6 +2784,17 @@ def _recovery_entry_to_dict(entry: RecoveryEntry) -> dict[str, object]:
             "pull_requests": [pr.number for pr in attempt.pull_requests],
             "goals": [asdict(goal) for goal in attempt.goals],
         }
+    elif isinstance(attempt, StackAppendAttempt):
+        payload = {
+            "kind": "append-stack", "identity": entry.identity,
+            "possibly_live": entry.possibly_live,
+            "repository": asdict(attempt.repository),
+            "stack": attempt.stack.number, "stack_node_id": attempt.stack_node_id,
+            "base_branch": attempt.base_branch,
+            "old_members": [pr.number for pr in attempt.old_members],
+            "additions": [pr.number for pr in attempt.additions],
+            "goals": [asdict(goal) for goal in attempt.goals],
+        }
     else:
         raise ValueError("unknown recovery attempt")
     return payload
@@ -2761,6 +2831,8 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
         if kind == 'create-pr'
         else common_fields | {'base_branch', 'pull_requests', 'goals'}
         if kind == 'create-stack'
+        else common_fields | {'stack', 'stack_node_id', 'base_branch', 'old_members', 'additions', 'goals'}
+        if kind == 'append-stack'
         else None
     )
     if expected_fields is None or set(raw) != expected_fields:
@@ -2902,6 +2974,19 @@ def _parse_recovery_entry(raw: object) -> RecoveryEntry:
         attempt = StackCreationAttempt(
             repository, raw["base_branch"],
             tuple(PullRequestId(repository, number) for number in numbers),
+            tuple(NewPullRequestGoal(**goal) for goal in goals),
+        )
+    elif kind == "append-stack":
+        old_members = raw["old_members"]
+        additions = raw["additions"]
+        goals = raw["goals"]
+        if not isinstance(old_members, list) or not isinstance(additions, list) or not isinstance(goals, list):
+            raise ValueError("stack append members must be arrays")
+        attempt = StackAppendAttempt(
+            repository, GitHubStackId(repository, raw["stack"]), raw["stack_node_id"],
+            raw["base_branch"],
+            tuple(PullRequestId(repository, number) for number in old_members),
+            tuple(PullRequestId(repository, number) for number in additions),
             tuple(NewPullRequestGoal(**goal) for goal in goals),
         )
     else:
@@ -3326,6 +3411,98 @@ def plan_first_publication(
         observed.local,
         observed.destinations,
         observed.historical_pull_requests,
+    )
+
+
+def plan_stack_append(observed: StackAppendInput) -> StackAppendPlan | Blocked:
+    """Purely derive an append goal from complete topology and ownership facts."""
+    publication = observed.publication
+    stack = observed.stack
+    members = stack.pull_requests
+    if stack.identity.repository != publication.repository:
+        return _block("repository-mismatch", "stack", "stack belongs to another repository")
+    if tuple(pr.identity for pr in observed.pull_requests) != members:
+        return _block("incomplete-membership", "stack", "ordered members were not observed exactly")
+    summary = GitHubStackSummary(stack.identity, stack.node_id, stack.base_branch)
+    if any(
+        pr.state is not PullRequestState.OPEN
+        or pr.stack != summary
+        or pr.head_repository != publication.repository
+        or pr.head_oid is None
+        or pr.base_oid is None
+        or pr.auto_merge_enabled
+        or pr.in_merge_queue
+        for pr in observed.pull_requests
+    ):
+        return _block("stack-not-appendable", "stack", "members must be exact, open, and automation-inactive")
+    base_reads = tuple(item for item in publication.destinations
+        if item.ref.full_name == f"refs/heads/{stack.base_branch}")
+    if not members or len(base_reads) != 1 or base_reads[0].commit_id is None or any(
+        pr.base_branch != (stack.base_branch if index == 0 else observed.pull_requests[index - 1].head_branch)
+        or (index > 0 and pr.base_oid != observed.pull_requests[index - 1].head_oid)
+        or (index == 0 and pr.base_oid != base_reads[0].commit_id)
+        for index, pr in enumerate(observed.pull_requests)
+    ):
+        return _block("inconsistent-topology", "stack", "stack branch topology is incomplete or inconsistent")
+    tracked = tuple(
+        item for item in observed.tracked_state.stacks
+        if item.repository == publication.repository and item.ordered_prs == members
+        and item.base_branch == stack.base_branch
+    )
+    if len(tracked) != 1:
+        return _block("untracked-membership", "stack", "exact complete membership is not tracked")
+    live_refs: dict[str, str | None] = {}
+    for item in publication.destinations:
+        if item.ref.repository != publication.repository or item.ref.full_name in live_refs:
+            return _block(
+                "ambiguous-live-ref",
+                item.ref.full_name,
+                "stack refs must be observed exactly once in the target repository",
+            )
+        live_refs[item.ref.full_name] = item.commit_id
+    if any(
+        live_refs.get(f"refs/heads/{pr.head_branch}") != pr.head_oid
+        for pr in observed.pull_requests
+    ):
+        return _block(
+            "head-disagrees",
+            "stack",
+            "live member heads do not match the observed pull requests",
+        )
+    receipts = {
+        (item.pr, item.ref.full_name, item.verified_commit_id)
+        for item in (
+            observed.tracked_state.last_published_heads
+            + observed.tracked_state.last_adopted_heads
+        )
+    }
+    if any(
+        (pr.identity, f"refs/heads/{pr.head_branch}", pr.head_oid) not in receipts
+        for pr in observed.pull_requests
+    ):
+        return _block("untracked-head", "stack", "member heads are not exactly tracked")
+    tip = observed.pull_requests[-1]
+    assert tip.head_oid is not None
+    suffix = replace(
+        publication,
+        base_branch=tip.head_branch,
+        destinations=publication.destinations + (
+            LiveRemoteRef(
+                RemoteBranchRef(publication.repository, f"refs/heads/{tip.head_branch}"),
+                tip.head_oid,
+            ),
+        ) if not any(item.ref.full_name == f"refs/heads/{tip.head_branch}" for item in publication.destinations) else publication.destinations,
+    )
+    planned = plan_first_publication(suffix)
+    if isinstance(planned, Blocked):
+        return planned
+    return StackAppendPlan(
+        StackAppendGoal(
+            publication.repository, stack.identity, stack.node_id, stack.base_branch,
+            members, planned.goal.pull_requests,
+        ),
+        planned.local, planned.destinations, planned.historical_pull_requests,
+        observed.pull_requests,
     )
 
 
@@ -4038,6 +4215,42 @@ def _classify_attempt(
             and stack.pull_requests == attempt.pull_requests
             else "foreign"
         )
+    if isinstance(attempt, StackAppendAttempt):
+        repository = github.resolve_repository(attempt.repository)
+        stack = github.stack(repository, attempt.stack)
+        if stack is None or stack.node_id != attempt.stack_node_id or stack.base_branch != attempt.base_branch:
+            return "foreign"
+        wanted = attempt.old_members + attempt.additions
+        if stack.pull_requests == wanted:
+            prs = github.pull_requests(wanted)
+            summary = GitHubStackSummary(attempt.stack, attempt.stack_node_id, attempt.base_branch)
+            additions = prs[len(attempt.old_members):]
+            exact_additions = all(
+                pr.identity == identity
+                and pr.stack == summary
+                and pr.state is PullRequestState.OPEN
+                and pr.head_repository == attempt.repository
+                and pr.head_branch == goal.branch_name
+                and pr.head_oid == goal.commit_id
+                and pr.base_branch == goal.base_branch
+                and pr.title == goal.title
+                and pr.body == goal.body
+                and not pr.draft
+                for pr, identity, goal in zip(
+                    additions, attempt.additions, attempt.goals, strict=True
+                )
+            )
+            return (
+                "applied"
+                if tuple(pr.identity for pr in prs) == wanted
+                and all(pr.stack == summary for pr in prs)
+                and exact_additions
+                else "foreign"
+            )
+        if stack.pull_requests == attempt.old_members:
+            additions = github.pull_requests(attempt.additions)
+            return "not-applied" if all(pr.stack is None for pr in additions) else "foreign"
+        return "foreign"
     assert isinstance(attempt, MetadataMutationAttempt)
     prs = github.pull_requests((attempt.update.pr_identity,))
     if len(prs) != 1:
@@ -4064,6 +4277,7 @@ def settle_recovery(
     remaining: list[RecoveryEntry] = []
     applied_heads: list[HeadMutationAttempt] = []
     applied_stacks: list[StackCreationAttempt] = []
+    applied_appends: list[StackAppendAttempt] = []
     for entry in journal.entries:
         # Obligation effects are durable facts until the core receipt handoff.
         # The generic driver, not legacy settlement, reconciles or retires them.
@@ -4128,6 +4342,8 @@ def settle_recovery(
             applied_heads.append(entry.attempt)
         elif isinstance(entry.attempt, StackCreationAttempt):
             applied_stacks.append(entry.attempt)
+        elif isinstance(entry.attempt, StackAppendAttempt):
+            applied_appends.append(entry.attempt)
         elif isinstance(entry.attempt, PullRequestCreationAttempt):
             goal = entry.attempt.goal
             matches = github.find_pull_requests(
@@ -4185,6 +4401,28 @@ def settle_recovery(
                     and entry.attempt.pull_request in members
                 )
             ]
+        for attempt in applied_appends:
+            _record_verified_state(
+                workspace,
+                TrackedStack(attempt.repository, attempt.base_branch,
+                    attempt.old_members + attempt.additions),
+                tuple(
+                    LastPublishedHead(pr, RemoteBranchRef(attempt.repository,
+                        f"refs/heads/{goal.branch_name}"), goal.commit_id)
+                    for pr, goal in zip(attempt.additions, attempt.goals, strict=True)
+                ),
+            )
+            goals = set(attempt.goals)
+            additions = set(attempt.additions)
+            remaining = [entry for entry in remaining if not (
+                isinstance(entry.attempt, StackAppendAttempt) and entry.attempt == attempt
+                or isinstance(entry.attempt, BranchCreationAttempt)
+                and entry.attempt.repository == attempt.repository
+                and set(entry.attempt.goals) == goals
+                or isinstance(entry.attempt, PullRequestCreationAttempt)
+                and entry.attempt.repository == attempt.repository
+                and entry.attempt.goal in goals and entry.attempt.pull_request in additions
+            )]
         updated = tuple(remaining)
         if updated != journal.entries:
             cas_write_recovery(
@@ -4235,6 +4473,8 @@ def _attempt_conflicts_plan(entry: RecoveryEntry, plan: NoOp | Apply) -> bool:
         return ref in active_refs or attempt.pull_request in active_prs
     if isinstance(attempt, StackCreationAttempt):
         members = attempt.pull_requests
+    elif isinstance(attempt, StackAppendAttempt):
+        members = attempt.old_members + attempt.additions
     else:
         raise AssertionError(f"unhandled recovery attempt: {type(attempt).__name__}")
     return bool(active_prs.intersection(members))
@@ -4657,6 +4897,288 @@ def _retire_first_publication_facts(
         workspace, expected_oid,
         RecoveryJournal(entries)
         if entries else None,
+    )
+
+
+def _append_conflict(entry: RecoveryEntry, plan: StackAppendPlan) -> bool:
+    goals = {goal.branch_name: goal for goal in plan.goal.pull_requests}
+    names = {
+        plan.goal.base_branch,
+        *goals,
+        *(pr.head_branch for pr in plan.existing_pull_requests),
+    }
+    members = set(plan.goal.old_members)
+    attempt = entry.attempt
+    repository = getattr(attempt, "repository", None)
+    if repository != plan.goal.repository:
+        return False
+    if isinstance(attempt, StackAppendAttempt):
+        return (
+            attempt.stack == plan.goal.stack
+            or bool(set(attempt.old_members + attempt.additions) & members)
+        )
+    if isinstance(attempt, PullRequestCreationAttempt):
+        return (
+            (attempt.pull_request in members)
+            or attempt.goal.branch_name in goals
+            and (
+                attempt.pull_request is None
+                or goals[attempt.goal.branch_name] != attempt.goal
+            )
+        )
+    if isinstance(attempt, BranchCreationAttempt):
+        observed = {item.ref.full_name: item.commit_id for item in plan.destinations}
+        return any(
+            goal.branch_name in goals
+            and (
+                goals[goal.branch_name] != goal
+                or observed.get(f"refs/heads/{goal.branch_name}") != goal.commit_id
+            )
+            for goal in attempt.goals
+        )
+    if isinstance(attempt, StackCreationAttempt):
+        return bool(
+            set(attempt.pull_requests) & members
+            or {goal.branch_name for goal in attempt.goals} & set(goals)
+        )
+    if isinstance(attempt, HeadMutationAttempt):
+        # A head push is atomic: overlap by any participating member or ref
+        # makes the whole possibly-live write conflict with suffix publication.
+        return bool(set(attempt.tracking.ordered_prs) & members) or any(
+            update.ref.full_name.removeprefix("refs/heads/") in names
+            for update in attempt.updates
+        )
+    if isinstance(attempt, MetadataMutationAttempt):
+        return attempt.update.pr_identity in members
+    if isinstance(attempt, AdoptionAttempt):
+        return any(
+            boundary.pr_identity in members or boundary.branch in names
+            for boundary in attempt.boundaries
+        )
+    return False
+
+
+def apply_stack_append(
+    plan: StackAppendPlan, workspace: str | Path, github: GitHubClient,
+    push_url: str, *, dry_run: bool = False,
+    git_transport: GitTransport | None = None,
+) -> ApplyResult:
+    """Publish a new suffix and append it with an exactly recoverable request."""
+    git = git_transport or SubprocessGitTransport(workspace)
+    _oid, journal = read_recovery(workspace)
+    if dry_run:
+        try:
+            unresolved = settle_recovery(
+                workspace, github, dry_run=True, git_transport=git
+            )
+        except Error as exc:
+            return Stopped("recovery", str(exc))
+        return Stopped("recovery", "a conflicting mutation remains unresolved") if any(
+            _append_conflict(entry, plan) for entry in unresolved
+        ) else Verified()
+    with repository_lock(workspace):
+        _locked_oid, locked_journal = read_recovery(workspace)
+        try:
+            unresolved = settle_recovery(
+                workspace, github, git_transport=git
+            )
+            repository = github.resolve_repository(plan.goal.repository)
+        except Error as exc:
+            return Stopped("recovery", str(exc))
+        if any(_append_conflict(entry, plan) for entry in unresolved):
+            return Stopped("recovery", "a conflicting mutation remains unresolved")
+        _state_oid, state = read_state(workspace)
+        goals = plan.goal.pull_requests
+        recorded_additions: list[PullRequestId] = []
+        for goal in goals:
+            matches = tuple(
+                item.pr
+                for item in state.last_published_heads
+                if item.ref
+                == RemoteBranchRef(
+                    plan.goal.repository, f"refs/heads/{goal.branch_name}"
+                )
+                and item.verified_commit_id == goal.commit_id
+            )
+            if len(matches) != 1:
+                break
+            recorded_additions.append(matches[0])
+        if len(recorded_additions) == len(goals):
+            complete_members = plan.goal.old_members + tuple(recorded_additions)
+            if TrackedStack(
+                plan.goal.repository, plan.goal.base_branch, complete_members
+            ) in state.stacks:
+                stack = github.stack(repository, plan.goal.stack)
+                if (
+                    stack is not None
+                    and stack.node_id == plan.goal.stack_node_id
+                    and stack.base_branch == plan.goal.base_branch
+                    and stack.pull_requests == complete_members
+                ):
+                    return Verified()
+                return Stopped("stack", "recorded append topology is no longer live")
+        stack = github.stack(repository, plan.goal.stack)
+        if (
+            stack is None
+            or stack.node_id != plan.goal.stack_node_id
+            or stack.base_branch != plan.goal.base_branch
+            or stack.pull_requests != plan.goal.old_members
+        ):
+            return Stopped("stack", "existing stack changed before append publication")
+        try:
+            existing = github.pull_requests(plan.goal.old_members)
+        except Error as exc:
+            return Stopped("stack", f"existing stack readback is unresolved: {exc}")
+        if existing != plan.existing_pull_requests:
+            return Stopped("stack", "existing stack members changed before publication")
+        try:
+            refs = git.observe_live_refs(
+                push_url,
+                plan.goal.repository,
+                tuple(f"refs/heads/{goal.branch_name}" for goal in goals),
+            )
+        except Error as exc:
+            return Stopped("observe", str(exc))
+        current = tuple(item.commit_id for item in refs)
+        wanted = tuple(goal.commit_id for goal in goals)
+        branch_facts = tuple(entry for entry in unresolved if
+            isinstance(entry.attempt, BranchCreationAttempt)
+            and entry.attempt.repository == plan.goal.repository and entry.attempt.goals == goals)
+        if current != wanted:
+            if any(value is not None for value in current):
+                return Stopped("heads", "a publication destination changed")
+            attempt = BranchCreationAttempt(plan.goal.repository, push_url, goals)
+            oid, entry = _append_recovery(workspace, attempt)
+            live = replace(entry, possibly_live=True)
+            oid = _replace_recovery_entry(workspace, oid, live)
+            try:
+                git.push_absent_heads(push_url, plan.goal.repository, goals)
+            except GitPushError:
+                pass
+            try:
+                refs = git.observe_live_refs(
+                    push_url,
+                    plan.goal.repository,
+                    tuple(item.ref.full_name for item in refs),
+                )
+            except Error as exc:
+                return Stopped("heads", f"publication readback is unresolved: {exc}")
+            if tuple(item.commit_id for item in refs) != wanted:
+                return Stopped("heads", "atomic branch publication remains unresolved")
+        elif not branch_facts:
+            return Stopped("heads", "occupied publication destinations are not owned")
+
+        additions: list[PullRequestId] = []
+        for goal in goals:
+            matches = github.find_pull_requests(plan.goal.repository,
+                head_branches=(goal.branch_name,), states=tuple(PullRequestState))
+            exact = tuple(pr for pr in matches if pr.head_repository == plan.goal.repository
+                and pr.head_oid == goal.commit_id and pr.base_branch == goal.base_branch
+                and pr.title == goal.title and pr.body == goal.body and not pr.draft)
+            owned = tuple(entry for entry in unresolved if
+                isinstance(entry.attempt, PullRequestCreationAttempt)
+                and entry.attempt.repository == plan.goal.repository
+                and entry.attempt.goal == goal and entry.attempt.pull_request is not None)
+            if len(matches) == len(exact) == 1 and owned and owned[0].attempt.pull_request == exact[0].identity:
+                additions.append(exact[0].identity)
+                continue
+            if matches:
+                return Stopped("pull-request", f"branch {goal.branch_name} has a foreign PR")
+            attempt = PullRequestCreationAttempt(plan.goal.repository, goal)
+            oid, entry = _append_recovery(workspace, attempt)
+            live = replace(entry, possibly_live=True)
+            oid = _replace_recovery_entry(workspace, oid, live)
+            try:
+                github.create_pull_request(repository, head_branch=goal.branch_name,
+                    base_branch=goal.base_branch, title=goal.title, body=goal.body, draft=False)
+            except GitHubTransportError:
+                pass
+            except GitHubHttpError:
+                _remove_recovery_entry(workspace, oid, entry.identity)
+                return Stopped("pull-request", "pull request creation was rejected")
+            try:
+                if _finish_creation_attempt(workspace, github, live) != "applied":
+                    return Stopped("pull-request", "pull request creation is unresolved")
+                match = github.find_pull_requests(plan.goal.repository,
+                    head_branches=(goal.branch_name,), states=tuple(PullRequestState))[0]
+                additions.append(match.identity)
+                _replace_recovery_entry(workspace, oid,
+                    replace(live, attempt=replace(attempt, pull_request=match.identity)))
+            except Error as exc:
+                return Stopped("pull-request", f"creation readback is unresolved: {exc}")
+
+        attempt = StackAppendAttempt(plan.goal.repository, plan.goal.stack,
+            plan.goal.stack_node_id, plan.goal.base_branch, plan.goal.old_members,
+            tuple(additions), goals)
+        try:
+            before = _classify_attempt(workspace, github, attempt)
+        except Error as exc:
+            return Stopped("stack", str(exc))
+        if before == "not-applied":
+            oid, entry = _append_recovery(workspace, attempt)
+            live = replace(entry, possibly_live=True)
+            oid = _replace_recovery_entry(workspace, oid, live)
+            try:
+                github.add_stack_members(repository, plan.goal.stack,
+                    pull_requests=tuple(additions))
+            except GitHubTransportError:
+                pass
+            except GitHubHttpError:
+                # As with creation, only a complete rejection proves no late effect.
+                _remove_recovery_entry(workspace, oid, entry.identity)
+                return Stopped("stack", "stack append was rejected")
+            try:
+                result = _finish_creation_attempt(workspace, github, live)
+            except Error as exc:
+                return Stopped("stack", f"append readback is unresolved: {exc}")
+            if result != "applied":
+                return Stopped("stack", f"stack append is {result}")
+        elif before != "applied":
+            return Stopped("stack", "stack membership is foreign or partial")
+        # settle_recovery performs state-before-retirement with journal-generation CAS.
+        try:
+            settle_recovery(workspace, github, git_transport=git)
+        except Error as exc:
+            return Stopped("receipt", str(exc))
+        return Verified(head_published=current != wanted, state_recorded=True)
+
+
+def execute_stack_append(
+    workspace: str | Path,
+    github: GitHubClient,
+    push_url: str,
+    recompute: Callable[[tuple[RecoveryEntry, ...]], StackAppendPlan | Blocked],
+    *,
+    confirm: Callable[[StackAppendPlan], bool] | None = None,
+    dry_run: bool = False,
+    git_transport: GitTransport | None = None,
+) -> tuple[StackAppendPlan | Blocked | None, ApplyResult]:
+    """Settle append facts, recompute current topology, confirm, then apply."""
+    try:
+        with repository_lock(workspace):
+            facts = settle_recovery(
+                workspace,
+                github,
+                dry_run=dry_run,
+                git_transport=git_transport,
+            )
+    except Error as exc:
+        return None, Stopped("recovery", str(exc))
+    try:
+        plan = recompute(facts)
+    except Error as exc:
+        return None, Stopped("observe", str(exc))
+    if isinstance(plan, Blocked):
+        return plan, Stopped("plan", "a blocked append plan cannot be applied")
+    if confirm is not None and not confirm(plan):
+        return plan, Stopped("confirmation", "append was not confirmed")
+    return plan, apply_stack_append(
+        plan,
+        workspace,
+        github,
+        push_url,
+        dry_run=dry_run,
+        git_transport=git_transport,
     )
 
 
