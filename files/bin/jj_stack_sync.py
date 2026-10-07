@@ -927,6 +927,43 @@ ApplyResult = Verified | Stopped
 
 
 @dataclass(frozen=True)
+class ExistingSyncIntent:
+    pr_number: int | None = None
+    revision: str | None = None
+    replace_pr_numbers: tuple[int, ...] = ()
+    force_local_wins: bool = False
+
+
+@dataclass(frozen=True)
+class NewSyncIntent:
+    revision: str
+    base_branch: str | None = None
+
+
+SyncIntent = ExistingSyncIntent | NewSyncIntent
+
+
+SyncCommandValue = (
+    Blocked
+    | NoOp
+    | Apply
+    | RemoteRestackAdoption
+    | FirstPublicationPlan
+    | StackAppendPlan
+    | RetainedTopologyPlan
+    | MixedMembershipPlan
+)
+
+
+@dataclass(frozen=True)
+class SyncCommandPlan:
+    """One freshly observed route and the transport needed to apply it."""
+
+    value: SyncCommandValue
+    push_url: str
+
+
+@dataclass(frozen=True)
 class HeadMutationAttempt:
     repository: GitHubRepositoryId
     push_url: str
@@ -8064,6 +8101,757 @@ def execute(
             )
     return plan, apply(
         plan,
+        workspace,
+        github,
+        dry_run=dry_run,
+        git_transport=git_transport,
+    )
+
+
+def _managed_branch_names(state: TrackedState) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(
+        item.ref.full_name.removeprefix("refs/heads/")
+        for item in (
+            state.last_published_heads
+            + state.last_adopted_heads
+            + state.last_published_boundaries
+            + tuple(
+                LastPublishedHead(
+                    association.pr, association.ref, association.verified_commit_id
+                )
+                for association in state.detached_associations
+            )
+        )
+    ))
+
+
+def _historical_pull_requests(
+    github: GitHubClient,
+    repository: GitHubRepositoryId,
+    branches: Sequence[str],
+) -> tuple[GitHubPullRequest, ...]:
+    names = tuple(dict.fromkeys(branches))
+    if not names:
+        return ()
+    found = (
+        github.find_pull_requests(
+            repository, head_branches=names, states=tuple(PullRequestState)
+        )
+        + github.find_pull_requests(
+            repository, base_branches=names, states=tuple(PullRequestState)
+        )
+    )
+    unique: dict[PullRequestId, GitHubPullRequest] = {}
+    for pull_request in found:
+        previous = unique.get(pull_request.identity)
+        if previous is not None and previous != pull_request:
+            raise SourceMismatch("historical pull request reads disagree")
+        unique[pull_request.identity] = pull_request
+    return tuple(unique.values())
+
+
+def _publication_branch(
+    local: LocalObservation,
+    commit_id: str,
+    protected: Collection[str],
+) -> str | Blocked:
+    names = tuple(
+        item.name for item in local.local_bookmarks
+        if item.name not in protected
+        and isinstance(item.target, CommitTarget)
+        and item.target.commit_id == commit_id
+    )
+    if len(names) != 1:
+        return _block(
+            "publication-branch-ambiguous",
+            commit_id,
+            "a new selected commit needs one exact eligible local bookmark",
+        )
+    return names[0]
+
+
+def _publication_input(
+    workspace: str | Path,
+    github: GitHubClient,
+    local: LocalObservation,
+    repository: GitHubRepository,
+    push_url: str,
+    base_branch: str,
+    assignments: tuple[PublicationAssignment, ...],
+    state: TrackedState,
+    recovery_facts: tuple[RecoveryEntry, ...],
+    existing_refs: Sequence[LiveRemoteRef] = (),
+    git_transport: GitTransport | None = None,
+) -> FirstPublicationInput:
+    names = tuple(item.branch_name for item in assignments)
+    requested = tuple(dict.fromkeys((
+        f"refs/heads/{base_branch}",
+        *(f"refs/heads/{name}" for name in names),
+    )))
+    known = {item.ref.full_name: item for item in existing_refs}
+    missing = tuple(name for name in requested if name not in known)
+    git = git_transport or SubprocessGitTransport(workspace)
+    observed = (
+        git.observe_live_refs(push_url, repository.identity, missing)
+        if missing
+        else ()
+    )
+    destinations = tuple(existing_refs) + observed
+    history = _historical_pull_requests(
+        github, repository.identity, (base_branch, *names)
+    )
+    return FirstPublicationInput(
+        repository.identity,
+        base_branch,
+        tuple(item.commit_id for item in assignments),
+        local,
+        assignments,
+        (),
+        _managed_branch_names(state),
+        destinations,
+        history,
+        recovery_facts,
+    )
+
+
+def _plan_new_sync(
+    workspace: str | Path,
+    github: GitHubClient,
+    intent: NewSyncIntent,
+    requested_remote: str | None,
+    recovery_facts: tuple[RecoveryEntry, ...],
+    git_transport: GitTransport | None = None,
+) -> SyncCommandPlan:
+    local = observe_local(
+        workspace,
+        revision=f"ancestors({intent.revision})",
+        config_keys=(
+            "git.push",
+        ),
+    )
+    selected = observe_commits(
+        workspace, local.operation_id, intent.revision, ancestry_order=True
+    )
+    if not selected:
+        return SyncCommandPlan(
+            _block("empty-publication", intent.revision,
+                "new publication requires a nonempty selection"),
+            "",
+        )
+    remote = resolve_remote(local, requested_remote)
+    push_url = resolve_push_url(local, remote)
+    repository = github.resolve_repository(push_url)
+    state = observe_tool_state(workspace).state
+    base = intent.base_branch or repository.default_branch
+    protected = {base, *_managed_branch_names(state)}
+    assignments: list[PublicationAssignment] = []
+    for commit in selected:
+        branch = _publication_branch(local, commit.commit_id, protected)
+        if isinstance(branch, Blocked):
+            return SyncCommandPlan(branch, push_url)
+        assignments.append(PublicationAssignment(commit.commit_id, branch))
+        protected.add(branch)
+    publication = _publication_input(
+        workspace, github, local, repository, push_url, base,
+        tuple(assignments), state, recovery_facts,
+        git_transport=git_transport,
+    )
+    return SyncCommandPlan(
+        plan_first_publication(publication),
+        push_url,
+    )
+
+
+def _selected_pr_number(
+    state: TrackedState,
+    repository: GitHubRepositoryId,
+    requested: int | None,
+) -> int | Blocked:
+    if requested is not None:
+        if requested <= 0:
+            return _block("invalid-pr", str(requested), "PR number must be positive")
+        return requested
+    memberships = tuple(
+        stack for stack in state.stacks if stack.repository == repository
+    )
+    if len(memberships) != 1 or not memberships[0].ordered_prs:
+        return _block(
+            "selection-required",
+            "stack",
+            "current state is ambiguous; select one stack with --pr",
+        )
+    return memberships[0].ordered_prs[0].number
+
+
+def _plan_existing_sync(
+    workspace: str | Path,
+    github: GitHubClient,
+    intent: ExistingSyncIntent,
+    requested_remote: str | None,
+    recovery_facts: tuple[RecoveryEntry, ...],
+    git_transport: GitTransport | None = None,
+) -> SyncCommandPlan:
+    if intent.replace_pr_numbers and intent.revision is None:
+        return SyncCommandPlan(_block(
+            "replacement-requires-revision", "selection",
+            "identity replacement requires an explicit revision selection",
+        ), "")
+    revision = "all()" if intent.revision is None else f"ancestors({intent.revision})"
+    local = observe_local(workspace, revision=revision, config_keys=(
+        "git.push",
+    ))
+    remote = resolve_remote(local, requested_remote)
+    push_url = resolve_push_url(local, remote)
+    repository = github.resolve_repository(push_url)
+    tool_state = observe_tool_state(workspace)
+    selected_number = _selected_pr_number(
+        tool_state.state, repository.identity, intent.pr_number
+    )
+    if isinstance(selected_number, Blocked):
+        return SyncCommandPlan(selected_number, push_url)
+    snapshot = observe_snapshot(
+        workspace,
+        github,
+        revision=revision,
+        config_keys=("git.push",),
+        remote=remote,
+        selected_pr_number=selected_number,
+        local=local,
+        git_transport=git_transport,
+    )
+    logical_ungrouped = False
+    logical_base_branch: str | None = None
+    logical_completed_stack: GitHubStack | None = None
+    observed_members = (
+        (snapshot.membership.pr,)
+        if isinstance(snapshot.membership, StandalonePullRequest)
+        else snapshot.membership.ordered_prs
+    )
+    tracked = tuple(
+        stack
+        for stack in tool_state.state.stacks
+        if stack.repository == repository.identity
+        and set(observed_members) <= set(stack.ordered_prs)
+    )
+    if tracked and tracked[0].ordered_prs != observed_members:
+        if len(tracked) > 1:
+            return SyncCommandPlan(
+                _block(
+                    "ambiguous-membership",
+                    f"PR #{selected_number}",
+                    "tracked logical memberships overlap",
+                ),
+                push_url,
+            )
+        logical = tracked[0]
+        pull_requests = github.pull_requests(logical.ordered_prs)
+        groups: dict[GitHubStackSummary, list[PullRequestId]] = {}
+        for pr in pull_requests:
+            if pr.stack is not None:
+                groups.setdefault(pr.stack, []).append(pr.identity)
+        if any(
+            tuple(members) != observed_members
+            and set(members).intersection(observed_members)
+            for members in groups.values()
+        ):
+            return SyncCommandPlan(
+                _block(
+                    "foreign-topology",
+                    "stack",
+                    "tracked logical members acquired incompatible grouping",
+                ),
+                push_url,
+            )
+        completed_groups = tuple(
+            (summary, tuple(members)) for summary, members in groups.items()
+            if tuple(members) == logical.ordered_prs[:len(members)]
+            and all(
+                pr.state is PullRequestState.MERGED
+                for pr in pull_requests[:len(members)]
+            )
+        )
+        if len(completed_groups) == 1:
+            summary, members = completed_groups[0]
+            logical_completed_stack = GitHubStack(
+                summary.identity, summary.node_id, summary.base_branch, members
+            )
+        names = tuple(dict.fromkeys((
+            f"refs/heads/{logical.base_branch}",
+            *(f"refs/heads/{pr.head_branch}" for pr in pull_requests),
+        )))
+        git = git_transport or SubprocessGitTransport(workspace)
+        live_refs = git.observe_live_refs(push_url, repository.identity, names)
+        snapshot = replace(
+            snapshot,
+            pull_requests=pull_requests,
+            live_refs=live_refs,
+        )
+        logical_ungrouped = True
+        logical_base_branch = logical.base_branch
+    open_prs = tuple(
+        pr for pr in snapshot.pull_requests if pr.state is PullRequestState.OPEN
+    )
+    source_pull_requests = snapshot.pull_requests
+    recovered_stack: GitHubStack | None = None
+    if isinstance(snapshot.membership, StandalonePullRequest):
+        dissolution = tuple(
+            entry.attempt for entry in recovery_facts
+            if isinstance(entry.attempt, StackDissolutionAttempt)
+            and selected_number in {member.number for member in entry.attempt.members}
+            and entry.attempt.repository == repository.identity
+        )
+        if len(dissolution) > 1:
+            return SyncCommandPlan(_block(
+                "ambiguous-provenance", "stack",
+                "multiple temporary-target dissolution facts overlap",
+            ), push_url)
+        if dissolution:
+            attempt = dissolution[0]
+            source_pull_requests = github.pull_requests(attempt.members)
+            open_prs = tuple(
+                pr for pr in source_pull_requests if pr.state is PullRequestState.OPEN
+            )
+            recovered_stack = GitHubStack(
+                attempt.stack, attempt.stack_node_id, attempt.base_branch, attempt.members
+            )
+    source_identities = {pr.identity for pr in source_pull_requests}
+    started_replacements: dict[PullRequestId, NewPullRequestGoal] = {}
+    for entry in recovery_facts:
+        if (not entry.possibly_live
+                or not isinstance(entry.attempt, BranchCreationAttempt)
+                or entry.attempt.repository != repository.identity):
+            continue
+        for old, goal in entry.attempt.replacements:
+            if old not in source_identities:
+                continue
+            previous = started_replacements.get(old)
+            if previous is not None and previous != goal:
+                return SyncCommandPlan(_block(
+                    "ambiguous-replacement", f"PR #{old.number}",
+                    "multiple started replacement candidates overlap one identity",
+                ), push_url)
+            started_replacements[old] = goal
+    open_prs = tuple(
+        pr for pr in source_pull_requests
+        if pr.state is PullRequestState.OPEN or pr.identity in started_replacements
+    )
+    if intent.revision is None:
+        selected_commits: list[ObservedCommit] = []
+        commits = {item.commit_id: item for item in local.commits}
+        for pr in open_prs:
+            replacement = started_replacements.get(pr.identity)
+            if replacement is not None:
+                commit = commits.get(replacement.commit_id)
+                if commit is None:
+                    return SyncCommandPlan(_block(
+                        "tracked-representation-missing", f"PR #{pr.number}",
+                        "started replacement commit is not locally visible",
+                    ), push_url)
+                selected_commits.append(commit)
+                continue
+            targets = tuple(
+                item.target.commit_id for item in local.local_bookmarks
+                if item.name == pr.head_branch and isinstance(item.target, CommitTarget)
+            )
+            if len(targets) != 1 or targets[0] not in commits:
+                return SyncCommandPlan(_block(
+                    "tracked-representation-missing", f"PR #{pr.number}",
+                    "ordinary sync requires one exact local bookmark boundary",
+                ), push_url)
+            selected_commits.append(commits[targets[0]])
+    else:
+        selected_commits = list(observe_commits(
+            workspace, local.operation_id, intent.revision, ancestry_order=True
+        ))
+    source_targets: dict[str, GitHubPullRequest] = {}
+    for pr in open_prs:
+        targets = tuple(
+            item.target.commit_id for item in local.local_bookmarks
+            if item.name == pr.head_branch and isinstance(item.target, CommitTarget)
+        )
+        if len(targets) == 1:
+            if targets[0] in source_targets:
+                return SyncCommandPlan(_block(
+                    "ambiguous-boundary", targets[0],
+                    "multiple source PR bookmarks select one commit",
+                ), push_url)
+            source_targets[targets[0]] = pr
+    replacement_numbers = set(intent.replace_pr_numbers)
+    if len(replacement_numbers) != len(intent.replace_pr_numbers):
+        return SyncCommandPlan(_block(
+            "invalid-replacement", "selection",
+            "replacement PR numbers must be unique",
+        ), push_url)
+    protected = {
+        source_pull_requests[0].base_branch,
+        *(pr.head_branch for pr in source_pull_requests),
+        *_managed_branch_names(tool_state.state),
+    }
+    assignments: list[MembershipAssignment] = []
+    for commit in selected_commits:
+        pr = source_targets.get(commit.commit_id)
+        recovered_old = next((
+            old for old, goal in started_replacements.items()
+            if goal.commit_id == commit.commit_id
+        ), None)
+        if recovered_old is not None:
+            pr = next((item for item in source_pull_requests
+                if item.identity == recovered_old), None)
+        if pr is not None:
+            if pr.number in replacement_numbers:
+                assignment: MembershipAssignment = ReplacementPRAssignment(
+                    pr.identity, commit.commit_id
+                )
+            elif intent.force_local_wins:
+                assignment = LocalWinsPRAssignment(pr.identity, commit.commit_id)
+            else:
+                assignment = ExistingPRAssignment(pr.identity, commit.commit_id)
+        else:
+            branch = _publication_branch(local, commit.commit_id, protected)
+            if isinstance(branch, Blocked):
+                return SyncCommandPlan(branch, push_url)
+            assignment = NewPRAssignment(commit.commit_id, branch)
+            protected.add(branch)
+        assignments.append(assignment)
+    selected_replacements = {
+        item.pr_identity.number for item in assignments
+        if isinstance(item, ReplacementPRAssignment)
+    }
+    if selected_replacements != replacement_numbers:
+        return SyncCommandPlan(_block(
+            "replacement-outside-selection", "selection",
+            "every replacement PR must match one selected source boundary",
+        ), push_url)
+
+    existing = tuple(
+        item for item in assignments
+        if isinstance(item, (ExistingPRAssignment, LocalWinsPRAssignment))
+    )
+    existing_ids = tuple(item.pr_identity for item in existing)
+    open_ids = tuple(pr.identity for pr in open_prs)
+    has_new = any(isinstance(item, NewPRAssignment) for item in assignments)
+    logical_historical = logical_ungrouped and any(
+        pr.state is PullRequestState.MERGED for pr in source_pull_requests
+    )
+    if (
+        (not logical_ungrouped or logical_completed_stack is not None or logical_historical)
+        and recovered_stack is None
+        and existing_ids == open_ids
+        and not has_new
+        and not replacement_numbers
+        and not started_replacements
+    ):
+        selection = StackSelection(
+            snapshot.pull_requests[0].base_branch
+            if isinstance(snapshot.membership, StandalonePullRequest)
+            else snapshot.membership.base_branch,
+            tuple(ExistingPRAssignment(item.pr_identity, item.commit_id)
+                for item in existing),
+        )
+        desired = derive_desired(snapshot, selection)
+        if intent.revision is None and not intent.force_local_wins:
+            adoption = plan_remote_restack_adoption(snapshot)
+            if isinstance(adoption, RemoteRestackAdoption):
+                return SyncCommandPlan(adoption, push_url)
+        ordinary = plan_sync(
+            snapshot,
+            desired,
+            local_wins=tuple(item.pr_identity for item in existing
+                if isinstance(item, LocalWinsPRAssignment)),
+        )
+        return SyncCommandPlan(ordinary, push_url)
+
+    stack = recovered_stack
+    if (
+        not logical_ungrouped
+        and isinstance(snapshot.membership, ServerStackMembership)
+    ):
+        stack = GitHubStack(
+            snapshot.membership.stack.identity,
+            snapshot.membership.stack.node_id,
+            snapshot.membership.base_branch,
+            snapshot.membership.ordered_prs,
+        )
+    prefix = tuple(
+        item.pr_identity for item in assignments[: len(open_ids)]
+        if isinstance(item, (ExistingPRAssignment, LocalWinsPRAssignment))
+    )
+    suffix = tuple(
+        item for item in assignments[len(open_ids):]
+        if isinstance(item, NewPRAssignment)
+    )
+    if (
+        stack is not None
+        and prefix == open_ids
+        and len(suffix) == len(assignments) - len(open_ids)
+        and suffix
+        and not replacement_numbers
+        and not started_replacements
+        and not intent.force_local_wins
+        and all(
+            assignment.commit_id == pr.head_oid
+            and _metadata(next(commit.description for commit in selected_commits
+                if commit.commit_id == assignment.commit_id)) == (pr.title, pr.body)
+            for assignment, pr in zip(assignments[:len(open_ids)], open_prs, strict=True)
+        )
+    ):
+        publication_assignments = tuple(
+            PublicationAssignment(item.commit_id, item.branch_name) for item in suffix
+        )
+        publication = _publication_input(
+            workspace, github, local, repository, push_url, stack.base_branch,
+            publication_assignments, tool_state.state, recovery_facts,
+            snapshot.live_refs,
+            git_transport,
+        )
+        return SyncCommandPlan(plan_stack_append(StackAppendInput(
+            publication, stack, snapshot.pull_requests, tool_state.state
+        )), push_url)
+
+    candidate_names = [
+        item.branch_name for item in assignments if isinstance(item, NewPRAssignment)
+    ]
+    candidate_names.extend(goal.branch_name for goal in started_replacements.values())
+    for item in assignments:
+        if isinstance(item, ReplacementPRAssignment):
+            old = next(pr for pr in source_pull_requests
+                if pr.identity == item.pr_identity)
+            candidate_names.extend(
+                old.head_branch + ("-replacement" if index == 1 else f"-replacement-{index}")
+                for index in range(1, 101)
+            )
+    known = {item.ref.full_name: item for item in snapshot.live_refs}
+    recovered_ref_names = tuple(
+        f"refs/heads/{name}" for name in (
+            *((pr.head_branch for pr in open_prs)),
+            *((recovered_stack.base_branch,) if recovered_stack is not None else ()),
+        )
+    )
+    candidate_refs = tuple(f"refs/heads/{name}" for name in candidate_names)
+    missing = tuple(
+        name for name in (*candidate_refs, *recovered_ref_names) if name not in known
+    )
+    git = git_transport or SubprocessGitTransport(workspace)
+    extra_refs = (
+        git.observe_live_refs(push_url, repository.identity, missing)
+        if missing
+        else ()
+    )
+    live_refs = snapshot.live_refs + extra_refs
+    history = _historical_pull_requests(
+        github, repository.identity,
+        tuple(candidate_names) + tuple(pr.head_branch for pr in source_pull_requests),
+    )
+    base_branch = logical_base_branch or (
+        snapshot.pull_requests[0].base_branch
+        if isinstance(snapshot.membership, StandalonePullRequest)
+        else snapshot.membership.base_branch
+    )
+    mixed = MixedMembershipInput(
+        repository.identity,
+        base_branch,
+        stack,
+        source_pull_requests,
+        tuple(assignments),
+        local,
+        live_refs,
+        tool_state.state,
+        history,
+        recovery_facts,
+    )
+    return SyncCommandPlan(
+        plan_mixed_membership(mixed), push_url
+    )
+
+
+def plan_sync_command(
+    workspace: str | Path,
+    github: GitHubClient,
+    intent: SyncIntent,
+    *,
+    requested_remote: str | None = None,
+    recovery_facts: tuple[RecoveryEntry, ...] = (),
+    git_transport: GitTransport | None = None,
+) -> SyncCommandPlan:
+    """Observe current intent and choose one pure planner route."""
+    if isinstance(intent, NewSyncIntent):
+        return _plan_new_sync(
+            workspace,
+            github,
+            intent,
+            requested_remote,
+            recovery_facts,
+            git_transport,
+        )
+    return _plan_existing_sync(
+        workspace,
+        github,
+        intent,
+        requested_remote,
+        recovery_facts,
+        git_transport,
+    )
+
+
+def render_sync_command(value: SyncCommandPlan | ApplyResult | AdoptionVerified) -> str:
+    if isinstance(value, SyncCommandPlan):
+        plan = value.value
+        if isinstance(plan, (Blocked, NoOp, Apply)):
+            return render(plan)
+        if isinstance(plan, RemoteRestackAdoption):
+            return "adopt remote restack:\n" + "\n".join(
+                f"  - {item.branch}: {item.old_commit_id} -> {item.remote_commit_id}"
+                for item in plan.boundaries
+            )
+        if isinstance(plan, FirstPublicationPlan):
+            rendered = "publish new stack:\n" + "\n".join(
+                f"  - {goal.commit_id} -> {goal.branch_name} (base {goal.base_branch})"
+                for goal in plan.goal.pull_requests
+            )
+            return rendered
+        if isinstance(plan, StackAppendPlan):
+            return "append stack:\n" + "\n".join(
+                f"  - {goal.commit_id} -> {goal.branch_name}"
+                for goal in plan.goal.pull_requests
+            )
+        if isinstance(plan, RetainedTopologyPlan):
+            return "retain stack membership: " + ", ".join(
+                f"#{item.pr_identity.number}" for item in plan.desired.ordered
+            )
+        assert isinstance(plan, MixedMembershipPlan)
+        rendered = "repair mixed membership:\n" + "\n".join(
+            f"  - PR #{item.number}" if isinstance(item, PullRequestId)
+            else f"  - new {item.branch_name} at {item.commit_id}"
+            for item in plan.goal.ordered
+        )
+        return rendered
+    if isinstance(value, AdoptionVerified):
+        return f"verified remote restack adoption ({len(value.adopted_heads)} head(s))"
+    if isinstance(value, Verified):
+        return "verified"
+    return f"stopped at {value.stage}: {value.detail}"
+
+
+def apply_sync_command(
+    command: SyncCommandPlan,
+    workspace: str | Path,
+    github: GitHubClient,
+    *,
+    dry_run: bool = False,
+    git_transport: GitTransport | None = None,
+) -> ApplyResult | AdoptionVerified:
+    value = command.value
+    if isinstance(value, Blocked):
+        return Stopped("plan", "a blocked plan cannot be applied")
+    if isinstance(value, RemoteRestackAdoption):
+        return adopt_remote_restack(
+            value,
+            workspace,
+            github,
+            dry_run=dry_run,
+            git_transport=git_transport,
+        )
+    if isinstance(value, (NoOp, Apply)):
+        return apply(
+            value,
+            workspace,
+            github,
+            dry_run=dry_run,
+            git_transport=git_transport,
+        )
+    if isinstance(value, FirstPublicationPlan):
+        return apply_first_publication(
+            value,
+            workspace,
+            github,
+            command.push_url,
+            dry_run=dry_run,
+            git_transport=git_transport,
+        )
+    if isinstance(value, StackAppendPlan):
+        return apply_stack_append(
+            value,
+            workspace,
+            github,
+            command.push_url,
+            dry_run=dry_run,
+            git_transport=git_transport,
+        )
+    if isinstance(value, RetainedTopologyPlan):
+        return apply_retained_topology(
+            value,
+            workspace,
+            github,
+            dry_run=dry_run,
+            git_transport=git_transport,
+        )
+    return apply_mixed_membership(
+        value,
+        workspace,
+        github,
+        command.push_url,
+        dry_run=dry_run,
+        git_transport=git_transport,
+    )
+
+
+def execute_sync_command(
+    workspace: str | Path,
+    github: GitHubClient,
+    intent: SyncIntent,
+    *,
+    requested_remote: str | None = None,
+    confirm: Callable[[SyncCommandPlan], bool] | None = None,
+    dry_run: bool = False,
+    git_transport: GitTransport | None = None,
+) -> tuple[SyncCommandPlan | None, ApplyResult | AdoptionVerified]:
+    """Resume durable work first, otherwise exactly plan and apply one command."""
+    try:
+        with repository_lock(workspace):
+            facts = settle_recovery(
+                workspace,
+                github,
+                dry_run=dry_run,
+                git_transport=git_transport,
+            )
+    except Error as exc:
+        return None, Stopped("recovery", str(exc))
+    try:
+        command = plan_sync_command(
+            workspace,
+            github,
+            intent,
+            requested_remote=requested_remote,
+            recovery_facts=facts,
+            git_transport=git_transport,
+        )
+    except Error as exc:
+        return None, Stopped("observe", str(exc))
+    if isinstance(command.value, Blocked):
+        return command, Stopped("plan", "current intent is blocked")
+    if (
+        not dry_run
+        and not isinstance(command.value, NoOp)
+        and confirm is not None
+        and not confirm(command)
+    ):
+        return command, Stopped("confirmation", "current plan was not confirmed")
+    if not dry_run and confirm is not None:
+        try:
+            current = plan_sync_command(
+                workspace, github, intent, requested_remote=requested_remote,
+                recovery_facts=facts,
+                git_transport=git_transport,
+            )
+        except Error as exc:
+            return command, Stopped("revalidate", str(exc))
+        if current != command:
+            return command, Stopped(
+                "revalidate", "authority-bearing facts changed during confirmation"
+            )
+        command = current
+    return command, apply_sync_command(
+        command,
         workspace,
         github,
         dry_run=dry_run,
