@@ -132,6 +132,14 @@
       (mkPackageReplacementOverlayModule {
         installAgentSkills = unstable;
       })
+      # Need an aarch64 build of terminal-notifier to run on macOS 27.
+      # TODO(NixOS/nixpkgs#555789): Delete this overlay and pull terminal-notifier via unstable or master.
+      (mkOverlayModule (final: prev: {
+        terminal-notifier = final.callPackage (builtins.fetchurl {
+          url = "https://raw.githubusercontent.com/NixOS/nixpkgs/d67c6f2090750e686c66054cd74960d1de935561/pkgs/by-name/te/terminal-notifier/package.nix";
+          sha256 = "1kb0c48abhag1837pwrqdcrlsrgpqifni8d3gyll9fvd72pp6s3i";
+        }) {};
+      }))
       # For more up-to-date claude-code{-acp} &c than from nixpkgs.
       # Overlays for llm-agents stuff.
       {
