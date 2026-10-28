@@ -83,6 +83,7 @@ startup."
 (use-package emacs
   :custom
   (blink-cursor-mode nil)
+  (visible-bell t)
   (inhibit-startup-screen t)
   (inhibit-startup-echo-area-message (user-login-name))
   (tab-bar-new-tab-choice "*scratch*")
