@@ -1,9 +1,9 @@
 theme = "github-light-default"
-mode = "auto"
+mode = "unified"
 line_numbers = true
 wrap_lines = false
 hunk_headers = true
 menu_bar = true
-agent_notes = true
+agent_notes = false
 copy_decorations = false
 cursor_line = "row"

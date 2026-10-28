@@ -85,11 +85,22 @@ fixup = ["util", "exec", "--", "jj-fixup"]
 'grove_log_heads()' = '''heads(coalesce(grove(), all()))'''
 'grove_log_context()' = '''ancestors(immutable_heads()..grove_log_heads(), 2) ~ (ancestors(grove_markers()) ~ grove_markers())'''
 
+# Archives affect the default log, not mutability or grove membership. Keep
+# history still needed by nonarchived heads, any workspace, or trunk visible.
+'archived_bookmarks()' = 'bookmarks(glob:"archived/*")'
+'archived_only()' = '''
+  ::archived_bookmarks() ~ ::(
+    (visible_heads() ~ ::archived_bookmarks()) |
+    working_copies() |
+    trunk()
+  )
+'''
+
 # "default_blah" are so that repos can be customised without repeating the basics.
 'default_private_commits()' = "(incomplete() & mine()) | descendants(grove_markers())"
 # Like jj's built-in `present(@) | ancestors(immutable_heads().., 2) | trunk()`,
-# but use grove-local heads for the middle term when a workspace is bound.
-'default_log()' = '''present(@) | grove_log_context() | trunk()'''
+# but use grove-local context and omit archive-only history.
+'default_log()' = '''present(@) | (grove_log_context() ~ archived_only()) | trunk()'''
 
 [git]
 private-commits = 'default_private_commits()'
