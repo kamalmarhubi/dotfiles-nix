@@ -105,6 +105,11 @@ startup."
         no-littering-var-directory (expand-file-name "var" k/emacs-data-directory))
   (require 'no-littering))
 
+(add-to-list 'recentf-exclude
+             (concat "^" (regexp-quote (file-name-as-directory no-littering-var-directory))))
+(add-to-list 'recentf-exclude
+             (concat "^" (regexp-quote (file-name-as-directory no-littering-etc-directory))))
+
 ;; Get env vars from shell when in graphical mode.
 (use-package exec-path-from-shell
   :ensure t
