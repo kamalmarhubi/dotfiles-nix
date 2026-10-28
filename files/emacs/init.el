@@ -103,7 +103,10 @@ startup."
   :preface
   (setq no-littering-etc-directory (expand-file-name "etc" user-emacs-directory)
         no-littering-var-directory (expand-file-name "var" k/emacs-data-directory))
-  (require 'no-littering))
+  (require 'no-littering)
+  :config
+  (setq custom-file (no-littering-expand-etc-file-name "custom.el"))
+  (load custom-file 'noerror 'nomessage))
 
 (add-to-list 'recentf-exclude
              (concat "^" (regexp-quote (file-name-as-directory no-littering-var-directory))))
