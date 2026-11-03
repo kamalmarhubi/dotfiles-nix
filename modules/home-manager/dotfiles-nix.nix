@@ -39,7 +39,7 @@
   };
   cloneGitRepoIfNeeded = pkgs.writeShellApplication {
     name = "clone-git-repo-if-needed";
-    runtimeInputs = [pkgs.git];
+    runtimeInputs = [pkgs.unstable.jujutsu];
     text = ''
       target_dir="${dotfilesNixDir}"
       git_origin="${repoUrl}"
@@ -47,7 +47,7 @@
         $VERBOSE_ECHO "$target_dir exists; skipping clone"
           exit 0
       fi
-      $DRY_RUN_CMD git clone "$git_origin" "$target_dir"
+      $DRY_RUN_CMD jj git clone "$git_origin" "$target_dir"
     '';
   };
 in {
