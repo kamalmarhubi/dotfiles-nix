@@ -198,7 +198,7 @@
           commonModules
           ++ [
             nur.modules.homeManager.default
-            ./modules/home-manager
+            (import ./modules/home-manager {})
             {
               programs.home-manager.enable = true;
               home = {
