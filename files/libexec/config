@@ -1,0 +1,69 @@
+# shellcheck shell=bash
+# Sourced by the generated launcher, which supplies manager, manager_cmd,
+# flake, and the extra_args array, plus strict Bash options and runtime PATH.
+
+usage() {
+  echo 'Usage: config {build|switch} [options...]'
+  echo "Build or activate the current $manager configuration."
+  printf '\nUsage: config backend [arguments...]\n'
+  echo 'Invoke the pinned backend directly; forward all arguments unchanged.'
+}
+
+case "${1-}" in
+  backend)
+    shift
+    exec "$manager_cmd" "$@"
+    ;;
+  build|switch)
+    action="$1"
+    shift
+    ;;
+  -h)
+    usage
+    printf '\nRun config --help to include underlying command help.\n'
+    exit 0
+    ;;
+  --help)
+    usage
+    printf '\nUnderlying command help (%s):\n' "$manager"
+    "$manager_cmd" --help 2>&1 || {
+      status=$?
+      # darwin-rebuild prints help successfully but exits with status 1.
+      [[ "$manager" == nix-darwin && "$status" == 1 ]] || exit "$status"
+    }
+    exit 0
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+
+if [[ "$action" == build ]]; then
+  original_dir=$PWD
+  cd -- "${flake%%#*}" || exit
+fi
+
+cmd=(
+  "$manager_cmd"
+  "$action"
+  --flake "$flake"
+  "${extra_args[@]}"
+  --no-write-lock-file
+)
+if [[ "$action" == build ]]; then
+  # GNU stat inspects the link itself unless explicitly told to dereference it.
+  result_before=$(stat --format='%i:%y' -- result 2>/dev/null || true)
+  "${cmd[@]}" "$@"
+  result_after=$(stat --format='%i:%y' -- result 2>/dev/null || true)
+  if [[ -L result && "$result_before" != "$result_after" && ! . -ef "$original_dir" ]]; then
+    printf '\nBuild output link:\n    %s/result\n\n' "$PWD" >&2
+  fi
+  exit 0
+fi
+
+if [[ "$manager" == nix-darwin && "$action" == switch ]]; then
+  exec /usr/bin/sudo -- "${cmd[@]}" "$@"
+fi
+
+exec "${cmd[@]}" "$@"

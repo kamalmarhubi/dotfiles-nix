@@ -161,7 +161,7 @@
       nix.registry.unstable.flake = inputs.unstable;
       nix.registry.master.flake = inputs.master;
     };
-    mkDarwinConfig = {
+    mkDarwinConfig = configurationName: {
       system ? "aarch64-darwin",
       extraModules ? [],
       extraHomeModules ? [],
@@ -176,11 +176,12 @@
             home-manager.darwinModules.home-manager
             ./modules/darwin
           ]
+          ++ nixpkgs.lib.optional (configurationName != "bootstrap") ./modules/darwin/config-command.nix
           ++ extraModules;
-        specialArgs = {inherit inputs system extraHomeModules;};
+        specialArgs = {inherit inputs system extraHomeModules configurationName;};
       };
 
-    mkHomeConfig = {
+    mkHomeConfig = configurationName: {
       username ? "kamal",
       system,
       homeDirectory ? "${homePrefix system}/${username}",
@@ -192,8 +193,7 @@
       home-manager.lib.homeManagerConfiguration {
         inherit pkgs;
 
-        # Make inputs and system available to all modules.
-        extraSpecialArgs = {inherit inputs system;};
+        extraSpecialArgs = {inherit inputs system configurationName;};
         modules =
           commonModules
           ++ [
@@ -206,16 +206,17 @@
               };
             }
           ]
+          ++ nixpkgs.lib.optional (configurationName != "bootstrap") ./modules/home-manager/config-command.nix
           ++ extraModules;
       };
   in
     {
-      darwinConfigurations = {
-        "bootstrap" = mkDarwinConfig {
+      darwinConfigurations = builtins.mapAttrs mkDarwinConfig {
+        "bootstrap" = {
           system = builtins.currentSystem;
         };
 
-        "kamal-FL932PQ21V" = mkDarwinConfig {
+        "kamal-FL932PQ21V" = {
           system = "aarch64-darwin";
           extraHomeModules = [./modules/home-manager/wave.nix];
           # Error message is confusing since I don't think I did any of these:
@@ -228,36 +229,36 @@
           ];
         };
         # Huh? Logging in to the kamal-personal account seems to change the hostname?
-        "kamal-personal-FL932PQ21V" = mkDarwinConfig {
+        "kamal-personal-FL932PQ21V" = {
           system = "aarch64-darwin";
           extraHomeModules = [./modules/home-manager/wave.nix];
         };
-        "mimolette" = mkDarwinConfig {
+        "mimolette" = {
           system = "aarch64-darwin";
         };
       };
-      homeConfigurations = {
+      homeConfigurations = builtins.mapAttrs mkHomeConfig {
         # For bootstrapping systems that aren't aleady in the homeConfigurations output.
         # NB This reads env vars and so requires --impure.
-        "bootstrap" = mkHomeConfig {
+        "bootstrap" = {
           system = builtins.currentSystem;
           username = builtins.getEnv "USER";
           homeDirectory = builtins.getEnv "HOME";
         };
 
-        "kamal@kx7" = mkHomeConfig {
+        "kamal@kx7" = {
           system = "x86_64-linux";
         };
-        "kamal@mimolette" = mkHomeConfig {
+        "kamal@mimolette" = {
           system = "aarch64-darwin";
           extraModules = [./modules/home-manager/personal.nix];
         };
-        "kamal@kamal-FL932PQ21V" = mkHomeConfig {
+        "kamal@kamal-FL932PQ21V" = {
           system = "aarch64-darwin";
           extraModules = [./modules/home-manager/wave.nix];
         };
         # Huh? Logging in to the kamal-personal account seems to change the hostname?
-        "kamal@kamal-personal-FL932PQ21V" = mkHomeConfig {
+        "kamal@kamal-personal-FL932PQ21V" = {
           system = "aarch64-darwin";
           extraModules = [./modules/home-manager/wave.nix];
         };
