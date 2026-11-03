@@ -20,7 +20,7 @@ environment, which is disallowed by default when using flakes.
 
 Finally add an entry to the `homeConfigurations` output so that
 
-    home-manager switch --flake ~/.config/dotfiles-nix
+    home-manager switch --flake ~/repos/github.com/kamalmarhubi/dotfiles-nix
 
 works.
 
@@ -38,7 +38,7 @@ environment, which is disallowed by default when using flakes.
 
 Finally add an entry to the `darwinConfigurations` output so that
 
-    darwin-rebuild switch --flake ~/.config/dotfiles-nix
+    darwin-rebuild switch --flake ~/repos/github.com/kamalmarhubi/dotfiles-nix
 
 works.
 
