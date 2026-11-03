@@ -12,7 +12,9 @@
   ...
 }: {
   options = with lib; {
-    nixpkgs.allowUnfreePackages = mkOption {
+    # Home Manager evaluates every nixpkgs option while constructing pkgs.
+    # Keep this package-valued option outside that namespace to avoid recursion.
+    unfree.allowedPackages = mkOption {
       type = types.listOf types.package;
       default = [];
     };
@@ -30,16 +32,16 @@
     homeManagerConfig = config.home-manager or osConfig.home-manager or null;
     usingGlobalPkgs = homeManagerConfig.useGlobalPkgs or false;
 
-    # Predicate for allowUnfreePackages at the top-level (could be stand-alone
+    # Predicate for allowedPackages at the top-level (could be stand-alone
     # home-manager or system-level packages on nixos / nix-darwin).
     topLevelPredicate = pkg:
-      builtins.elem (lib.getName pkg) (lib.map lib.getName config.nixpkgs.allowUnfreePackages);
+      builtins.elem (lib.getName pkg) (lib.map lib.getName config.unfree.allowedPackages);
 
     # Predicate for home-manager user packages collected from
-    #   home-manager.users.<user>.nixpkgs.allowUnfreePackages
+    #   home-manager.users.<user>.unfree.allowedPackages
     collectedUserPackagesPredicate = pkg: let
       homeManagerUnfree = lib.flatten (lib.mapAttrsToList
-        (_: userConfig: userConfig.nixpkgs.allowUnfreePackages or [])
+        (_: userConfig: userConfig.unfree.allowedPackages or [])
         homeManagerConfig.users);
       allowed = lib.map lib.getName homeManagerUnfree;
     in

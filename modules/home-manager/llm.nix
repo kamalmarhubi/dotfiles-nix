@@ -25,7 +25,7 @@
       pi
     ]);
 
-  nixpkgs.allowUnfreePackages = with pkgs.llm-agents; [
+  unfree.allowedPackages = with pkgs.llm-agents; [
     claude-code
   ];
 

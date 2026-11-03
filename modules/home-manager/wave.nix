@@ -30,7 +30,7 @@ in {
     yaml2json
   ];
 
-  nixpkgs.allowUnfreePackages = with pkgs; [
+  unfree.allowedPackages = with pkgs; [
     vault-bin
   ];
 

@@ -40,7 +40,7 @@
 
   home.sessionPath = ["${config.home.homeDirectory}/.local/bin"];
 
-  nixpkgs.allowUnfreePackages = with pkgs; [
+  unfree.allowedPackages = with pkgs; [
     _1password-cli
   ];
 
