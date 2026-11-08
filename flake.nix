@@ -223,7 +223,6 @@
 
         "kamal-FL932PQ21V" = {
           system = "aarch64-darwin";
-          extraHomeModules = [./modules/home-manager/wave.nix];
           # Error message is confusing since I don't think I did any of these:
           #   Possible causes include setting up a new Nix installation with an
           #   existing nix-darwin configuration, setting up a new nix-darwin
@@ -236,7 +235,6 @@
         # Huh? Logging in to the kamal-personal account seems to change the hostname?
         "kamal-personal-FL932PQ21V" = {
           system = "aarch64-darwin";
-          extraHomeModules = [./modules/home-manager/wave.nix];
         };
         "mimolette" = {
           system = "aarch64-darwin";
@@ -260,12 +258,10 @@
         };
         "kamal@kamal-FL932PQ21V" = {
           system = "aarch64-darwin";
-          extraModules = [./modules/home-manager/wave.nix];
         };
         # Huh? Logging in to the kamal-personal account seems to change the hostname?
         "kamal@kamal-personal-FL932PQ21V" = {
           system = "aarch64-darwin";
-          extraModules = [./modules/home-manager/wave.nix];
         };
       };
     }
