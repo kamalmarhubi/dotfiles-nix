@@ -127,6 +127,11 @@
       myPackagesOverlayModule
       (mkOverlayModule brew-nix.overlays.default)
       (mkOverlayModule fenix.overlays.default)
+      # Required by herdr, but missing in 26.05.
+      # TODO(26.11): Remove this overlay.
+      (mkPackageReplacementOverlayModule {
+        installAgentSkills = unstable;
+      })
       # For more up-to-date claude-code{-acp} &c than from nixpkgs.
       # Overlays for llm-agents stuff.
       {
