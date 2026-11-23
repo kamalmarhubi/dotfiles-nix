@@ -12,4 +12,5 @@
   };
 
   xdg.configFile."starship.toml".source = config.lib.file.mkOutOfStoreSymlink "${dotfilesNixDir}/files/starship.toml";
+  xdg.configFile."fish/functions".source = config.lib.file.mkOutOfStoreSymlink "${dotfilesNixDir}/files/fish/functions";
 }

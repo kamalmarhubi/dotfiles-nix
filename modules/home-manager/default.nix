@@ -2,7 +2,7 @@
   imports =
     [
       ({config, ...}: {
-        _module.args.dotfilesNixDir = "${config.home.homeDirectory}/repos/github.com/kamalmarhubi/dotfiles-nix";
+        _module.args.dotfilesNixDir = "${config.home.reposRoot}/github.com/kamalmarhubi/dotfiles-nix";
       })
       ../unfree.nix
       ./base.nix

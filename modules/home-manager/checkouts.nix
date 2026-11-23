@@ -4,6 +4,12 @@
   pkgs,
   ...
 }: {
+  options.home.reposRoot = lib.mkOption {
+    type = lib.types.strMatching "/.*";
+    default = "${config.home.homeDirectory}/repos";
+    description = "Absolute root directory for repository checkouts.";
+  };
+
   options.home.checkouts = lib.mkOption {
     default = {};
     description = "Local checkouts to validate when present and clone when missing. Existing checkouts are never updated or converted to jj.";

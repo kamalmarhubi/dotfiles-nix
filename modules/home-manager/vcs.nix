@@ -28,6 +28,10 @@
       config.lib.file.mkOutOfStoreSymlink "${dotfilesNixDir}/files/bin";
   };
 
+  xdg.configFile."clone.toml".source = (pkgs.formats.toml {}).generate "clone.toml" {
+    repos_root = config.home.reposRoot;
+  };
+
   xdg.configFile."fish/completions/jj.fish".source =
     config.lib.file.mkOutOfStoreSymlink "${dotfilesNixDir}/files/fish/completions/jj.fish";
   xdg.configFile."jj/config.toml".source = config.lib.file.mkOutOfStoreSymlink "${dotfilesNixDir}/files/jj/config.toml";
