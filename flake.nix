@@ -274,6 +274,7 @@
       };
     }
     // {
+      homeManagerModules.checkouts = ./modules/home-manager/checkouts.nix;
       formatter = eachSystem (system: nixpkgs.legacyPackages.${system}.alejandra);
     };
 }

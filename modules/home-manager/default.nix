@@ -6,6 +6,7 @@
       })
       ../unfree.nix
       ./base.nix
+      ./checkouts.nix
       ./dotfiles-nix.nix
       ./emacs.nix
       ./fish.nix
