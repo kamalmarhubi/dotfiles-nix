@@ -9,13 +9,22 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import tomllib
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 
 @dataclass(frozen=True)
 class Repository:
     remote: str
     relative_path: Path
+
+
+def normalize_github_url(url: SplitResult) -> SplitResult:
+    """Select the repository identified by a GitHub HTTPS page URL."""
+    parts = url.path.removeprefix("/").split("/")[:2]
+    if len(parts) != 2:
+        raise ValueError("expected a GitHub URL containing an owner and repository")
+    parts[-1] = parts[-1].removesuffix(".git") + ".git"
+    return url._replace(path="/" + "/".join(parts), query="", fragment="")
 
 
 def repository(source: str) -> Repository:
@@ -32,7 +41,10 @@ def repository(source: str) -> Repository:
     url = urlsplit(normalized)
     if url.scheme not in ("https", "ssh") or not url.hostname:
         raise ValueError("expected an HTTPS/SSH URL or SCP-style SSH remote")
-    if url.query or url.fragment:
+    if url.scheme == "https" and url.hostname == "github.com":
+        url = normalize_github_url(url)
+        remote = url.geturl()
+    elif url.query or url.fragment:
         raise ValueError("queries and fragments are not supported")
 
     host = url.hostname
@@ -52,7 +64,9 @@ def main() -> int:
         description=__doc__,
         epilog="Examples: clone https://github.com/kamalmarhubi/dotfiles-nix; clone git@github.com:kamalmarhubi/dotfiles-nix.git",
     )
-    parser.add_argument("repository", help="Git repository URL")
+    parser.add_argument(
+        "repository", help="Git repository URL, or a GitHub page URL for convenience"
+    )
     args = parser.parse_args()
     config_home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
     try:
